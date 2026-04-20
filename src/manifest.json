@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "黑曜书签",
+  "description": "在本地查询、浏览、移动和删除 Chrome 书签。",
+  "version": "1.0.0",
+  "icons": {
+    "16": "src/assets/icon16.png",
+    "32": "src/assets/icon32.png",
+    "48": "src/assets/icon48.png",
+    "128": "src/assets/icon128.png"
+  },
+  "permissions": [
+    "bookmarks",
+    "storage",
+    "webNavigation"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/service-worker/service-worker.ts",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "src/options/options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_icon": {
+      "16": "src/assets/icon16.png",
+      "24": "src/assets/icon24.png",
+      "32": "src/assets/icon32.png"
+    },
+    "default_title": "黑曜书签",
+    "default_popup": "src/popup/popup.html"
+  }
+}

@@ -1,0 +1,763 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>黑曜书签设置</title>
+    <link rel="stylesheet" href="./options.css">
+  </head>
+  <body>
+    <div class="options-shell">
+      <header class="options-header">
+        <a class="options-brand" href="#availability" aria-label="跳转到可用性检测">
+          <span class="options-brand-mark" aria-hidden="true">
+            <img src="../assets/icon4096.jpg" alt="">
+          </span>
+          <span class="options-brand-copy">
+            <span class="options-brand-eyebrow">Chrome Bookmark Manager</span>
+            <strong>黑曜书签</strong>
+          </span>
+        </a>
+      </header>
+
+      <div class="options-layout">
+        <aside class="options-sidebar" aria-label="设置分类">
+          <p class="options-sidebar-label">设置分类</p>
+          <nav class="options-nav">
+            <a class="options-nav-link" href="#availability" data-section-link="availability">可用性检测</a>
+            <a class="options-nav-link" href="#history" data-section-link="history">检测历史</a>
+            <a class="options-nav-link" href="#ai" data-section-link="ai">AI 命名</a>
+            <a class="options-nav-link" href="#redirects" data-section-link="redirects">重定向更新</a>
+            <a class="options-nav-link" href="#duplicates" data-section-link="duplicates">重复书签</a>
+            <a class="options-nav-link" href="#ignore" data-section-link="ignore">忽略规则</a>
+            <a class="options-nav-link" href="#recycle" data-section-link="recycle">回收站</a>
+          </nav>
+        </aside>
+
+        <main class="options-main">
+          <section
+            id="availability"
+            class="options-panel"
+            data-section-panel="availability"
+            aria-labelledby="availability-title"
+          >
+            <p class="options-section-label">Availability</p>
+            <h1 id="availability-title">书签可用性检测</h1>
+            <p class="options-description">批量检查 `http://` 和 `https://` 书签是否可访问。当前会按“后台导航、失败重试、网络探测”三层方式交叉验证，不会上传任何书签内容。</p>
+
+            <div class="options-group">
+              <div class="option-row">
+                <div class="option-copy">
+                  <strong>检测范围</strong>
+                  <p id="availability-scope-copy">当前范围：全部书签。你可以切换到某个文件夹，只检测该文件夹及其子层级里的书签。</p>
+                </div>
+                <button id="availability-scope-trigger" class="scope-picker-trigger" type="button" aria-label="选择检测范围">
+                  <span id="availability-scope-label">全部书签</span>
+                  <span class="scope-picker-caret" aria-hidden="true"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="detect-toolbar">
+              <div class="detect-permission-card">
+                <div class="detect-permission-meta">
+                  <span id="availability-permission-badge" class="options-chip muted">多层校验</span>
+                  <strong>检测方式</strong>
+                </div>
+                <p id="availability-permission-copy">当前会先做后台真实导航，再按需做二次导航和网络探测，减少单一方法造成的误判。检测过程中会短暂创建并自动关闭后台标签页。</p>
+              </div>
+
+              <div class="detect-toolbar-actions">
+                <button id="availability-action" class="options-button" type="button">
+                  开始检测全部书签
+                </button>
+                <button id="availability-pause-action" class="options-button secondary small hidden" type="button" disabled>
+                  暂停检测
+                </button>
+                <button id="availability-stop-action" class="options-button secondary small hidden" type="button" disabled>
+                  停止本次检测
+                </button>
+              </div>
+            </div>
+
+            <div class="detect-progress-card">
+              <div class="detect-progress-meta">
+                <strong>检测进度</strong>
+                <span id="availability-progress-text">未开始</span>
+              </div>
+              <div class="detect-progress-track" aria-hidden="true">
+                <span id="availability-progress-bar" class="detect-progress-bar"></span>
+              </div>
+              <p id="availability-status-copy" class="detect-status-copy">仅检测 `http/https` 书签，其它协议会自动跳过。</p>
+            </div>
+
+            <div class="detect-summary-grid">
+              <article class="summary-card">
+                <span id="availability-total-label" class="summary-label">全部书签</span>
+                <strong id="availability-total">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">可检测</span>
+                <strong id="availability-eligible">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">可访问</span>
+                <strong id="availability-available">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">重定向</span>
+                <strong id="availability-redirected">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">低置信异常</span>
+                <strong id="availability-review">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">高置信异常</span>
+                <strong id="availability-failed">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">已忽略</span>
+                <strong id="availability-ignored">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">跳过</span>
+                <strong id="availability-skipped">0</strong>
+              </article>
+            </div>
+
+            <div id="availability-selection-group" class="options-group detect-selection-group hidden">
+              <div class="detect-results-header">
+                <div>
+                  <strong id="availability-selection-count">0 条已选择</strong>
+                  <p class="detect-results-subtitle">可对当前低/高置信异常执行批量移动、忽略或删除。</p>
+                </div>
+                <button id="availability-clear-selection" class="options-button secondary small" type="button">清空选择</button>
+              </div>
+              <div class="detect-toolbar-actions wrap-start">
+                <button id="availability-selection-retest" class="options-button secondary small" type="button">重新测试</button>
+                <button id="availability-selection-promote" class="options-button secondary small" type="button">移入高置信异常</button>
+                <button id="availability-selection-demote" class="options-button secondary small" type="button">移入低置信异常</button>
+                <button id="availability-selection-move" class="options-button secondary small" type="button">批量移动到文件夹</button>
+                <button id="availability-selection-ignore-bookmark" class="options-button secondary small" type="button">忽略所选书签</button>
+                <button id="availability-selection-ignore-domain" class="options-button secondary small" type="button">忽略所选域名</button>
+                <button id="availability-selection-ignore-folder" class="options-button secondary small" type="button">忽略所选文件夹</button>
+                <button id="availability-selection-delete" class="options-button danger small" type="button">批量删除所选</button>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>低置信异常</strong>
+                  <p id="availability-review-subtitle" class="detect-results-subtitle">导航失败但证据不足以直接判定为高置信异常，建议人工确认</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="availability-select-all-review" class="options-button secondary small" type="button">全选本区</button>
+                  <span id="availability-review-count" class="option-value">0 条低置信异常</span>
+                </div>
+              </div>
+              <div id="availability-review-results" class="detect-results">
+                <div class="detect-empty">开始检测后，这里会展示低置信异常书签。</div>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>高置信异常</strong>
+                  <p id="availability-last-run" class="detect-results-subtitle">尚未执行检测</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="availability-select-all-failed" class="options-button secondary small" type="button">全选本区</button>
+                  <button id="delete-failed-bookmarks" class="options-button danger small" type="button" disabled>
+                    批量删除
+                  </button>
+                  <span id="availability-error-count" class="option-value">0 条异常</span>
+                </div>
+              </div>
+              <div id="availability-results" class="detect-results">
+                <div class="detect-empty">开始检测后，这里会展示高置信失效的书签。</div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            id="history"
+            class="options-panel"
+            data-section-panel="history"
+            aria-labelledby="history-title"
+            hidden
+          >
+            <p class="options-section-label">History</p>
+            <h1 id="history-title">检测历史</h1>
+            <p class="options-description">每次完整检测都会生成一条历史日志，保留最近多次结果，用于对比新增异常、已恢复结果和长期异常趋势。</p>
+
+            <div class="options-group">
+              <div class="option-row">
+                <div class="option-copy">
+                  <strong>历史范围</strong>
+                  <p id="history-scope-copy">当前显示范围：全部书签。这里只展示对应检测范围的历史日志与趋势变化。</p>
+                </div>
+                <button id="history-scope-trigger" class="scope-picker-trigger" type="button" aria-label="选择历史范围">
+                  <span id="history-scope-label">全部书签</span>
+                  <span class="scope-picker-caret" aria-hidden="true"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="options-group detect-history-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>检测历史</strong>
+                  <p id="availability-history-subtitle" class="detect-results-subtitle">完成一次检测后，这里会生成一条检测日志，保留最近多次结果用于趋势和连续异常对比。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <span id="availability-history-timestamp" class="option-value">尚无历史</span>
+                  <button id="availability-clear-history" class="options-button secondary small" type="button">清空历史日志</button>
+                </div>
+              </div>
+              <div class="detect-history-grid">
+                <article class="summary-card compact">
+                  <span class="summary-label">新增异常</span>
+                  <strong id="availability-history-new">0</strong>
+                </article>
+                <article class="summary-card compact">
+                  <span class="summary-label">持续异常</span>
+                  <strong id="availability-history-persistent">0</strong>
+                </article>
+                <article class="summary-card compact">
+                  <span class="summary-label">已恢复</span>
+                  <strong id="availability-history-recovered">0</strong>
+                </article>
+              </div>
+              <div class="detect-results-header history-subheader">
+                <div>
+                  <strong>检测日志</strong>
+                  <p class="detect-results-subtitle">每条日志会同时展示异常数量变化、新增异常、已恢复结果，以及各异常书签的连续异常次数。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <span id="availability-history-log-count" class="option-value">0 次记录</span>
+                  <button id="availability-toggle-history-logs" class="options-button secondary small" type="button">收起日志</button>
+                </div>
+              </div>
+              <div id="availability-history-log-list" class="detect-results compact">
+                <div class="detect-empty">完成检测后，这里会保留最近多次检测日志。</div>
+              </div>
+              <div class="detect-results-header history-subheader">
+                <div>
+                  <strong>最近一次已恢复</strong>
+                  <p class="detect-results-subtitle">这里会展示相较于上一轮已恢复的书签。</p>
+                </div>
+              </div>
+              <div id="availability-history-recovered-list" class="detect-results compact">
+                <div class="detect-empty">完成检测后，这里会展示相较于上一次已恢复的书签。</div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            id="ai"
+            class="options-panel"
+            data-section-panel="ai"
+            aria-labelledby="ai-title"
+            hidden
+          >
+            <p class="options-section-label">AI Naming</p>
+            <h1 id="ai-title">AI 智能命名</h1>
+            <p class="options-description">抓取网页标题与元信息后，调用 OpenAI-compatible 模型生成书签命名建议。只有你点击“应用”后，真实书签标题才会被修改。</p>
+
+            <div class="options-group">
+              <div class="option-row">
+                <div class="option-copy">
+                  <strong>命名范围</strong>
+                  <p id="ai-scope-copy">当前范围：全部书签。你可以切换到某个文件夹，只处理该文件夹及其子层级里的 `http/https` 书签。</p>
+                </div>
+                <button id="ai-scope-trigger" class="scope-picker-trigger" type="button" aria-label="选择 AI 命名范围">
+                  <span id="ai-scope-label">全部书签</span>
+                  <span class="scope-picker-caret" aria-hidden="true"></span>
+                </button>
+              </div>
+            </div>
+
+            <div class="options-group ai-provider-card">
+              <div class="ai-provider-head">
+                <div class="ai-provider-copy">
+                  <p id="ai-provider-notice-text" class="ai-provider-notice">需要填写密钥后才可用。`API Key` 仅保存在当前扩展的本地存储里。</p>
+                  <p class="ai-provider-subtitle">支持自定义 `baseUrl`、`apiKey` 与 `model`。当前实现要求目标服务兼容 OpenAI 的 `Responses API` 或 `Chat Completions API`。</p>
+                </div>
+                <span id="ai-config-status" class="options-chip muted">待配置</span>
+              </div>
+
+              <div class="ai-provider-layout">
+                <label class="ai-provider-field" for="ai-api-key">
+                  <span>API Key</span>
+                  <input
+                    id="ai-api-key"
+                    class="ai-provider-input"
+                    type="password"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="sk-..."
+                  >
+                </label>
+
+                <label class="ai-provider-check" for="ai-reveal-api-key">
+                  <input id="ai-reveal-api-key" type="checkbox">
+                  <span>显示密码</span>
+                </label>
+
+                <label class="ai-provider-field" for="ai-model-select">
+                  <span>模型</span>
+                  <select id="ai-model-select" class="ai-provider-select"></select>
+                </label>
+
+                <p class="ai-provider-hint">
+                  可从预设列表选择模型；若目标服务使用自定义模型 ID，可在
+                  <button id="ai-manage-models" class="ai-inline-action" type="button">设置更多模型</button>
+                  里追加。
+                </p>
+
+                <p id="ai-connectivity-copy" class="ai-provider-connectivity muted">连通性测试会向当前接口发送一条最小请求，用于验证 Base URL、API Key、模型与接口类型是否可用。</p>
+
+                <details id="ai-advanced-settings" class="ai-advanced-details">
+                  <summary class="ai-advanced-summary">展开更多自定义选项</summary>
+                  <div class="ai-advanced-body">
+                    <div class="ai-settings-grid ai-settings-grid-advanced">
+                      <label class="ai-settings-field" for="ai-base-url">
+                        <span>自定义 API 接口地址</span>
+                        <input
+                          id="ai-base-url"
+                          class="ai-provider-input"
+                          type="url"
+                          spellcheck="false"
+                          autocomplete="off"
+                          placeholder="https://api.openai.com/v1"
+                        >
+                      </label>
+
+                      <label class="ai-settings-field" for="ai-api-style">
+                        <span>接口类型</span>
+                        <select id="ai-api-style" class="ai-provider-select">
+                          <option value="responses">Responses API</option>
+                          <option value="chat_completions">Chat Completions</option>
+                        </select>
+                      </label>
+
+                      <label class="ai-settings-field" for="ai-timeout-ms">
+                        <span>请求超时 (ms)</span>
+                        <input
+                          id="ai-timeout-ms"
+                          class="ai-provider-input"
+                          type="number"
+                          min="5000"
+                          max="120000"
+                          step="1000"
+                          inputmode="numeric"
+                          placeholder="30000"
+                        >
+                      </label>
+
+                      <label class="ai-settings-field" for="ai-batch-size">
+                        <span>每批最大请求数</span>
+                        <input
+                          id="ai-batch-size"
+                          class="ai-provider-input"
+                          type="number"
+                          min="1"
+                          max="20"
+                          step="1"
+                          inputmode="numeric"
+                          placeholder="6"
+                        >
+                      </label>
+                    </div>
+
+                    <p class="ai-provider-field-tip">`Base URL` 可填写到 `/v1`，也可以直接填写到 `/v1/responses` 或 `/v1/chat/completions`。</p>
+
+                    <label class="ai-settings-toggle ai-settings-toggle-advanced" for="ai-auto-select-high">
+                      <input id="ai-auto-select-high" type="checkbox">
+                      <span>自动勾选高置信建议</span>
+                    </label>
+
+                    <label class="ai-settings-field wide" for="ai-system-prompt">
+                      <span>System Prompt 覆盖（可选）</span>
+                      <textarea
+                        id="ai-system-prompt"
+                        class="ai-settings-textarea"
+                        spellcheck="false"
+                        placeholder="留空则使用内置提示词。"
+                      ></textarea>
+                    </label>
+                  </div>
+                </details>
+              </div>
+            </div>
+
+            <div class="detect-toolbar">
+              <div class="detect-permission-card">
+                <div class="detect-permission-meta">
+                  <span id="ai-run-badge" class="options-chip muted">AI 命名</span>
+                  <strong>执行方式</strong>
+                </div>
+                <p id="ai-status-copy">保存配置后，系统会先抓取网页标题与元信息，再分批调用 AI 生成命名建议。建议生成后，你可以先预览并手动选择要应用的标题。</p>
+              </div>
+
+              <div class="detect-toolbar-actions">
+                <button id="ai-save-settings" class="options-button secondary" type="button">保存 AI 配置</button>
+                <button id="ai-test-connection" class="options-button secondary" type="button">测试连接</button>
+                <button id="ai-action" class="options-button" type="button">开始生成建议</button>
+                <button id="ai-stop-action" class="options-button secondary small hidden" type="button" disabled>停止本次生成</button>
+              </div>
+            </div>
+
+            <div class="detect-progress-card">
+              <div class="detect-progress-meta">
+                <strong>执行进度</strong>
+                <span id="ai-progress-text">未开始</span>
+              </div>
+              <div class="detect-progress-track" aria-hidden="true">
+                <span id="ai-progress-bar" class="detect-progress-bar"></span>
+              </div>
+              <p id="ai-progress-copy" class="detect-status-copy">先抓取书签指向的网页元信息，再把结果分批发送给 AI 模型生成命名建议。</p>
+            </div>
+
+            <div class="detect-summary-grid">
+              <article class="summary-card">
+                <span class="summary-label">可处理</span>
+                <strong id="ai-eligible">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">已建议</span>
+                <strong id="ai-suggested">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">待确认</span>
+                <strong id="ai-manual-review">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">无需改名</span>
+                <strong id="ai-unchanged">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">高置信</span>
+                <strong id="ai-high-confidence">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">中置信</span>
+                <strong id="ai-medium-confidence">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">低置信</span>
+                <strong id="ai-low-confidence">0</strong>
+              </article>
+              <article class="summary-card">
+                <span class="summary-label">失败</span>
+                <strong id="ai-failed">0</strong>
+              </article>
+            </div>
+
+            <div id="ai-selection-group" class="options-group detect-selection-group hidden">
+              <div class="detect-results-header">
+                <div>
+                  <strong id="ai-selection-count">0 条已选择</strong>
+                  <p class="detect-results-subtitle">只会应用状态为“建议改名”的条目；“待确认”与“失败”结果需要先人工判断。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="ai-select-all" class="options-button secondary small" type="button">全选</button>
+                  <button id="ai-select-high-confidence" class="options-button secondary small" type="button">全选高置信</button>
+                  <button id="ai-clear-selection" class="options-button secondary small" type="button">清空选择</button>
+                  <button id="ai-apply-selection" class="options-button small" type="button">应用所选建议</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>命名建议</strong>
+                  <p id="ai-results-subtitle" class="detect-results-subtitle">配置 AI 提供方后，开始生成建议，这里会展示当前标题、建议标题、置信度与原因。</p>
+                </div>
+                <span id="ai-result-count" class="option-value">0 条结果</span>
+              </div>
+              <div id="ai-results" class="detect-results">
+                <div class="detect-empty">保存 AI 配置并开始生成建议后，这里会展示批量预览结果。</div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            id="redirects"
+            class="options-panel"
+            data-section-panel="redirects"
+            aria-labelledby="redirects-title"
+            hidden
+          >
+            <p class="options-section-label">Redirects</p>
+            <h1 id="redirects-title">重定向更新</h1>
+            <p class="options-description">当检测发现书签已经稳定跳转到新地址时，可以在这里一键把原书签更新为最终 URL。</p>
+
+            <div id="redirect-selection-group" class="options-group detect-selection-group hidden">
+              <div class="detect-results-header">
+                <div>
+                  <strong id="redirect-selection-count">0 条已选择</strong>
+                  <p class="detect-results-subtitle">可批量更新这些重定向书签为最终地址，或直接批量删除并移入回收站。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="redirect-clear-selection" class="options-button secondary small" type="button">清空选择</button>
+                  <button id="redirect-batch-update" class="options-button small" type="button">批量更新最终 URL</button>
+                  <button id="redirect-delete-selection" class="options-button danger small" type="button">删除所选</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>待更新重定向</strong>
+                  <p id="redirect-results-subtitle" class="detect-results-subtitle">完成检测后，这里会展示原书签地址与最终落地地址不一致的结果。结果会本地缓存，刷新页面后仍可直接更新。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="redirect-select-all" class="options-button secondary small" type="button">全选本区</button>
+                  <button id="redirect-delete-all" class="options-button danger small" type="button">批量删除本区</button>
+                  <span id="redirect-count" class="option-value">0 条待更新</span>
+                </div>
+              </div>
+              <div id="redirect-results" class="detect-results">
+                <div class="detect-empty">完成一次检测后，这里会展示可一键更新的重定向书签。</div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            id="duplicates"
+            class="options-panel"
+            data-section-panel="duplicates"
+            aria-labelledby="duplicates-title"
+            hidden
+          >
+            <p class="options-section-label">Duplicates</p>
+            <h1 id="duplicates-title">重复书签检测</h1>
+            <p class="options-description">按归一化 URL 自动归类重复书签，支持保留最新、保留指定文件夹或批量合并删除。</p>
+
+            <div id="duplicate-selection-group" class="options-group detect-selection-group hidden">
+              <div class="detect-results-header">
+                <div>
+                  <strong id="duplicate-selection-count">0 条已选择</strong>
+                  <p class="detect-results-subtitle">你可以对这些重复项执行批量合并删除。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="duplicate-clear-selection" class="options-button secondary small" type="button">清空选择</button>
+                  <button id="duplicate-delete-selection" class="options-button danger small" type="button">批量合并删除</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>重复分组</strong>
+                  <p id="duplicate-results-subtitle" class="detect-results-subtitle">同一归一化地址下出现多个书签时，会归到同一组。</p>
+                </div>
+                <span id="duplicate-group-count" class="option-value">0 组重复</span>
+              </div>
+              <div id="duplicate-groups" class="detect-results">
+                <div class="detect-empty">正在分析重复书签。</div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            id="ignore"
+            class="options-panel"
+            data-section-panel="ignore"
+            aria-labelledby="ignore-title"
+            hidden
+          >
+            <p class="options-section-label">Ignore Rules</p>
+            <h1 id="ignore-title">忽略规则 / 白名单</h1>
+            <p class="options-description">你可以按单条书签、域名或文件夹压制重复提示。命中的低/高置信异常下次检测时会自动隐藏。</p>
+            <div class="options-group">
+              <div class="option-row">
+                <div class="option-copy">
+                  <strong>规则来源说明</strong>
+                  <p>忽略规则是从检测结果里指定的，不是提前手动录入。请先完成一次检测，再从低/高置信异常结果里添加要忽略的书签、域名或文件夹。</p>
+                </div>
+                <span class="option-value">检测结果生成</span>
+              </div>
+            </div>
+
+            <div class="detect-summary-grid compact-grid">
+              <article class="summary-card compact">
+                <span class="summary-label">书签规则</span>
+                <strong id="ignore-bookmark-count">0</strong>
+              </article>
+              <article class="summary-card compact">
+                <span class="summary-label">域名规则</span>
+                <strong id="ignore-domain-count">0</strong>
+              </article>
+              <article class="summary-card compact">
+                <span class="summary-label">文件夹规则</span>
+                <strong id="ignore-folder-count">0</strong>
+              </article>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>按书签忽略</strong>
+                  <p class="detect-results-subtitle">仅压制指定书签本身的异常提示。</p>
+                </div>
+                <button id="ignore-clear-bookmarks" class="options-button secondary small" type="button">清空本类</button>
+              </div>
+              <div id="ignore-bookmark-rules" class="detect-results">
+                <div class="detect-empty">暂无按书签忽略的规则。</div>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>按域名忽略</strong>
+                  <p class="detect-results-subtitle">同一域名下的异常提示会被压制。</p>
+                </div>
+                <button id="ignore-clear-domains" class="options-button secondary small" type="button">清空本类</button>
+              </div>
+              <div id="ignore-domain-rules" class="detect-results">
+                <div class="detect-empty">暂无按域名忽略的规则。</div>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>按文件夹忽略</strong>
+                  <p class="detect-results-subtitle">命中该文件夹及其子层级的异常提示会被压制。</p>
+                </div>
+                <button id="ignore-clear-folders" class="options-button secondary small" type="button">清空本类</button>
+              </div>
+              <div id="ignore-folder-rules" class="detect-results">
+                <div class="detect-empty">暂无按文件夹忽略的规则。</div>
+              </div>
+            </div>
+          </section>
+
+          <section
+            id="recycle"
+            class="options-panel"
+            data-section-panel="recycle"
+            aria-labelledby="recycle-title"
+            hidden
+          >
+            <p class="options-section-label">Recycle Bin</p>
+            <h1 id="recycle-title">回收站</h1>
+            <p class="options-description">所有通过设置页批量删除和弹窗删除的书签都会先记录到回收站，方便后续恢复。</p>
+
+            <div id="recycle-selection-group" class="options-group detect-selection-group hidden">
+              <div class="detect-results-header">
+                <div>
+                  <strong id="recycle-selection-count">0 条已选择</strong>
+                  <p class="detect-results-subtitle">可批量恢复选中的回收站书签。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="recycle-clear-selection" class="options-button secondary small" type="button">清空选择</button>
+                  <button id="recycle-restore-selection" class="options-button small" type="button">批量恢复</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="options-group detect-results-group">
+              <div class="detect-results-header">
+                <div>
+                  <strong>回收站条目</strong>
+                  <p id="recycle-results-subtitle" class="detect-results-subtitle">恢复时会优先尝试放回原文件夹；若原文件夹已不存在，则回到书签栏。</p>
+                </div>
+                <div class="detect-results-actions">
+                  <button id="recycle-select-all" class="options-button secondary small" type="button">全选本区</button>
+                  <button id="recycle-clear-all" class="options-button danger small" type="button">清空回收站</button>
+                  <span id="recycle-count" class="option-value">0 条回收站条目</span>
+                </div>
+              </div>
+              <div id="recycle-results" class="detect-results">
+                <div class="detect-empty">回收站当前为空。</div>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <div id="delete-modal-backdrop" class="options-modal-backdrop hidden" aria-hidden="true">
+      <section class="options-modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+        <p class="options-section-label danger">Delete</p>
+        <h2 id="delete-modal-title">批量删除高置信异常书签？</h2>
+        <p id="delete-modal-copy" class="options-modal-copy">这些书签会从 Chrome 书签中移除，并直接从当前高置信异常列表里消失；低置信异常结果会保留。</p>
+        <div class="options-modal-actions">
+          <button id="cancel-delete-modal" class="options-button secondary" type="button">取消</button>
+          <button id="confirm-delete-modal" class="options-button danger" type="button">确认删除</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="move-modal-backdrop" class="options-modal-backdrop hidden" aria-hidden="true">
+      <section class="options-modal options-modal-wide" role="dialog" aria-modal="true" aria-labelledby="move-modal-title">
+        <p class="options-section-label">Move</p>
+        <h2 id="move-modal-title">批量移动书签</h2>
+        <p id="move-modal-copy" class="options-modal-copy">请选择一个目标文件夹，所选书签会被一起移动到该位置。</p>
+        <label class="options-search">
+          <span class="options-search-label">搜索目标文件夹</span>
+          <input id="move-search-input" class="options-search-input" type="search" placeholder="搜索文件夹名称或路径">
+        </label>
+        <div id="move-folder-results" class="detect-results modal-results">
+          <div class="detect-empty">正在加载文件夹列表。</div>
+        </div>
+        <div class="options-modal-actions">
+          <button id="cancel-move-modal" class="options-button secondary" type="button">取消</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="scope-modal-backdrop" class="options-modal-backdrop hidden" aria-hidden="true">
+      <section class="options-modal options-modal-wide" role="dialog" aria-modal="true" aria-labelledby="scope-modal-title">
+        <p class="options-section-label">Folder Filter</p>
+        <h2 id="scope-modal-title">选择筛选文件夹</h2>
+        <p id="scope-modal-copy" class="options-modal-copy">请选择一个文件夹作为当前筛选范围，可直接搜索文件夹名称或路径。</p>
+        <label class="options-search">
+          <span class="options-search-label">搜索文件夹</span>
+          <input id="scope-search-input" class="options-search-input" type="search" placeholder="搜索文件夹名称或路径">
+        </label>
+        <div id="scope-folder-results" class="detect-results modal-results" role="listbox">
+          <div class="detect-empty">正在加载文件夹列表。</div>
+        </div>
+        <div class="options-modal-actions">
+          <button id="cancel-scope-modal" class="options-button secondary" type="button">关闭</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="ai-model-modal-backdrop" class="options-modal-backdrop hidden" aria-hidden="true">
+      <section class="options-modal ai-model-modal" role="dialog" aria-modal="true" aria-labelledby="ai-model-modal-title">
+        <button id="close-ai-model-modal" class="options-modal-close" type="button" aria-label="关闭自定义模型弹窗">×</button>
+        <p class="options-section-label">Custom Models</p>
+        <h2 id="ai-model-modal-title">自定义模型列表</h2>
+        <p class="options-modal-copy">输入自定义模型名称，多个模型可用换行、英文逗号或分号分隔。保存后会出现在模型下拉列表里。</p>
+        <label class="ai-settings-field" for="ai-custom-models-input">
+          <span>模型列表</span>
+          <textarea
+            id="ai-custom-models-input"
+            class="ai-model-list-textarea"
+            spellcheck="false"
+            placeholder="gpt-5-mini&#10;my-provider/model-alpha"
+          ></textarea>
+        </label>
+        <p class="ai-model-modal-hint">这里只保存模型 ID，不解析别名、加减号或批量隐藏语法。</p>
+        <div class="options-modal-actions ai-model-modal-actions">
+          <button id="cancel-ai-model-modal" class="options-button secondary" type="button">取消</button>
+          <button id="save-ai-model-modal" class="options-button" type="button">保存</button>
+        </div>
+      </section>
+    </div>
+
+    <script type="module" src="./options.ts"></script>
+  </body>
+</html>

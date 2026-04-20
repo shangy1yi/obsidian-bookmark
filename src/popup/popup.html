@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>黑曜书签</title>
+    <link rel="stylesheet" href="./popup.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="hero">
+        <div class="hero-brand">
+          <div class="hero-mark" aria-hidden="true">
+            <img class="hero-logo" src="../assets/icon4096.jpg" alt="">
+          </div>
+          <div class="hero-copy">
+            <p class="hero-eyebrow">Chrome Bookmark Manager</p>
+            <h1>黑曜书签</h1>
+            <p class="hero-subtitle" id="hero-subtitle">本地读取，不上传任何书签内容</p>
+          </div>
+        </div>
+        <button id="open-settings" class="hero-settings-button" type="button" aria-label="打开设置页">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path
+              d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.757.426 1.757 2.924 0 3.35a1.724 1.724 0 0 0-1.065 2.573c.94 1.543-.827 3.31-2.37 2.37a1.724 1.724 0 0 0-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.572-1.066c-1.543.94-3.31-.827-2.37-2.37a1.724 1.724 0 0 0-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.572c-.94-1.544.827-3.31 2.37-2.37.996.608 2.296.07 2.572-1.066Z"
+              stroke="currentColor"
+              stroke-width="1.35"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            ></path>
+            <circle cx="12" cy="12" r="3.1" stroke="currentColor" stroke-width="1.35"></circle>
+          </svg>
+        </button>
+      </header>
+
+      <section class="filter-row">
+        <button id="folder-filter-trigger" class="filter-trigger" type="button">
+          全部文件夹
+        </button>
+        <button id="clear-folder-filter" class="filter-clear hidden" type="button">
+          清除筛选
+        </button>
+      </section>
+
+      <label class="search-shell" for="search-input">
+        <span class="search-icon" aria-hidden="true"></span>
+        <input
+          id="search-input"
+          class="search-input"
+          type="search"
+          spellcheck="false"
+          autocomplete="off"
+          autofocus
+          placeholder="搜索书签名称或网址"
+        >
+        <button id="clear-search" class="clear-search hidden" type="button" aria-label="清空搜索">
+          清空
+        </button>
+      </label>
+
+      <section class="toolbar">
+        <p class="view-caption" id="view-caption">书签栏</p>
+        <p class="key-hint">↑ ↓ 切换 · Enter 打开 · Esc 返回</p>
+      </section>
+
+      <section id="error-banner" class="error-banner hidden" role="alert"></section>
+
+      <section class="content-shell">
+        <div id="loading-state" class="state-panel">正在加载书签…</div>
+        <div id="empty-state" class="state-panel hidden"></div>
+        <div id="content" class="content" role="list"></div>
+      </section>
+    </main>
+
+    <div id="modal-backdrop" class="modal-backdrop hidden" aria-hidden="true">
+      <section id="filter-modal" class="modal-card hidden" role="dialog" aria-modal="true" aria-labelledby="filter-modal-title">
+        <header class="modal-header">
+          <div>
+            <p class="modal-eyebrow">文件夹筛选</p>
+            <h2 id="filter-modal-title">选择筛选文件夹</h2>
+          </div>
+          <button id="close-filter-modal" class="icon-button ghost" type="button" aria-label="关闭筛选面板">
+            关闭
+          </button>
+        </header>
+
+        <label class="search-shell modal-search" for="filter-search-input">
+          <span class="search-icon" aria-hidden="true"></span>
+          <input
+            id="filter-search-input"
+            class="search-input"
+            type="search"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="搜索文件夹名称或路径"
+          >
+        </label>
+
+        <div id="filter-folder-list" class="modal-list" role="listbox"></div>
+      </section>
+
+      <section id="move-modal" class="modal-card hidden" role="dialog" aria-modal="true" aria-labelledby="move-modal-title">
+        <header class="modal-header">
+          <div>
+            <p class="modal-eyebrow">移动书签</p>
+            <h2 id="move-modal-title">选择目标文件夹</h2>
+          </div>
+          <button id="close-move-modal" class="icon-button ghost" type="button" aria-label="关闭移动面板">
+            关闭
+          </button>
+        </header>
+
+        <div class="modal-bookmark-card">
+          <p class="modal-card-label">当前书签</p>
+          <p id="move-bookmark-title" class="modal-card-title"></p>
+          <p id="move-bookmark-path" class="modal-card-path"></p>
+        </div>
+
+        <label class="search-shell modal-search" for="move-search-input">
+          <span class="search-icon" aria-hidden="true"></span>
+          <input
+            id="move-search-input"
+            class="search-input"
+            type="search"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="搜索目标文件夹"
+          >
+        </label>
+
+        <div id="move-folder-list" class="modal-list" role="tree"></div>
+      </section>
+
+      <section id="edit-modal" class="modal-card hidden" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+        <header class="modal-header">
+          <div>
+            <p class="modal-eyebrow">编辑书签</p>
+            <h2 id="edit-modal-title">修改标题与网址</h2>
+          </div>
+          <button id="close-edit-modal" class="icon-button ghost" type="button" aria-label="关闭编辑面板">
+            关闭
+          </button>
+        </header>
+
+        <div class="modal-bookmark-card">
+          <p class="modal-card-label">来源路径</p>
+          <p id="edit-bookmark-path" class="modal-card-path"></p>
+        </div>
+
+        <div class="modal-form">
+          <label class="modal-field" for="edit-title-input">
+            <span class="modal-label">标题</span>
+            <input id="edit-title-input" class="modal-input" type="text" spellcheck="false" maxlength="512">
+          </label>
+          <label class="modal-field" for="edit-url-input">
+            <span class="modal-label">网址</span>
+            <input id="edit-url-input" class="modal-input" type="url" spellcheck="false" inputmode="url">
+          </label>
+        </div>
+
+        <footer class="modal-actions">
+          <button id="cancel-edit" class="secondary-button" type="button">取消</button>
+          <button id="save-edit" class="secondary-button primary-button" type="button">保存</button>
+        </footer>
+      </section>
+
+      <section id="delete-modal" class="modal-card small hidden" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+        <header class="modal-header compact">
+          <div>
+            <p class="modal-eyebrow danger">删除确认</p>
+            <h2 id="delete-modal-title">确认删除该书签？</h2>
+          </div>
+        </header>
+
+        <div class="modal-bookmark-card">
+          <p class="modal-card-label">即将删除</p>
+          <p id="delete-bookmark-title" class="modal-card-title"></p>
+          <p id="delete-bookmark-path" class="modal-card-path"></p>
+        </div>
+
+        <footer class="modal-actions">
+          <button id="cancel-delete" class="secondary-button" type="button">取消</button>
+          <button id="confirm-delete" class="danger-button" type="button">删除</button>
+        </footer>
+      </section>
+    </div>
+
+    <section id="toast-root" class="toast-root" aria-live="polite" aria-atomic="true"></section>
+
+    <script type="module" src="./popup.ts"></script>
+  </body>
+</html>
