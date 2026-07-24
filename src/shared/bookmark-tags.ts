@@ -4,9 +4,14 @@ import {
   configureBookmarkTagRepository,
   loadBookmarkTagIndexFromRepository,
   resetBookmarkTagRepositoryForTest,
+  restoreBookmarkTagIndexInRepositoryStrict,
   saveBookmarkTagIndexToRepository,
   updateBookmarkTagIndexInRepository
 } from './repositories/tag-repository.js'
+import {
+  withLocalStorageTransaction,
+  type LocalStorageTransaction
+} from './storage.js'
 import type { BookmarkRecord } from './types.js'
 
 export const BOOKMARK_TAG_SCHEMA_VERSION = 1
@@ -403,21 +408,86 @@ configureBookmarkTagRepository({
   normalizeRecord: normalizeBookmarkTagRecord
 })
 
-export async function loadBookmarkTagIndex(): Promise<BookmarkTagIndex> {
-  return loadBookmarkTagIndexFromRepository()
+export async function loadBookmarkTagIndex(
+  { transaction = null }: { transaction?: LocalStorageTransaction | null } = {}
+): Promise<BookmarkTagIndex> {
+  if (!transaction) {
+    return withLocalStorageTransaction((activeTransaction) => {
+      return loadBookmarkTagIndex({ transaction: activeTransaction })
+    })
+  }
+
+  return loadBookmarkTagIndexFromRepository(transaction)
 }
 
-export async function saveBookmarkTagIndex(index: BookmarkTagIndex): Promise<BookmarkTagIndex> {
+export async function saveBookmarkTagIndex(
+  index: BookmarkTagIndex,
+  {
+    transaction = null,
+    updatedAt = Date.now()
+  }: {
+    transaction?: LocalStorageTransaction | null
+    updatedAt?: number
+  } = {}
+): Promise<BookmarkTagIndex> {
+  if (!transaction) {
+    return withLocalStorageTransaction((activeTransaction) => {
+      return saveBookmarkTagIndex(index, {
+        transaction: activeTransaction,
+        updatedAt
+      })
+    })
+  }
+
   const normalized = normalizeBookmarkTagIndex({
     ...index,
-    updatedAt: Date.now()
+    updatedAt
   })
   assertBookmarkTagIndexWithinQuota(normalized)
-  return saveBookmarkTagIndexToRepository(normalized)
+  return saveBookmarkTagIndexToRepository(normalized, transaction)
+}
+
+export async function restoreBookmarkTagIndexSnapshot(
+  index: BookmarkTagIndex,
+  { transaction = null }: { transaction?: LocalStorageTransaction | null } = {}
+): Promise<BookmarkTagIndex> {
+  if (!transaction) {
+    return withLocalStorageTransaction((activeTransaction) => {
+      return restoreBookmarkTagIndexSnapshot(index, { transaction: activeTransaction })
+    })
+  }
+
+  const normalized = normalizeBookmarkTagIndex(index)
+  assertBookmarkTagIndexWithinQuota(normalized)
+  const restored = await restoreBookmarkTagIndexInRepositoryStrict(
+    normalized,
+    transaction
+  )
+  const verified = await loadBookmarkTagIndexFromRepository(transaction)
+  if (
+    buildBookmarkTagIndexVerificationSignature(verified) !==
+    buildBookmarkTagIndexVerificationSignature(normalized)
+  ) {
+    throw new Error('标签数据回滚校验失败，已保留恢复日志以便重试。')
+  }
+  return restored
+}
+
+function buildBookmarkTagIndexVerificationSignature(index: BookmarkTagIndex): string {
+  const normalized = normalizeBookmarkTagIndex(index)
+  return JSON.stringify({
+    version: normalized.version,
+    updatedAt: normalized.updatedAt,
+    records: Object.keys(normalized.records)
+      .sort()
+      .map((bookmarkId) => [bookmarkId, normalized.records[bookmarkId]])
+  })
 }
 
 export async function clearBookmarkTagIndex(): Promise<void> {
-  await clearBookmarkTagIndexInRepository()
+  await withLocalStorageTransaction((transaction) => {
+    return clearBookmarkTagIndexInRepository(transaction)
+  })
 }
 
 export async function upsertBookmarkTagRecord(record: BookmarkTagRecord): Promise<BookmarkTagIndex> {
@@ -453,10 +523,12 @@ function updateBookmarkTagIndex(
   updater: (index: BookmarkTagIndex) => BookmarkTagIndex
 ): Promise<BookmarkTagIndex> {
   const task = bookmarkTagIndexWriteQueue.then(async () => {
-    return updateBookmarkTagIndexInRepository((current) => {
-      const nextIndex = normalizeBookmarkTagIndex(updater(current))
-      assertBookmarkTagIndexWithinQuota(nextIndex)
-      return nextIndex
+    return withLocalStorageTransaction((transaction) => {
+      return updateBookmarkTagIndexInRepository((current) => {
+        const nextIndex = normalizeBookmarkTagIndex(updater(current))
+        assertBookmarkTagIndexWithinQuota(nextIndex)
+        return nextIndex
+      }, transaction)
     })
   })
 

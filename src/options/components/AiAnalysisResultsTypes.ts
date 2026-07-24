@@ -4,6 +4,7 @@ export interface AiNamingResultCardViewModel {
   confidenceScorePercent: number | null
   currentTitle: string
   detailRows: string[]
+  errorMessage: string
   expandedTags: boolean
   id: string
   interactionLocked: boolean
@@ -62,7 +63,7 @@ export interface AiAnalysisResultsPaginationActionDetail {
   direction: AiAnalysisResultsPaginationDirection
 }
 
-export type AiAnalysisResultsFilterKey = 'confidence' | 'query' | 'status'
+export type AiAnalysisResultsFilterKey = 'query' | 'status'
 export type AiAnalysisResultsFilterAction = 'change' | 'clear'
 
 export interface AiAnalysisResultsFilterActionDetail {

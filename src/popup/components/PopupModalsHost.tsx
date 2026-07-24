@@ -99,7 +99,7 @@ const modalActionsClass = 'flex items-center justify-between gap-2.5'
 const modalStackClass =
   'relative grid h-full max-h-full min-h-0 w-full min-w-0 place-items-center overflow-hidden p-[18px] outline-none'
 const modalDismissLayerClass =
-  'absolute inset-0 z-0 block cursor-default border-0 bg-transparent transition-colors duration-[var(--ds-motion-feedback)] ease-ds-standard active:bg-black/20'
+  'absolute inset-0 z-0 block cursor-default border-0 bg-transparent'
 const modalCardShellClass = [
   'relative z-[1] flex min-h-0 flex-col gap-[11px] overflow-hidden rounded-ds-lg border border-ds-border bg-ds-surface-1 p-[13px] text-ds-text-primary shadow-none outline-none',
   'focus-visible:outline focus-visible:outline-2 focus-visible:outline-[rgba(245,245,247,0.86)] focus-visible:outline-offset-2'

@@ -4,7 +4,10 @@ import {
   ROOT_ID,
   STORAGE_KEYS
 } from '../shared/constants.js'
-import type { NavigationAttempt } from '../shared/types.js'
+import type {
+  AvailabilityResult,
+  NavigationAttempt
+} from '../shared/types.js'
 import {
   getLocalStorage,
   removeLocalStorage,
@@ -38,16 +41,19 @@ import {
   saveInboxSettings
 } from '../shared/inbox.js'
 import {
+  BACKUP_RESTORE_ROLLED_BACK_CODE,
   buildBackupRestorePreview,
   createAutoBackupBeforeDangerousOperation,
   createCuratorBackupFile,
   getBackupFileName,
   parseCuratorBackupFile,
-  restoreCuratorBackup,
   type BackupRestoreMode
 } from '../shared/backup.js'
 import {
+  AVAILABILITY_NAVIGATION_TIMEOUT_MIN_MS,
   cancelNavigationCheck,
+  requestAvailabilityProbe,
+  requestBackupRestore,
   requestNavigationCheck,
   requestRuntimeNotification
 } from '../shared/messages.js'
@@ -71,6 +77,13 @@ import {
   type AiProviderSettings
 } from '../shared/ai-runtime.js'
 import {
+  createAiFailureCircuit,
+  recordAiGenerationFailure,
+  recordAiGenerationSuccess,
+  type AiFailureCircuit,
+  type AiFailureCircuitDecision
+} from '../shared/ai-failure-circuit.js'
+import {
   getAiProviderAuthHeaders,
   getAiProviderBaseUrlIssue,
   getAnthropicMessagesEndpoint,
@@ -92,15 +105,20 @@ import {
   type AvailabilityRunOutcome,
   type AvailabilityRunScheduler
 } from './sections/availability-runner.js'
+import { createAvailabilityRunSessionCoordinator } from './sections/availability-run-session.js'
+import { createAvailabilityGlobalRunLockCoordinator } from './sections/availability-global-run-lock.js'
 import {
   FETCH_TIMEOUT_MS,
   buildNavigationSuccess,
   buildFailureClassification,
-  shouldRetryNavigation,
+  getSafeSameOriginRedirectUrl,
   shouldAcceptNavigationSuccess,
   shouldFallbackToGet,
-  classifyProbeResponse,
+  shouldRetryNavigation,
+  classifyAvailabilityProbeResult,
   classifyProbeError,
+  isUnverifiedAvailabilityErrorCode,
+  requireRepeatedFailureEvidence,
   isRedirectedNavigation
 } from './sections/classifier.js'
 import {
@@ -204,6 +222,7 @@ import {
   saveRedirectCache,
   synchronizeRedirectResults,
   persistRedirectCacheSnapshot,
+  mergeRetestedRedirectCache,
   removeRedirectIdsFromState,
   renderRedirectSection,
   toggleRedirectResultSelection,
@@ -217,6 +236,7 @@ import {
 import {
   hydrateDetectionHistory,
   getHistoricalAbnormalStreak,
+  hasMatchingPreviousHistoryEntry,
   syncHistoryComparisonScope,
   finalizeDetectionHistory,
   renderAvailabilityHistory,
@@ -317,6 +337,16 @@ let availabilityDurationTimer = 0
 let aiNamingDurationTimer = 0
 let availabilityPauseResolvers: Array<() => void> = []
 let availabilitySettingsDraft: AvailabilitySettingsDraft | null = null
+let availabilitySettingsDraftRevision = 0
+let availabilityCatalogRefreshPending = false
+let availabilityDeleteModalSnapshot: Array<{ id: string; expectedUrl: string }> = []
+const availabilityRunSessions = createAvailabilityRunSessionCoordinator()
+const availabilityGlobalRunLocks = createAvailabilityGlobalRunLockCoordinator({
+  lockManager:
+    typeof navigator !== 'undefined' && navigator.locks
+      ? navigator.locks as any
+      : null
+})
 let largeRepositoryHydrationStarted = false
 const AVAILABILITY_FILTERS = new Set([
   'all',
@@ -328,6 +358,7 @@ const AVAILABILITY_FILTERS = new Set([
   'recovered',
   'ignored'
 ])
+const AUTHORIZED_SAME_ORIGIN_REDIRECT_HOP_LIMIT = 4
 const AI_REJECTED_SUGGESTIONS_LIMIT = 500
 const AI_API_STYLE_OPTIONS = [
   { value: 'responses', label: 'Responses API' },
@@ -373,6 +404,7 @@ const recycleCallbacks = {
   getBookmarkRecord,
   removeDeletedResultsFromState,
   saveRedirectCache,
+  claimAvailabilityMutationLock,
   confirm: requestConfirmation
 }
 
@@ -387,13 +419,15 @@ const redirectsCallbacks = {
   getCurrentAvailabilityScopeMeta,
   hydrateAvailabilityCatalog,
   confirm: requestConfirmation,
+  claimAvailabilityMutationLock,
   recycleCallbacks
 }
 
 const historyCallbacks = {
   renderAvailabilitySection,
   getCurrentAvailabilityScopeMeta,
-  confirm: requestConfirmation
+  confirm: requestConfirmation,
+  claimAvailabilityMutationLock
 }
 
 const folderCleanupCallbacks = {
@@ -404,8 +438,14 @@ const folderCleanupCallbacks = {
 
 const ignoreCallbacks = {
   confirm: requestConfirmation,
+  claimAvailabilityMutationLock,
   onIgnoreRulesChanged() {
     repartitionAvailabilityResultsByIgnoreRules()
+    renderAvailabilitySection()
+  },
+  onIgnoreRulesError(error) {
+    availabilityState.lastError =
+      error instanceof Error ? `忽略规则保存失败：${error.message}` : '忽略规则保存失败。'
     renderAvailabilitySection()
   }
 }
@@ -428,6 +468,7 @@ async function startOptionsController(): Promise<void> {
     return
   }
   optionsControllerStarted = true
+  window.addEventListener('pagehide', cancelAvailabilityRunOnPageHide)
 
   const initialSectionKey = normalizeSectionKey(getCurrentSectionKey())
   if (initialSectionKey !== getCurrentSectionKey()) {
@@ -451,6 +492,15 @@ export function handleOptionsWindowSectionChange(_event?: Event): void {
 
 let bookmarkChangeRefreshHandle = 0
 export function handleOptionsBookmarkTreeChanged(): void {
+  if (hasActiveAvailabilityRunSession()) {
+    availabilityCatalogRefreshPending = true
+    if (bookmarkChangeRefreshHandle) {
+      window.clearTimeout(bookmarkChangeRefreshHandle)
+      bookmarkChangeRefreshHandle = 0
+    }
+    return
+  }
+
   if (bookmarkChangeRefreshHandle) {
     window.clearTimeout(bookmarkChangeRefreshHandle)
   }
@@ -754,7 +804,7 @@ export function handleAvailabilityResultAction(detail: AvailabilityResultActionD
     if (
       availabilityState.deleting ||
       availabilityState.stopRequested ||
-      (availabilityState.running && !availabilityState.paused)
+      availabilityState.runSessionActive
     ) {
       return
     }
@@ -922,9 +972,20 @@ function getSelectedNewTabFolderIds(rawFolderSettings?: unknown): string[] {
   return selectedFolderIds.flatMap(folderId => { const mappedResult = String(folderId || '').trim(); return mappedResult ? [mappedResult] : [] })
 }
 
-async function hydrateAvailabilityCatalog({ preserveResults = false, analyzeFolderCleanup = true } = {}) {
+async function hydrateAvailabilityCatalog({
+  preserveResults = false,
+  analyzeFolderCleanup = true,
+  preserveLastError = false
+} = {}) {
+  if (hasActiveAvailabilityRunSession()) {
+    availabilityCatalogRefreshPending = true
+    return
+  }
+
   availabilityState.catalogLoading = true
-  availabilityState.lastError = ''
+  if (!preserveLastError) {
+    availabilityState.lastError = ''
+  }
   scheduleAvailabilityRender()
 
   try {
@@ -1048,7 +1109,7 @@ function applyAvailabilityScope({ preserveResults = false } = {}) {
   }
 
   if (!eligibleBookmarks.length) {
-    availabilityState.lastError = '当前检测范围内没有可检测的 http/https 书签。'
+    availabilityState.lastError = '当前范围内没有适合外部检测的书签；敏感地址和不支持的链接已跳过。'
   }
 }
 
@@ -1113,16 +1174,15 @@ function getCurrentAiNamingScopeMeta() {
 }
 
 function resetAiNamingRunState() {
+  aiNamingState.runTotalBookmarks = 0
   aiNamingState.checkedBookmarks = 0
+  aiNamingState.completedBookmarkIds = new Set()
   aiNamingState.paused = false
   aiNamingState.pauseResolvers = []
   aiNamingState.suggestedCount = 0
   aiNamingState.rejectedCount = 0
   aiNamingState.manualReviewCount = 0
   aiNamingState.unchangedCount = 0
-  aiNamingState.highConfidenceCount = 0
-  aiNamingState.mediumConfidenceCount = 0
-  aiNamingState.lowConfidenceCount = 0
   aiNamingState.failedCount = 0
   aiNamingState.results = []
   aiNamingState.resultsPage = 1
@@ -1131,10 +1191,23 @@ function resetAiNamingRunState() {
   aiNamingState.pendingMoveSelection = false
   aiNamingState.runStartedAt = 0
   aiNamingState.lastCompletedAt = 0
+  aiNamingState.lastRunOutcome = ''
   aiNamingState.lastError = ''
   contentSnapshotState.aiRunSavedCount = 0
   contentSnapshotState.aiRunFailedCount = 0
   contentSnapshotState.statusMessage = ''
+}
+
+function markAiNamingBookmarkCompleted(bookmarkId: unknown) {
+  const normalizedBookmarkId = String(bookmarkId || '').trim()
+  if (!normalizedBookmarkId || aiNamingState.completedBookmarkIds.has(normalizedBookmarkId)) {
+    return
+  }
+
+  aiNamingState.completedBookmarkIds.add(normalizedBookmarkId)
+  aiNamingState.checkedBookmarks = aiNamingState.completedBookmarkIds.size
+  recalculateAiNamingSummary()
+  scheduleAvailabilityRender()
 }
 
 function syncAiNamingCatalog({ preserveResults = false } = {}) {
@@ -1318,9 +1391,6 @@ function recalculateAiNamingSummary() {
   aiNamingState.manualReviewCount = aiNamingState.results.filter((result) => result.status === 'manual_review').length
   aiNamingState.unchangedCount = aiNamingState.results.filter((result) => result.status === 'unchanged').length
   aiNamingState.failedCount = aiNamingState.results.filter((result) => result.status === 'failed').length
-  aiNamingState.highConfidenceCount = aiNamingState.results.filter((result) => result.confidence === 'high').length
-  aiNamingState.mediumConfidenceCount = aiNamingState.results.filter((result) => result.confidence === 'medium').length
-  aiNamingState.lowConfidenceCount = aiNamingState.results.filter((result) => result.confidence === 'low').length
 }
 
 async function hydrateAiNamingPermissionState() {
@@ -1366,6 +1436,7 @@ function resetCurrentAvailabilityRunState() {
   resetResultsPage('redirects')
   availabilityState.lastCompletedAt = 0
   availabilityState.lastRunOutcome = ''
+  availabilityState.runTotalBookmarks = 0
   availabilityState.runStartedAt = 0
   availabilityState.runnerStatusCopy = ''
   availabilityState.currentRunProbeEnabled = false
@@ -1386,30 +1457,31 @@ async function ensureProbePermissionForRun({ interactive = true, origins = avail
     return false
   }
 
-  try {
-    if (await containsPermissions({ origins: requestOrigins })) {
+  if (interactive) {
+    availabilityState.requestingPermission = true
+    scheduleAvailabilityRender()
+
+    try {
+      const granted = await requestPermissions({
+        origins: requestOrigins
+      })
       if (isCurrentScopeRequest) {
-        availabilityState.probePermissionGranted = true
+        availabilityState.probePermissionGranted = granted
       }
-      return true
-    }
-  } catch (error) {
-    if (isCurrentScopeRequest) {
-      availabilityState.probePermissionGranted = false
+      return granted
+    } catch (error) {
+      if (isCurrentScopeRequest) {
+        availabilityState.probePermissionGranted = false
+      }
+      return false
+    } finally {
+      availabilityState.requestingPermission = false
+      renderAvailabilitySection()
     }
   }
-
-  if (!interactive) {
-    return false
-  }
-
-  availabilityState.requestingPermission = true
-  scheduleAvailabilityRender()
 
   try {
-    const granted = await requestPermissions({
-      origins: requestOrigins
-    })
+    const granted = await containsPermissions({ origins: requestOrigins })
     if (isCurrentScopeRequest) {
       availabilityState.probePermissionGranted = granted
     }
@@ -1419,9 +1491,6 @@ async function ensureProbePermissionForRun({ interactive = true, origins = avail
       availabilityState.probePermissionGranted = false
     }
     return false
-  } finally {
-    availabilityState.requestingPermission = false
-    renderAvailabilitySection()
   }
 }
 
@@ -1439,33 +1508,189 @@ function hasSameOriginPermissions(left, right): boolean {
   )
 }
 
+function beginAvailabilityRunSession(kind: 'full' | 'retest'): string {
+  const session = availabilityRunSessions.claim(kind)
+  if (!session) {
+    return ''
+  }
+
+  availabilityState.paused = false
+  availabilityState.stopRequested = false
+  availabilityState.runSessionActive = true
+  availabilityState.abortController = new AbortController()
+  availabilityState.activeNavigationCheckIds = new Set()
+  availabilityState.deletedBookmarkIds = new Set()
+  renderAvailabilitySection()
+  return session.id
+}
+
+function hasActiveAvailabilityRunSession(): boolean {
+  return Boolean(availabilityRunSessions.getActive())
+}
+
+function isAvailabilityRunSessionOwner(sessionId: string): boolean {
+  return availabilityRunSessions.isOwner(sessionId)
+}
+
+async function finishAvailabilityRunSession(sessionId: string): Promise<void> {
+  if (!availabilityRunSessions.isOwner(sessionId)) {
+    return
+  }
+
+  availabilityState.abortController?.abort()
+  await cancelActiveNavigationChecks()
+  availabilityState.running = false
+  availabilityState.retestingSelection = false
+  availabilityState.runSessionActive = false
+  availabilityState.paused = false
+  availabilityState.stopRequested = false
+  availabilityState.runQueue = []
+  availabilityState.deletedBookmarkIds = new Set()
+  availabilityState.abortController = null
+  availabilityState.activeNavigationCheckIds = new Set()
+  availabilityState.currentRunProbeEnabled = false
+  availabilityState.retestSelectionProbeEnabled = false
+  releaseAvailabilityPauseResolvers()
+  availabilityRunSessions.release(sessionId)
+  availabilityGlobalRunLocks.release(sessionId)
+
+  if (availabilityCatalogRefreshPending) {
+    availabilityCatalogRefreshPending = false
+    void hydrateAvailabilityCatalog({
+      preserveResults: true,
+      analyzeFolderCleanup: false,
+      preserveLastError: true
+    })
+      .catch((error) => {
+        console.warn('Curator: 检测结束后的书签目录重新加载失败。', error)
+      })
+  }
+}
+
+async function acquireGlobalAvailabilityRunLock(sessionId: string): Promise<boolean> {
+  const acquired = await availabilityGlobalRunLocks.acquire(sessionId)
+  if (!isAvailabilityRunSessionOwner(sessionId) || availabilityState.stopRequested) {
+    if (acquired) {
+      availabilityGlobalRunLocks.release(sessionId)
+    }
+    return false
+  }
+
+  if (!acquired) {
+    availabilityState.lastError = navigator.locks
+      ? '另一个 Curator 设置页正在执行可用性检测，请等待其完成后重试。'
+      : '当前浏览器不支持安全的跨页面检测锁，已取消本次检测。'
+    return false
+  }
+
+  try {
+    await refreshAvailabilityPersistentStateUnderLock()
+  } catch (error) {
+    availabilityGlobalRunLocks.release(sessionId)
+    availabilityState.lastError =
+      error instanceof Error
+        ? `检测状态同步失败：${error.message}`
+        : '检测状态同步失败，已取消本次检测。'
+    return false
+  }
+  return true
+}
+
+async function claimAvailabilityMutationLock(): Promise<(() => void) | null> {
+  const mutationId = `mutation-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`
+  const acquired = await availabilityGlobalRunLocks.acquire(mutationId)
+  if (!acquired) {
+    availabilityState.lastError = navigator.locks
+      ? '另一个 Curator 设置页正在修改或检测可用性数据，请稍后重试。'
+      : '当前浏览器不支持安全的跨页面数据锁，已取消操作。'
+    renderAvailabilitySection()
+    return null
+  }
+
+  try {
+    await refreshAvailabilityPersistentStateUnderLock()
+  } catch (error) {
+    availabilityGlobalRunLocks.release(mutationId)
+    availabilityState.lastError =
+      error instanceof Error
+        ? `可用性数据同步失败：${error.message}`
+        : '可用性数据同步失败，已取消操作。'
+    renderAvailabilitySection()
+    return null
+  }
+
+  return () => {
+    availabilityGlobalRunLocks.release(mutationId)
+  }
+}
+
+async function refreshAvailabilityPersistentStateUnderLock(): Promise<void> {
+  const stored = await getLocalStorage([
+    STORAGE_KEYS.ignoreRules,
+    STORAGE_KEYS.detectionHistory,
+    STORAGE_KEYS.redirectCache,
+    STORAGE_KEYS.availabilitySettings,
+    STORAGE_KEYS.recycleBin
+  ])
+  managerState.ignoreRules = normalizeIgnoreRules(stored[STORAGE_KEYS.ignoreRules])
+  hydrateDetectionHistory(stored[STORAGE_KEYS.detectionHistory], historyCallbacks)
+  managerState.redirectCache = normalizeRedirectCache(stored[STORAGE_KEYS.redirectCache])
+  availabilityState.settings = normalizeAvailabilityRunnerUserSettings(
+    stored[STORAGE_KEYS.availabilitySettings]
+  )
+  managerState.recycleBin = normalizeRecycleBin(stored[STORAGE_KEYS.recycleBin])
+}
+
 async function handleAvailabilityAction() {
   if (
-    availabilityState.running ||
-    availabilityState.retestingSelection ||
+    hasActiveAvailabilityRunSession() ||
+    backupRestoreState.restoring ||
     availabilityState.catalogLoading ||
     availabilityState.requestingPermission ||
+    availabilityState.settingsSaving ||
     availabilityState.deleting
   ) {
     return
   }
 
   if (!availabilityState.bookmarks.length) {
-    availabilityState.lastError = '当前没有可检测的 http/https 书签。'
+    availabilityState.lastError = '当前没有适合外部检测的书签；敏感地址和不支持的链接已跳过。'
     renderAvailabilitySection()
     return
   }
 
-  const probeEnabled = await ensureProbePermissionForRun({ interactive: true })
-  if (!probeEnabled) {
-    availabilityState.currentRunProbeEnabled = false
-    availabilityState.lastError = '未授予当前检测范围的目标网站访问权限，已取消本次检测。'
-    renderAvailabilitySection()
+  availabilityState.lastError = ''
+  const sessionId = beginAvailabilityRunSession('full')
+  if (!sessionId) {
     return
   }
 
-  availabilityState.currentRunProbeEnabled = probeEnabled
-  await runAvailabilityDetection({ probeEnabled })
+  try {
+    const probeEnabled = await ensureProbePermissionForRun({ interactive: true })
+    if (!isAvailabilityRunSessionOwner(sessionId) || availabilityState.stopRequested) {
+      availabilityState.lastError = '已取消本次检测。'
+      return
+    }
+    if (!probeEnabled) {
+      availabilityState.currentRunProbeEnabled = false
+      availabilityState.lastError = '未授予当前检测范围的目标网站访问权限，已取消本次检测。'
+      return
+    }
+    if (!(await acquireGlobalAvailabilityRunLock(sessionId))) {
+      return
+    }
+
+    availabilityState.currentRunProbeEnabled = probeEnabled
+    await runAvailabilityDetection({ probeEnabled, sessionId })
+  } catch (error) {
+    availabilityState.lastError =
+      error instanceof Error ? error.message : '书签可用性检测启动失败，请稍后重试。'
+  } finally {
+    if (isAvailabilityRunSessionOwner(sessionId)) {
+      await finishAvailabilityRunSession(sessionId)
+      renderAvailabilitySection()
+    }
+  }
 }
 
 async function handleAvailabilityScopeChange(nextScopeFolderId) {
@@ -1477,7 +1702,14 @@ async function handleAvailabilityScopeChange(nextScopeFolderId) {
 }
 
 function toggleAvailabilityPause() {
-  if (!availabilityState.running || availabilityState.deleting || availabilityState.stopRequested) {
+  const activeSession = availabilityRunSessions.getActive()
+  if (
+    !availabilityState.running ||
+    activeSession?.kind !== 'full' ||
+    activeSession.phase !== 'running' ||
+    availabilityState.deleting ||
+    availabilityState.stopRequested
+  ) {
     return
   }
 
@@ -1491,14 +1723,21 @@ function toggleAvailabilityPause() {
 }
 
 function requestAvailabilityStop() {
-  if (!availabilityState.running || availabilityState.deleting || availabilityState.stopRequested) {
+  const activeSession = availabilityRunSessions.getActive()
+  if (
+    !activeSession ||
+    activeSession.phase === 'finalizing' ||
+    availabilityState.deleting ||
+    availabilityState.stopRequested
+  ) {
     return
   }
 
+  availabilityRunSessions.transition(activeSession.id, 'stopping')
   availabilityState.stopRequested = true
   availabilityState.paused = false
   availabilityState.abortController?.abort()
-  cancelActiveNavigationChecks()
+  void cancelActiveNavigationChecks()
   releaseAvailabilityPauseResolvers()
   renderAvailabilitySection()
 }
@@ -1509,45 +1748,65 @@ function createAvailabilityScheduler() {
   })
 }
 
-async function runAvailabilityDetection({ probeEnabled }) {
+async function runAvailabilityDetection({
+  probeEnabled,
+  sessionId
+}: {
+  probeEnabled: boolean
+  sessionId: string
+}) {
+  if (!availabilityRunSessions.transition(sessionId, 'running')) {
+    await finishAvailabilityRunSession(sessionId)
+    return
+  }
+
   const redirectCacheScope = getCurrentAvailabilityScopeMeta()
   const scheduler = createAvailabilityScheduler()
   const runStartedAt = Date.now()
   availabilityState.running = true
   availabilityState.paused = false
-  availabilityState.stopRequested = false
   availabilityState.lastError = ''
   availabilityState.lastCompletedAt = 0
   availabilityState.lastRunOutcome = ''
   availabilityState.runStartedAt = runStartedAt
   updateAvailabilityRunnerStatus(scheduler)
   availabilityState.runQueue = availabilityState.bookmarks.slice()
+  availabilityState.runTotalBookmarks = availabilityState.runQueue.length
   availabilityState.deletedBookmarkIds = new Set()
-  availabilityState.abortController = new AbortController()
-  availabilityState.activeNavigationCheckIds = new Set()
   resetDetectionResults()
   clearAvailabilitySelection()
   clearRedirectSelection(redirectsCallbacks)
   renderAvailabilitySection()
+  const persistenceWarnings: string[] = []
 
   try {
     await runAvailabilityQueue({
       items: availabilityState.runQueue,
       scheduler,
       getUrl: (bookmark) => bookmark?.url,
-      shouldContinue: waitForAvailabilityRun,
+      shouldContinue: () => waitForAvailabilityRun(sessionId),
       shouldSkip: (bookmark) => !bookmark || isBookmarkRemovedDuringRun(bookmark.id),
       wait: waitForAvailabilityQueueDelay,
       onWait: () => {
-        updateAvailabilityRunnerStatus(scheduler)
+        if (isAvailabilityRunSessionOwner(sessionId)) {
+          updateAvailabilityRunnerStatus(scheduler)
+        }
       },
       processItem: async (bookmark) => {
-        const result = await inspectBookmarkAvailability(bookmark, { probeEnabled, scheduler })
+        const result = await inspectBookmarkAvailability(bookmark, {
+          probeEnabled,
+          scheduler,
+          sessionId
+        })
         if (!result) {
           return
         }
 
-        if (isBookmarkRemovedDuringRun(result.id)) {
+        if (
+          !isAvailabilityRunSessionOwner(sessionId) ||
+          availabilityState.stopRequested ||
+          isBookmarkRemovedDuringRun(result.id)
+        ) {
           return
         }
 
@@ -1556,16 +1815,38 @@ async function runAvailabilityDetection({ probeEnabled }) {
       }
     })
 
+    const stopped = availabilityState.stopRequested
+    const catalogChangedDuringRun = availabilityCatalogRefreshPending
+    if (!stopped) {
+      availabilityRunSessions.transition(sessionId, 'finalizing')
+      renderAvailabilitySection()
+    }
+
     sortResultsByPath(availabilityState.reviewResults)
     sortResultsByPath(availabilityState.failedResults)
     sortResultsByPath(availabilityState.redirectResults)
-    if (!availabilityState.stopRequested) {
-      await finalizeDetectionHistory(historyCallbacks)
+    if (!stopped && !catalogChangedDuringRun) {
+      try {
+        await finalizeDetectionHistory({
+          ...historyCallbacks,
+          getCurrentAvailabilityScopeMeta: () => redirectCacheScope
+        }, {
+          checkedHealthyBookmarks: availabilityState.checkedHealthyBookmarkUrls,
+          checkedHealthyBookmarkIds: availabilityState.checkedHealthyBookmarkIds
+        })
+      } catch (error) {
+        const detail = error instanceof Error ? `：${error.message}` : ''
+        persistenceWarnings.push(`检测历史保存失败${detail}`)
+      }
     }
     availabilityState.lastCompletedAt = Date.now()
-    availabilityState.lastRunOutcome = availabilityState.stopRequested ? 'stopped' : 'completed'
+    availabilityState.lastRunOutcome = stopped
+      ? 'stopped'
+      : catalogChangedDuringRun
+        ? 'stale'
+        : 'completed'
     notifyAvailabilityRunFinished({
-      stopped: availabilityState.stopRequested,
+      stopped,
       startedAt: availabilityState.runStartedAt,
       completedAt: availabilityState.lastCompletedAt
     }).catch((error) => {
@@ -1578,15 +1859,40 @@ async function runAvailabilityDetection({ probeEnabled }) {
       itemCount: availabilityState.checkedBookmarks,
       fields: ['URL', 'HTTP 状态', '重定向地址', '错误码'],
       includesBody: false,
-      status: availabilityState.stopRequested ? 'cancelled' : 'success',
-      reason: availabilityState.stopRequested
+      status: stopped ? 'cancelled' : 'success',
+      reason: stopped
         ? `用户停止检测，已处理 ${availabilityState.checkedBookmarks} 条。`
+        : catalogChangedDuringRun
+          ? `检测期间书签目录发生变化，已处理 ${availabilityState.checkedBookmarks} 条；本轮未写入历史与重定向缓存。`
         : `完成检测：可访问 ${availabilityState.availableCount}，重定向 ${availabilityState.redirectedCount}，异常 ${availabilityState.reviewCount + availabilityState.failedCount}。`
     })
+
+    if (!stopped && !catalogChangedDuringRun) {
+      try {
+        await persistRedirectCacheSnapshot(redirectsCallbacks, {
+          savedAt: availabilityState.lastCompletedAt,
+          scope: redirectCacheScope
+        })
+      } catch (error) {
+        const detail = error instanceof Error ? `：${error.message}` : ''
+        persistenceWarnings.push(`重定向缓存保存失败${detail}`)
+      }
+    }
+    if (catalogChangedDuringRun) {
+      persistenceWarnings.push('检测期间书签发生变化，本轮结果未写入历史和缓存')
+    }
+    if (persistenceWarnings.length) {
+      availabilityState.lastError = `检测已完成，但${persistenceWarnings.join('；')}。`
+    }
   } catch (error) {
-    availabilityState.lastRunOutcome = ''
-    availabilityState.lastError =
-      error instanceof Error ? error.message : '书签可用性检测失败，请稍后重试。'
+    const stopped = availabilityState.stopRequested || isAbortError(error)
+    availabilityState.lastCompletedAt = stopped ? Date.now() : 0
+    availabilityState.lastRunOutcome = stopped ? 'stopped' : ''
+    availabilityState.lastError = stopped
+      ? `已停止检测，保留 ${availabilityState.checkedBookmarks} 条已完成结果。`
+      : error instanceof Error
+        ? error.message
+        : '书签可用性检测失败，请稍后重试。'
     recordPrivacyAudit({
       feature: 'availability-check',
       label: '死链/重定向检测',
@@ -1594,25 +1900,14 @@ async function runAvailabilityDetection({ probeEnabled }) {
       itemCount: availabilityState.checkedBookmarks,
       fields: ['URL', 'HTTP 状态', '重定向地址', '错误码'],
       includesBody: false,
-      status: 'error',
+      status: stopped ? 'cancelled' : 'error',
       reason: availabilityState.lastError
     })
   } finally {
-    availabilityState.running = false
-    availabilityState.paused = false
-    availabilityState.stopRequested = false
-    availabilityState.runQueue = []
-    availabilityState.deletedBookmarkIds = new Set()
-    availabilityState.abortController = null
-    availabilityState.activeNavigationCheckIds = new Set()
-    updateAvailabilityRunnerStatus(scheduler)
-    releaseAvailabilityPauseResolvers()
-    try {
-      await persistRedirectCacheSnapshot(redirectsCallbacks, {
-        savedAt: availabilityState.lastCompletedAt || Date.now(),
-        scope: redirectCacheScope
-      })
-    } catch {}
+    if (isAvailabilityRunSessionOwner(sessionId)) {
+      updateAvailabilityRunnerStatus(scheduler)
+    }
+    await finishAvailabilityRunSession(sessionId)
     renderAvailabilitySection()
   }
 }
@@ -1621,65 +1916,162 @@ async function inspectBookmarkAvailability(
   bookmark,
   {
     probeEnabled,
-    scheduler = null
+    scheduler = null,
+    sessionId
   }: {
     probeEnabled: boolean
     scheduler?: AvailabilityRunScheduler | null
+    sessionId: string
   }
 ) {
-  if (!(await waitForAvailabilityRun())) {
+  if (!(await waitForAvailabilityRun(sessionId))) {
     return null
   }
 
-  const attempts: NavigationAttempt[] = []
   const timeoutPolicy = scheduler?.getTimeoutPolicy(bookmark?.url) || {
     navigationTimeoutMs: NAVIGATION_TIMEOUT_MS,
     retryNavigationTimeoutMs: NAVIGATION_RETRY_TIMEOUT_MS,
     probeTimeoutMs: FETCH_TIMEOUT_MS
   }
 
-  const firstNavigation = await runNavigationAttempt(bookmark.url, timeoutPolicy.navigationTimeoutMs)
-  scheduler?.recordOutcome(bookmark.url, getNavigationAttemptRunOutcome(firstNavigation))
-  if (availabilityState.stopRequested) {
+  const attempts: NavigationAttempt[] = []
+  const runRecordedNavigationAttempt = async (
+    targetUrl: string,
+    timeoutMs: number
+  ): Promise<NavigationAttempt | null> => {
+    if (
+      !(await waitForAvailabilityRun(sessionId)) ||
+      !(await waitForAvailabilityCooldown(scheduler, targetUrl, sessionId))
+    ) {
+      return null
+    }
+
+    const attempt = await runNavigationAttempt(targetUrl, timeoutMs)
+    scheduler?.recordOutcome(
+      targetUrl,
+      getNavigationAttemptRunOutcome(attempt)
+    )
+    if (!isAvailabilityRunSessionOwner(sessionId) || availabilityState.stopRequested) {
+      return null
+    }
+    attempts.push(attempt)
+    return attempt
+  }
+
+  let activeNavigationUrl = bookmark.url
+  let navigation = await runRecordedNavigationAttempt(
+    activeNavigationUrl,
+    timeoutPolicy.navigationTimeoutMs
+  )
+  if (!navigation) {
     return null
   }
-  attempts.push(firstNavigation)
-
-  if (shouldAcceptNavigationSuccess(firstNavigation)) {
-    return buildNavigationSuccess(bookmark, firstNavigation, '首轮后台导航成功')
+  if (shouldAcceptNavigationSuccess(navigation)) {
+    return buildNavigationSuccess(bookmark, navigation, '首轮后台导航成功')
   }
 
-  if (shouldRetryNavigation(firstNavigation)) {
-    if (!(await waitForAvailabilityRun())) {
-      return null
+  const visitedNavigationUrls = new Set([
+    normalizeAvailabilityNavigationUrl(activeNavigationUrl)
+  ])
+  for (
+    let redirectHop = 0;
+    redirectHop < AUTHORIZED_SAME_ORIGIN_REDIRECT_HOP_LIMIT;
+    redirectHop += 1
+  ) {
+    const redirectUrl = await getAuthorizedSameOriginRedirectUrl(
+      activeNavigationUrl,
+      navigation
+    )
+    const normalizedRedirectUrl = normalizeAvailabilityNavigationUrl(redirectUrl)
+    if (!redirectUrl || !normalizedRedirectUrl || visitedNavigationUrls.has(normalizedRedirectUrl)) {
+      break
     }
 
-    const secondNavigation = await runNavigationAttempt(bookmark.url, timeoutPolicy.retryNavigationTimeoutMs)
-    scheduler?.recordOutcome(bookmark.url, getNavigationAttemptRunOutcome(secondNavigation))
-    if (availabilityState.stopRequested) {
+    visitedNavigationUrls.add(normalizedRedirectUrl)
+    activeNavigationUrl = redirectUrl
+    navigation = await runRecordedNavigationAttempt(
+      activeNavigationUrl,
+      timeoutPolicy.retryNavigationTimeoutMs
+    )
+    if (!navigation) {
       return null
     }
-    attempts.push(secondNavigation)
+    if (shouldAcceptNavigationSuccess(navigation)) {
+      return buildNavigationSuccess(
+        bookmark,
+        navigation,
+        `站内重定向第 ${redirectHop + 1} 跳成功`
+      )
+    }
+  }
 
-    if (shouldAcceptNavigationSuccess(secondNavigation)) {
-      return buildNavigationSuccess(bookmark, secondNavigation, '二次后台导航成功')
+  if (shouldRetryNavigation(navigation)) {
+    navigation = await runRecordedNavigationAttempt(
+      activeNavigationUrl,
+      timeoutPolicy.retryNavigationTimeoutMs
+    )
+    if (!navigation) {
+      return null
+    }
+    if (shouldAcceptNavigationSuccess(navigation)) {
+      return buildNavigationSuccess(bookmark, navigation, '重试后台导航成功')
     }
   }
 
   let probe = null
   if (probeEnabled) {
-    if (!(await waitForAvailabilityRun())) {
+    if (!(await waitForAvailabilityRun(sessionId))) {
+      return null
+    }
+    if (!(await waitForAvailabilityCooldown(scheduler, bookmark.url, sessionId))) {
       return null
     }
 
     probe = await probeBookmarkUrl(bookmark.url, { timeoutMs: timeoutPolicy.probeTimeoutMs })
     scheduler?.recordOutcome(bookmark.url, getProbeRunOutcome(probe))
-    if (availabilityState.stopRequested) {
+    if (!isAvailabilityRunSessionOwner(sessionId) || availabilityState.stopRequested) {
       return null
     }
   }
 
   return buildFailureClassification(bookmark, attempts, probe, probeEnabled)
+}
+
+async function getAuthorizedSameOriginRedirectUrl(
+  sourceUrl: string,
+  attempt: NavigationAttempt
+): Promise<string> {
+  const redirectUrl = getSafeSameOriginRedirectUrl(sourceUrl, attempt)
+  if (!redirectUrl) {
+    return ''
+  }
+
+  try {
+    const originPattern = getOriginPermissionPattern(redirectUrl)
+    if (
+      !originPattern ||
+      !(await containsPermissions({ origins: [originPattern] }))
+    ) {
+      return ''
+    }
+
+    return redirectUrl
+  } catch {
+    return ''
+  }
+}
+
+function normalizeAvailabilityNavigationUrl(url: unknown): string {
+  try {
+    const parsedUrl = new URL(String(url || '').trim())
+    if (!/^https?:$/i.test(parsedUrl.protocol)) {
+      return ''
+    }
+    parsedUrl.hash = ''
+    return parsedUrl.href
+  } catch {
+    return ''
+  }
 }
 
 async function notifyAvailabilityRunFinished({
@@ -1706,15 +2098,39 @@ async function notifyAvailabilityRunFinished({
   })
 }
 
-async function waitForAvailabilityRun() {
-  if (!availabilityState.paused || availabilityState.stopRequested) {
-    return !availabilityState.stopRequested
+async function waitForAvailabilityRun(sessionId: string): Promise<boolean> {
+  while (
+    isAvailabilityRunSessionOwner(sessionId) &&
+    availabilityState.paused &&
+    !availabilityState.stopRequested
+  ) {
+    await new Promise((resolve) => {
+      availabilityPauseResolvers.push(() => resolve(undefined))
+    })
   }
 
-  await new Promise((resolve) => {
-    availabilityPauseResolvers.push(() => resolve(undefined))
+  return isAvailabilityRunSessionOwner(sessionId) && !availabilityState.stopRequested
+}
+
+async function waitForAvailabilityCooldown(
+  scheduler: AvailabilityRunScheduler | null,
+  url: unknown,
+  sessionId: string
+): Promise<boolean> {
+  if (!scheduler) {
+    return waitForAvailabilityRun(sessionId)
+  }
+
+  return scheduler.waitForCooldown(url, {
+    signal: availabilityState.abortController?.signal,
+    shouldContinue: () => waitForAvailabilityRun(sessionId),
+    onWait: () => {
+      if (isAvailabilityRunSessionOwner(sessionId)) {
+        updateAvailabilityRunnerStatus(scheduler)
+        scheduleAvailabilityRender()
+      }
+    }
   })
-  return waitForAvailabilityRun()
 }
 
 function runSequentially<T>(items: T[], task: (item: T, index: number) => Promise<void>): Promise<void> {
@@ -1736,13 +2152,26 @@ function isBookmarkRemovedDuringRun(bookmarkId) {
   return availabilityState.deletedBookmarkIds.has(String(bookmarkId || '').trim())
 }
 
-async function runNavigationAttempt(url, timeoutMs): Promise<NavigationAttempt> {
+async function cancelActiveNavigationChecks(): Promise<void> {
+  const checkIds = [...(availabilityState.activeNavigationCheckIds || [])]
+  availabilityState.activeNavigationCheckIds = new Set()
+
+  await Promise.all(
+    checkIds.map((checkId) => cancelNavigationCheck(checkId).catch(() => {}))
+  )
+}
+
+async function runNavigationAttempt(
+  url: string,
+  timeoutMs: number
+): Promise<NavigationAttempt> {
+  throwIfAvailabilityProbeCancelled()
   const checkId = createNavigationCheckId()
-  availabilityState.activeNavigationCheckIds?.add(checkId)
+  availabilityState.activeNavigationCheckIds.add(checkId)
 
   try {
     const result = await requestNavigationCheck(url, timeoutMs, checkId)
-
+    throwIfAvailabilityProbeCancelled()
     return {
       status: result?.status || 'failed',
       finalUrl: result?.finalUrl || url,
@@ -1751,35 +2180,71 @@ async function runNavigationAttempt(url, timeoutMs): Promise<NavigationAttempt> 
       networkEvidence: result?.networkEvidence
     }
   } catch (error) {
+    if (
+      availabilityState.stopRequested ||
+      availabilityState.abortController?.signal.aborted
+    ) {
+      throw new DOMException('后台导航检测已取消。', 'AbortError')
+    }
+    if (isRuntimeMessagePortUnavailable(error)) {
+      throw new Error(
+        'Curator 后台服务未响应，已停止检测，未把这些书签记为异常。' +
+        '请在扩展管理页重新加载 Curator 后再试。'
+      )
+    }
     return {
-      status: 'failed' as const,
+      status: 'failed',
       finalUrl: url,
       detail: error instanceof Error ? error.message : '后台导航失败。',
       errorCode: 'runtime-message-failed'
     }
   } finally {
-    availabilityState.activeNavigationCheckIds?.delete(checkId)
+    availabilityState.activeNavigationCheckIds.delete(checkId)
   }
 }
 
-function createNavigationCheckId() {
+function createNavigationCheckId(): string {
   return `nav-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`
 }
 
-function cancelActiveNavigationChecks() {
-  const checkIds = [...(availabilityState.activeNavigationCheckIds || [])]
-  availabilityState.activeNavigationCheckIds = new Set()
-
-  checkIds.forEach((checkId) => {
-    cancelNavigationCheck(checkId).catch(() => {})
-  })
+function isRuntimeMessagePortUnavailable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /message port closed|receiving end does not exist|could not establish connection/i
+    .test(message)
 }
 
 async function probeBookmarkUrl(url, { timeoutMs = FETCH_TIMEOUT_MS } = {}) {
+  const deadlineAtMs = Date.now() + timeoutMs
+  const allowGetFallback = isGetFallbackSafeForUrl(url)
+  const runProbeWithinDeadline = async (
+    method: 'HEAD' | 'GET'
+  ) => {
+    throwIfAvailabilityProbeCancelled()
+    const remainingMs = Math.floor(deadlineAtMs - Date.now())
+    if (remainingMs < AVAILABILITY_NAVIGATION_TIMEOUT_MIN_MS) {
+      throw new DOMException('网络探测超时。', 'AbortError')
+    }
+    const response = await runAvailabilityProbe(
+      url,
+      method,
+      remainingMs,
+      deadlineAtMs
+    )
+    throwIfAvailabilityProbeCancelled()
+    if (Date.now() >= deadlineAtMs) {
+      throw new DOMException('网络探测超时。', 'AbortError')
+    }
+    return response
+  }
+
   try {
-    const headResponse = await fetchWithTimeout(url, 'HEAD', timeoutMs)
-    if (!shouldFallbackToGet(headResponse.status)) {
-      return classifyProbeResponse(headResponse, 'HEAD')
+    const headResponse = await runProbeWithinDeadline('HEAD')
+    if (
+      headResponse.errorCode ||
+      !allowGetFallback ||
+      !shouldFallbackToGet(headResponse.status)
+    ) {
+      return classifyAvailabilityProbeResult(headResponse, 'HEAD')
     }
   } catch (error) {
     if (error?.name === 'AbortError') {
@@ -1790,11 +2255,18 @@ async function probeBookmarkUrl(url, { timeoutMs = FETCH_TIMEOUT_MS } = {}) {
         detail: `网络探测超时，超过 ${Math.round(timeoutMs / 1000)} 秒仍未返回。`
       }
     }
+    const classifiedError = classifyProbeError(error)
+    if (
+      !allowGetFallback ||
+      isUnverifiedAvailabilityErrorCode(classifiedError.errorCode)
+    ) {
+      return classifiedError
+    }
   }
 
   try {
-    const getResponse = await fetchWithTimeout(url, 'GET', timeoutMs)
-    return classifyProbeResponse(getResponse, 'GET')
+    const getResponse = await runProbeWithinDeadline('GET')
+    return classifyAvailabilityProbeResult(getResponse, 'GET')
   } catch (error) {
     if (error?.name === 'AbortError') {
       return {
@@ -1809,41 +2281,63 @@ async function probeBookmarkUrl(url, { timeoutMs = FETCH_TIMEOUT_MS } = {}) {
   }
 }
 
-async function fetchWithTimeout(url, method, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController()
-  const runSignal = availabilityState.abortController?.signal
-  const abortCurrentFetch = () => {
-    controller.abort()
-  }
-
-  if (runSignal?.aborted) {
-    controller.abort()
-  } else {
-    runSignal?.addEventListener('abort', abortCurrentFetch, { once: true })
-  }
-
-  const timeoutId = window.setTimeout(() => {
-    controller.abort()
-  }, Math.max(1000, Number(timeoutMs) || FETCH_TIMEOUT_MS))
-
+function isGetFallbackSafeForUrl(value: unknown): boolean {
   try {
-    return await fetch(url, {
-      method,
-      cache: 'no-store',
-      credentials: 'omit',
-      redirect: 'follow',
-      referrerPolicy: 'no-referrer',
-      signal: controller.signal
-    })
-  } finally {
-    clearTimeout(timeoutId)
-    runSignal?.removeEventListener('abort', abortCurrentFetch)
+    return new URL(String(value || '')).search === ''
+  } catch {
+    return false
   }
 }
 
-function getNavigationAttemptRunOutcome(attempt: NavigationAttempt | null | undefined): AvailabilityRunOutcome {
-  const statusCode = Number(attempt?.networkEvidence?.statusCode) || extractStatusCodeFromText(attempt?.errorCode) || extractStatusCodeFromText(attempt?.detail)
-  const errorCode = String(attempt?.networkEvidence?.errorCode || attempt?.errorCode || '').trim()
+async function runAvailabilityProbe(
+  url: string,
+  method: 'HEAD' | 'GET',
+  timeoutMs: number,
+  deadlineAtMs: number
+) {
+  throwIfAvailabilityProbeCancelled()
+  const checkId = `probe-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`
+  availabilityState.activeNavigationCheckIds.add(checkId)
+  try {
+    return await requestAvailabilityProbe(
+      url,
+      method,
+      timeoutMs,
+      checkId,
+      deadlineAtMs
+    )
+  } catch (error) {
+    if (
+      availabilityState.stopRequested ||
+      availabilityState.abortController?.signal.aborted
+    ) {
+      throw new DOMException('网络探测已取消。', 'AbortError')
+    }
+    throw error
+  } finally {
+    availabilityState.activeNavigationCheckIds.delete(checkId)
+  }
+}
+
+function throwIfAvailabilityProbeCancelled(): void {
+  if (
+    availabilityState.stopRequested ||
+    availabilityState.abortController?.signal.aborted
+  ) {
+    throw new DOMException('网络探测已取消。', 'AbortError')
+  }
+}
+
+function getNavigationAttemptRunOutcome(
+  attempt: NavigationAttempt | null | undefined
+): AvailabilityRunOutcome {
+  const statusCode =
+    Number(attempt?.networkEvidence?.statusCode) ||
+    extractStatusCodeFromText(attempt?.errorCode) ||
+    extractStatusCodeFromText(attempt?.detail)
+  const errorCode = String(
+    attempt?.networkEvidence?.errorCode || attempt?.errorCode || ''
+  ).trim()
   const detail = String(attempt?.detail || '').trim()
 
   if (statusCode === 429) {
@@ -1851,10 +2345,17 @@ function getNavigationAttemptRunOutcome(attempt: NavigationAttempt | null | unde
   }
 
   if (
-    ['timeout', 'net::ERR_TIMED_OUT', 'net::ERR_CONNECTION_TIMED_OUT'].includes(errorCode) ||
+    ['timeout', 'net::ERR_TIMED_OUT', 'net::ERR_CONNECTION_TIMED_OUT']
+      .includes(errorCode) ||
     /timeout|超时/i.test(detail)
   ) {
-    return { kind: 'timeout', statusCode, errorCode, detail, timedOut: true }
+    return {
+      kind: 'timeout',
+      statusCode,
+      errorCode,
+      detail,
+      timedOut: true
+    }
   }
 
   if (attempt?.status === 'available') {
@@ -1945,19 +2446,30 @@ function throwIfAborted(signal?: AbortSignal | null) {
 }
 
 function isAbortError(error) {
-  return error instanceof DOMException && error.name === 'AbortError'
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'name' in error &&
+    error.name === 'AbortError'
+  )
 }
 
 function applyAvailabilityResult(result) {
   availabilityState.checkedBookmarks += 1
 
   if (result.status === 'available') {
+    const bookmarkId = String(result.id)
+    availabilityState.checkedHealthyBookmarkIds.add(bookmarkId)
+    availabilityState.checkedHealthyBookmarkUrls.set(bookmarkId, String(result.url || ''))
     availabilityState.availableCount += 1
     scheduleAvailabilityRender()
     return
   }
 
   if (result.status === 'redirected') {
+    const bookmarkId = String(result.id)
+    availabilityState.checkedHealthyBookmarkIds.add(bookmarkId)
+    availabilityState.checkedHealthyBookmarkUrls.set(bookmarkId, String(result.url || ''))
     availabilityState.redirectedCount += 1
     availabilityState.redirectResults.push({
       ...result,
@@ -1967,12 +2479,30 @@ function applyAvailabilityResult(result) {
     return
   }
 
-  const historyStatus = managerState.previousHistoryMap.has(result.id) ? 'persistent' : 'new'
-  const abnormalStreak = managerState.previousHistoryMap.has(result.id)
-    ? getHistoricalAbnormalStreak(result.id, historyCallbacks) + 1
+  if (isUnverifiedAvailabilityResult(result)) {
+    const bookmarkId = String(result.id)
+    availabilityState.checkedHealthyBookmarkIds.delete(bookmarkId)
+    availabilityState.checkedHealthyBookmarkUrls.delete(bookmarkId)
+    availabilityState.reviewResults.push({
+      ...result,
+      historyStatus: '',
+      abnormalStreak: 0
+    })
+    availabilityState.reviewCount = availabilityState.reviewResults.length
+    scheduleAvailabilityRender()
+    return
+  }
+
+  const hasPreviousHistory = hasMatchingPreviousHistoryEntry(result)
+  const historyStatus = hasPreviousHistory ? 'persistent' : 'new'
+  const qualifiedResult = requireRepeatedFailureEvidence(result, hasPreviousHistory)
+  availabilityState.checkedHealthyBookmarkIds.delete(String(result.id))
+  availabilityState.checkedHealthyBookmarkUrls.delete(String(result.id))
+  const abnormalStreak = hasPreviousHistory
+    ? getHistoricalAbnormalStreak(result.id, result.url, historyCallbacks) + 1
     : 1
   const nextResult = {
-    ...result,
+    ...qualifiedResult,
     historyStatus,
     abnormalStreak
   }
@@ -2013,7 +2543,7 @@ function renderAvailabilitySection() {
 
   const progressTotal = availabilityState.retestingSelection
     ? availabilityState.retestSelectionTotal
-    : availabilityState.eligibleBookmarks
+    : availabilityState.runTotalBookmarks || availabilityState.eligibleBookmarks
   const progressCompleted = availabilityState.retestingSelection
     ? availabilityState.retestSelectionCompleted
     : availabilityState.checkedBookmarks
@@ -2167,6 +2697,7 @@ function getAvailabilityFilterCounts() {
 }
 
 function getAvailabilityProgressState(progressCompleted: number, progressTotal: number) {
+  const activeSession = availabilityRunSessions.getActive()
   const progressLabel = progressTotal
     ? `${progressCompleted} / ${progressTotal}`
     : '未开始'
@@ -2174,8 +2705,14 @@ function getAvailabilityProgressState(progressCompleted: number, progressTotal: 
     ? Math.round((progressCompleted / progressTotal) * 100)
     : 0
 
-  const availabilityProgressLabel = availabilityState.retestingSelection
-    ? `重测中 ${progressLabel}`
+  const availabilityProgressLabel = activeSession?.phase === 'finalizing'
+    ? `正在保存结果 ${progressLabel}`
+    : activeSession?.phase === 'stopping'
+    ? `正在停止 ${progressLabel}`
+    : availabilityState.retestingSelection
+      ? `重测中 ${progressLabel}`
+      : activeSession?.phase === 'authorizing'
+      ? '正在准备检测'
     : availabilityState.running
     ? availabilityState.stopRequested
       ? `正在停止 ${progressLabel}`
@@ -2273,6 +2810,7 @@ function getAvailabilitySelectionActionsState() {
     promoteDisabled: interactionLocked || selectedReviewCount === 0,
     retestDisabled: (
       interactionLocked ||
+      hasActiveAvailabilityRunSession() ||
       availabilityState.catalogLoading ||
       availabilityState.requestingPermission ||
       selectedResults.length === 0
@@ -2282,22 +2820,25 @@ function getAvailabilitySelectionActionsState() {
 }
 
 function getAvailabilityControlsState(): AvailabilityControlsState {
+  const activeSession = availabilityRunSessions.getActive()
   const actionDisabled = (
-    availabilityState.running ||
-    availabilityState.retestingSelection ||
+    Boolean(activeSession) ||
     availabilityState.catalogLoading ||
     availabilityState.requestingPermission ||
+    availabilityState.settingsSaving ||
     availabilityState.deleting
   )
   const pauseDisabled = (
     !availabilityState.running ||
+    activeSession?.phase !== 'running' ||
     availabilityState.deleting ||
     availabilityState.stopRequested
   )
   const stopDisabled = (
-    !availabilityState.running ||
+    !activeSession ||
     availabilityState.deleting ||
-    availabilityState.stopRequested
+    activeSession?.phase === 'finalizing' ||
+    activeSession?.phase === 'stopping'
   )
 
   return {
@@ -2307,7 +2848,7 @@ function getAvailabilityControlsState(): AvailabilityControlsState {
     badgeText: getModeBadgeText(),
     badgeTone: getModeBadgeTone(),
     pauseDisabled,
-    pauseHidden: !availabilityState.running,
+    pauseHidden: !availabilityState.running || activeSession?.phase === 'finalizing',
     pauseLabel: availabilityState.paused ? '继续检测' : '暂停检测',
     permissionCopy: getModeCopyText(),
     settingsDisabled: isAvailabilitySettingsDisabled(),
@@ -2317,17 +2858,17 @@ function getAvailabilityControlsState(): AvailabilityControlsState {
     settingsStatusTone: String(availabilityState.settingsStatusTone || 'muted'),
     stopBusy: availabilityState.stopRequested,
     stopDisabled,
-    stopHidden: !availabilityState.running,
+    stopHidden: !activeSession || activeSession.phase === 'finalizing',
     stopLabel: availabilityState.stopRequested ? '停止中…' : '停止本次检测'
   }
 }
 
 function isAvailabilitySettingsDisabled(): boolean {
   return (
-    availabilityState.running ||
-    availabilityState.retestingSelection ||
+    hasActiveAvailabilityRunSession() ||
     availabilityState.catalogLoading ||
-    availabilityState.storageLoading
+    availabilityState.storageLoading ||
+    availabilityState.settingsSaving
   )
 }
 
@@ -2342,8 +2883,7 @@ function renderAvailabilitySettingsControl() {
 
 function openAvailabilitySettingsPopover() {
   if (
-    availabilityState.running ||
-    availabilityState.retestingSelection ||
+    hasActiveAvailabilityRunSession() ||
     availabilityState.catalogLoading ||
     availabilityState.storageLoading
   ) {
@@ -2428,7 +2968,7 @@ function readAvailabilitySettingsFromDraft() {
 }
 
 function syncAvailabilitySettingsDraft(draft: AvailabilitySettingsDraft) {
-  if (!availabilityState.settingsOpen) {
+  if (!availabilityState.settingsOpen || availabilityState.settingsSaving) {
     return
   }
 
@@ -2436,27 +2976,65 @@ function syncAvailabilitySettingsDraft(draft: AvailabilitySettingsDraft) {
     concurrency: String(draft.concurrency ?? ''),
     navigationTimeoutSeconds: String(draft.navigationTimeoutSeconds ?? '')
   }
-  availabilityState.settings = readAvailabilitySettingsFromDraft()
+  availabilitySettingsDraftRevision += 1
   availabilityState.settingsStatus = '未保存'
   availabilityState.settingsStatusTone = 'muted'
-  updateAvailabilityRunnerStatus()
   renderAvailabilitySection()
 }
 
+function cancelAvailabilityRunOnPageHide(): void {
+  if (!hasActiveAvailabilityRunSession()) {
+    return
+  }
+
+  availabilityState.stopRequested = true
+  availabilityState.abortController?.abort()
+  void cancelActiveNavigationChecks()
+  releaseAvailabilityPauseResolvers()
+}
+
 async function saveAvailabilitySettingsFromDraft() {
+  if (isAvailabilitySettingsDisabled()) {
+    return
+  }
+
+  const savedDraftRevision = availabilitySettingsDraftRevision
   const nextSettings = readAvailabilitySettingsFromDraft()
-  availabilityState.settings = nextSettings
-  availabilitySettingsDraft = createAvailabilitySettingsDraft(nextSettings)
-  availabilityState.settingsStatus = '已保存'
-  availabilityState.settingsStatusTone = 'success'
+  availabilityState.settingsSaving = true
+  availabilityState.settingsStatus = '保存中…'
+  availabilityState.settingsStatusTone = 'muted'
+  renderAvailabilitySection()
+
+  const releaseMutationLock = await claimAvailabilityMutationLock()
+  if (!releaseMutationLock) {
+    availabilityState.settingsSaving = false
+    availabilityState.settingsStatus = '暂时不可保存'
+    availabilityState.settingsStatusTone = 'warning'
+    renderAvailabilitySection()
+    return
+  }
 
   try {
     await setLocalStorage({
       [STORAGE_KEYS.availabilitySettings]: nextSettings
     })
-  } catch {
+    availabilityState.settings = nextSettings
+    if (availabilitySettingsDraftRevision === savedDraftRevision) {
+      availabilitySettingsDraft = createAvailabilitySettingsDraft(nextSettings)
+    }
+    availabilityState.settingsStatus = '已保存'
+    availabilityState.settingsStatusTone = 'success'
+    if (String(availabilityState.lastError).includes('检测设置保存失败')) {
+      availabilityState.lastError = ''
+    }
+  } catch (error) {
     availabilityState.settingsStatus = '保存失败'
     availabilityState.settingsStatusTone = 'warning'
+    availabilityState.lastError =
+      error instanceof Error ? `检测设置保存失败：${error.message}` : '检测设置保存失败。'
+  } finally {
+    availabilityState.settingsSaving = false
+    releaseMutationLock()
   }
 
   updateAvailabilityRunnerStatus()
@@ -2464,18 +3042,47 @@ async function saveAvailabilitySettingsFromDraft() {
 }
 
 async function resetAvailabilitySettings() {
-  availabilityState.settings = getDefaultAvailabilityRunnerUserSettings()
-  availabilitySettingsDraft = createAvailabilitySettingsDraft(availabilityState.settings)
-  availabilityState.settingsStatus = '已恢复'
-  availabilityState.settingsStatusTone = 'success'
+  if (isAvailabilitySettingsDisabled()) {
+    return
+  }
+
+  const savedDraftRevision = availabilitySettingsDraftRevision
+  const nextSettings = getDefaultAvailabilityRunnerUserSettings()
+  availabilityState.settingsSaving = true
+  availabilityState.settingsStatus = '保存中…'
+  availabilityState.settingsStatusTone = 'muted'
+  renderAvailabilitySection()
+
+  const releaseMutationLock = await claimAvailabilityMutationLock()
+  if (!releaseMutationLock) {
+    availabilityState.settingsSaving = false
+    availabilityState.settingsStatus = '暂时不可保存'
+    availabilityState.settingsStatusTone = 'warning'
+    renderAvailabilitySection()
+    return
+  }
 
   try {
     await setLocalStorage({
-      [STORAGE_KEYS.availabilitySettings]: availabilityState.settings
+      [STORAGE_KEYS.availabilitySettings]: nextSettings
     })
-  } catch {
+    availabilityState.settings = nextSettings
+    if (availabilitySettingsDraftRevision === savedDraftRevision) {
+      availabilitySettingsDraft = createAvailabilitySettingsDraft(nextSettings)
+    }
+    availabilityState.settingsStatus = '已恢复'
+    availabilityState.settingsStatusTone = 'success'
+    if (String(availabilityState.lastError).includes('检测设置保存失败')) {
+      availabilityState.lastError = ''
+    }
+  } catch (error) {
     availabilityState.settingsStatus = '保存失败'
     availabilityState.settingsStatusTone = 'warning'
+    availabilityState.lastError =
+      error instanceof Error ? `默认检测设置保存失败：${error.message}` : '默认检测设置保存失败。'
+  } finally {
+    availabilityState.settingsSaving = false
+    releaseMutationLock()
   }
 
   updateAvailabilityRunnerStatus()
@@ -2521,7 +3128,7 @@ function getAvailabilityDurationLabel() {
 function publishAvailabilityProgressTick() {
   const progressTotal = availabilityState.retestingSelection
     ? availabilityState.retestSelectionTotal
-    : availabilityState.eligibleBookmarks
+    : availabilityState.runTotalBookmarks || availabilityState.eligibleBookmarks
   const progressCompleted = availabilityState.retestingSelection
     ? availabilityState.retestSelectionCompleted
     : availabilityState.checkedBookmarks
@@ -3014,21 +3621,27 @@ function setShortcutStatus(message, tone = 'success') {
 }
 
 function isAvailabilityPrimaryActionBusy() {
+  const activeSession = availabilityRunSessions.getActive()
   return (
     availabilityState.catalogLoading ||
     availabilityState.requestingPermission ||
     availabilityState.retestingSelection ||
     availabilityState.stopRequested ||
+    activeSession?.phase === 'authorizing' ||
+    activeSession?.phase === 'finalizing' ||
     (availabilityState.running && !availabilityState.paused)
   )
 }
 
 function isAvailabilityProgressBusy() {
+  const activeSession = availabilityRunSessions.getActive()
   return (
     availabilityState.retestingSelection ||
     availabilityState.requestingPermission ||
     availabilityState.catalogLoading ||
     availabilityState.stopRequested ||
+    activeSession?.phase === 'authorizing' ||
+    activeSession?.phase === 'finalizing' ||
     (availabilityState.running && !availabilityState.paused)
   )
 }
@@ -3363,12 +3976,14 @@ function renderAiNamingSection() {
     badgeTone: getAiNamingBadgeTone(),
     statusCopy: getAiNamingStatusCopy()
   })
-  const progressLabel = aiNamingState.eligibleBookmarks
-    ? `${aiNamingState.checkedBookmarks} / ${aiNamingState.eligibleBookmarks}`
+  const progressMax = aiNamingState.runTotalBookmarks || aiNamingState.eligibleBookmarks
+  const progressValue = Math.max(
+    0,
+    Math.min(aiNamingState.checkedBookmarks, progressMax || aiNamingState.checkedBookmarks)
+  )
+  const progressLabel = progressMax
+    ? `${progressValue} / ${progressMax}`
     : '未开始'
-  const progressValue = aiNamingState.eligibleBookmarks
-    ? Math.round((aiNamingState.checkedBookmarks / aiNamingState.eligibleBookmarks) * 100)
-    : 0
 
   const aiProgressLabel = aiNamingState.running
     ? aiNamingState.stopRequested
@@ -3377,13 +3992,18 @@ function renderAiNamingSection() {
         ? `已暂停 ${progressLabel}`
         : `生成中 ${progressLabel}`
     : aiNamingState.lastCompletedAt
-      ? `已完成 ${progressLabel}`
+      ? aiNamingState.lastRunOutcome === 'failed'
+        ? `生成失败 ${progressLabel}`
+        : aiNamingState.lastRunOutcome === 'stopped'
+          ? `已停止 ${progressLabel}`
+          : `已完成 ${progressLabel}`
       : progressLabel
   publishAiAnalysisProgress({
     busy: isAiProgressBusy(),
     progressCopy: getAiNamingProgressCopy(),
     progressLabel: aiProgressLabel,
-    progressValue: Math.max(0, Math.min(progressValue, 100))
+    progressMax: Math.max(progressMax, 1),
+    progressValue
   })
 
   renderBookmarkTagDataCard()
@@ -3412,9 +4032,6 @@ function renderAiNamingSection() {
       ? `${aiNamingState.manualReviewCount} / 已拒绝 ${aiNamingState.rejectedCount}`
       : String(aiNamingState.manualReviewCount),
     unchanged: String(aiNamingState.unchangedCount),
-    highConfidence: String(aiNamingState.highConfidenceCount),
-    mediumConfidence: String(aiNamingState.mediumConfidenceCount),
-    lowConfidence: String(aiNamingState.lowConfidenceCount),
     failed: String(aiNamingState.failedCount)
   })
   updateAiNamingDurationDisplay()
@@ -3457,7 +4074,11 @@ function renderAiNamingSection() {
       ? `${aiNamingState.results.length} 条结果`
       : `${visibleAiResults.length} / ${aiNamingState.results.length} 条结果`,
     subtitle: aiNamingState.lastCompletedAt
-      ? `最近完成：${formatDateTime(aiNamingState.lastCompletedAt)} · 建议 ${aiNamingState.suggestedCount} · 待确认 ${aiNamingState.manualReviewCount} · 已拒绝 ${aiNamingState.rejectedCount} · 失败 ${aiNamingState.failedCount}`
+      ? `${aiNamingState.lastRunOutcome === 'failed'
+        ? '最近失败'
+        : aiNamingState.lastRunOutcome === 'stopped'
+          ? '最近停止'
+          : '最近完成'}：${formatDateTime(aiNamingState.lastCompletedAt)} · 建议 ${aiNamingState.suggestedCount} · 待确认 ${aiNamingState.manualReviewCount} · 已拒绝 ${aiNamingState.rejectedCount} · 失败 ${aiNamingState.failedCount}`
       : '展示标题建议、标签、置信度和原因。'
   })
 
@@ -3827,7 +4448,11 @@ export function handleIgnoreRuleAction(detail: IgnoreRuleActionDetail): void {
 
 export function handleHistoryControlAction(action: 'clear-history' | 'toggle-logs'): void {
   if (action === 'clear-history') {
-    void clearDetectionHistoryLogs(historyCallbacks)
+    void clearDetectionHistoryLogs(historyCallbacks).catch((error) => {
+      availabilityState.lastError =
+        error instanceof Error ? `检测历史清空失败：${error.message}` : '检测历史清空失败。'
+      renderAvailabilitySection()
+    })
     return
   }
   if (action === 'toggle-logs') {
@@ -3889,6 +4514,8 @@ async function handleFullBackupImport(file?: File) {
   backupRestoreState.status = '正在读取备份文件...'
   backupRestoreState.backup = null
   backupRestoreState.preview = null
+  backupRestoreState.operationKey = ''
+  backupRestoreState.operationId = ''
   renderBackupRestoreSection()
 
   try {
@@ -3910,6 +4537,7 @@ async function handleFullBackupRestore(mode: BackupRestoreMode) {
   if (!backupRestoreState.backup || backupRestoreState.restoring) {
     return
   }
+  const backup = backupRestoreState.backup
 
   const modeLabel = mode === 'tagsOnly'
     ? '只恢复标签数据'
@@ -3933,28 +4561,83 @@ async function handleFullBackupRestore(mode: BackupRestoreMode) {
   }
 
   backupRestoreState.restoring = true
-  backupRestoreState.status = '正在恢复...'
+  backupRestoreState.status = '正在交由后台安全恢复...'
   renderBackupRestoreSection()
 
+  let operationId = ''
   try {
-    const result = await createAutoBackupBeforeDangerousOperation({
-      kind: 'restore',
-      source: 'options',
-      reason: `恢复备份：${modeLabel}`
-    }).then(() => restoreCuratorBackup(backupRestoreState.backup, mode))
-    const [, tagIndex] = await Promise.all([
-      hydrateAvailabilityCatalog({ preserveResults: true }),
-      loadBookmarkTagIndex()
-    ])
-    aiNamingState.tagIndex = tagIndex
-    backupRestoreState.status =
+    operationId = getOrCreateBackupRestoreOperationId(backup, mode)
+    const result = await requestBackupRestore(operationId, backup, mode)
+    clearBackupRestoreOperationIdentity(operationId)
+    const completedStatus =
       `恢复完成：标签 ${result.restored.tags} 条，新标签页配置 ${result.restored.newTabSections} 项，本地数据 ${result.restored.storageSections} 项，复制缺失书签 ${result.restored.copiedBookmarks} 条；无法匹配标签 ${result.unmatchedTags} 条。`
+    let releaseRefreshLock: (() => void) | null = null
+    try {
+      if (mode === 'safeFull') {
+        releaseRefreshLock = await claimAvailabilityMutationLock()
+        if (!releaseRefreshLock) {
+          throw new Error(
+            availabilityState.lastError || '可用性数据正在使用，暂时无法刷新界面。'
+          )
+        }
+      }
+      const [, tagIndex] = await Promise.all([
+        hydrateAvailabilityCatalog({ preserveResults: true }),
+        loadBookmarkTagIndex()
+      ])
+      aiNamingState.tagIndex = tagIndex
+      backupRestoreState.status = completedStatus
+    } catch (error) {
+      const detail = error instanceof Error ? `：${error.message}` : ''
+      backupRestoreState.status =
+        `${completedStatus} 但界面同步失败${detail}；恢复数据已经提交，请勿重复恢复，重新打开设置页即可。`
+    } finally {
+      releaseRefreshLock?.()
+    }
   } catch (error) {
+    if (
+      operationId &&
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      String(error.code || '') === BACKUP_RESTORE_ROLLED_BACK_CODE
+    ) {
+      clearBackupRestoreOperationIdentity(operationId)
+    }
     backupRestoreState.status = error instanceof Error ? error.message : '备份恢复失败。'
   } finally {
     backupRestoreState.restoring = false
     renderBackupRestoreSection()
   }
+}
+
+function getOrCreateBackupRestoreOperationId(
+  backup: { exportedAt?: unknown; extensionVersion?: unknown },
+  mode: BackupRestoreMode
+): string {
+  const operationKey = [
+    mode,
+    String(backup?.exportedAt || ''),
+    String(backup?.extensionVersion || ''),
+    String(backupRestoreState.fileName || '')
+  ].join('\n')
+  if (
+    backupRestoreState.operationKey !== operationKey ||
+    !backupRestoreState.operationId
+  ) {
+    backupRestoreState.operationKey = operationKey
+    backupRestoreState.operationId =
+      `restore-${Date.now().toString(36)}-${crypto.randomUUID().replace(/-/g, '')}`
+  }
+  return backupRestoreState.operationId
+}
+
+function clearBackupRestoreOperationIdentity(operationId: string): void {
+  if (backupRestoreState.operationId !== operationId) {
+    return
+  }
+  backupRestoreState.operationKey = ''
+  backupRestoreState.operationId = ''
 }
 
 async function getCurrentBookmarksForTagData() {
@@ -4298,7 +4981,6 @@ async function handleFetchAiModels() {
 function renderAiResultsFilterControls() {
   publishAiAnalysisResultsFilter({
     clearDisabled: !hasActiveAiResultsFilter(),
-    confidence: aiNamingState.filterConfidence,
     query: aiNamingState.filterQuery,
     status: aiNamingState.filterStatus
   })
@@ -4316,8 +4998,6 @@ export function handleAiResultsFilterChange(detail: AiAnalysisResultsFilterActio
 
   if (detail.key === 'status') {
     aiNamingState.filterStatus = detail.value || 'all'
-  } else if (detail.key === 'confidence') {
-    aiNamingState.filterConfidence = detail.value || 'all'
   } else if (detail.key === 'query') {
     aiNamingState.filterQuery = String(detail.value || '').trim()
   } else {
@@ -4329,7 +5009,6 @@ export function handleAiResultsFilterChange(detail: AiAnalysisResultsFilterActio
 
 function clearAiResultsFilters() {
   aiNamingState.filterStatus = 'all'
-  aiNamingState.filterConfidence = 'all'
   aiNamingState.filterQuery = ''
   resetResultsPage('ai-results')
   renderAvailabilitySection()
@@ -4338,7 +5017,6 @@ function clearAiResultsFilters() {
 function hasActiveAiResultsFilter() {
   return (
     aiNamingState.filterStatus !== 'all' ||
-    aiNamingState.filterConfidence !== 'all' ||
     Boolean(aiNamingState.filterQuery)
   )
 }
@@ -4393,21 +5071,9 @@ function renderAiNamingResults() {
 function getVisibleAiNamingResults() {
   const normalizedQuery = normalizeText(aiNamingState.filterQuery)
   return aiNamingState.results.filter((result) => {
-    if (aiNamingState.filterStatus === 'changed' && !isLargeAiTitleChange(result)) {
-      return false
-    }
-
     if (
       aiNamingState.filterStatus !== 'all' &&
-      aiNamingState.filterStatus !== 'changed' &&
       result.status !== aiNamingState.filterStatus
-    ) {
-      return false
-    }
-
-    if (
-      aiNamingState.filterConfidence !== 'all' &&
-      result.confidence !== aiNamingState.filterConfidence
     ) {
       return false
     }
@@ -4433,46 +5099,6 @@ function getVisibleAiNamingResults() {
 
     return true
   })
-}
-
-function isLargeAiTitleChange(result) {
-  if (result.status !== 'suggested') {
-    return false
-  }
-
-  const currentTitle = normalizeText(result.currentTitle)
-  const suggestedTitle = normalizeText(result.suggestedTitle)
-  if (!currentTitle || !suggestedTitle || currentTitle === suggestedTitle) {
-    return false
-  }
-
-  const maxLength = Math.max(currentTitle.length, suggestedTitle.length, 1)
-  const lengthDelta = Math.abs(currentTitle.length - suggestedTitle.length)
-  const distanceRatio = levenshteinDistance(currentTitle, suggestedTitle) / maxLength
-  return lengthDelta >= 16 || distanceRatio >= 0.55
-}
-
-function levenshteinDistance(left, right) {
-  const previous = Array.from({ length: right.length + 1 }, (_value, index) => index)
-  const current = Array.from({ length: right.length + 1 }, () => 0)
-
-  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
-    current[0] = leftIndex
-    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      const cost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1
-      current[rightIndex] = Math.min(
-        current[rightIndex - 1] + 1,
-        previous[rightIndex] + 1,
-        previous[rightIndex - 1] + cost
-      )
-    }
-
-    for (let index = 0; index < previous.length; index += 1) {
-      previous[index] = current[index]
-    }
-  }
-
-  return previous[right.length]
 }
 
 function getAiNamingResultActionLabel(action, result) {
@@ -4523,12 +5149,17 @@ function buildAiNamingResultCardViewModel(result) {
 
   return {
     canMoveToSuggestedFolder,
-    confidenceLabel: getAiNamingConfidenceLabel(result.confidence),
-    confidenceScorePercent: Number.isFinite(Number(result.confidenceScore))
+    confidenceLabel: result.status === 'failed'
+      ? '未生成置信度'
+      : getAiNamingConfidenceLabel(result.confidence),
+    confidenceScorePercent: result.status !== 'failed' && Number.isFinite(Number(result.confidenceScore))
       ? Math.round(Number(result.confidenceScore) * 100)
       : null,
     currentTitle: result.currentTitle || '未命名书签',
     detailRows,
+    errorMessage: result.status === 'failed'
+      ? String(result.reason || result.detail || '生成建议失败。')
+      : '',
     expandedTags: tagsExpanded,
     id: String(result.id || ''),
     interactionLocked,
@@ -4542,7 +5173,9 @@ function buildAiNamingResultCardViewModel(result) {
     statusLabel,
     badgeTone,
     suggestedFolder: result.suggestedFolder || '',
-    suggestedTitle: result.suggestedTitle || '未生成建议标题',
+    suggestedTitle: result.status === 'failed'
+      ? '未生成建议'
+      : result.suggestedTitle || '未生成建议标题',
     tags,
     url: result.url || '',
     applyLabel,
@@ -5419,6 +6052,14 @@ function getAiNamingBadgeTone() {
     return 'warning'
   }
 
+  if (aiNamingState.lastRunOutcome === 'failed') {
+    return 'danger'
+  }
+
+  if (aiNamingState.lastRunOutcome === 'stopped') {
+    return 'warning'
+  }
+
   if (aiNamingState.lastError) {
     return 'danger'
   }
@@ -5446,6 +6087,14 @@ function getAiNamingBadgeText() {
 
   if (aiNamingState.running) {
     return '生成中'
+  }
+
+  if (aiNamingState.lastRunOutcome === 'failed') {
+    return '运行失败'
+  }
+
+  if (aiNamingState.lastRunOutcome === 'stopped') {
+    return '已停止'
   }
 
   return aiNamingState.permissionGranted ? '已就绪' : '待授权'
@@ -5479,7 +6128,7 @@ function getAiNamingStatusCopy() {
       : '正在读取网页并生成建议。'
   }
 
-  if (aiNamingState.lastCompletedAt) {
+  if (aiNamingState.lastCompletedAt && aiNamingState.lastRunOutcome === 'completed') {
     return `最近完成：${formatDateTime(aiNamingState.lastCompletedAt)}`
   }
 
@@ -5641,6 +6290,7 @@ function getAiExtractionLabel(status, source = '') {
 async function runAiNamingSuggestions() {
   const runStartedAt = Date.now()
   const controller = new AbortController()
+  const failureCircuit = createAiFailureCircuit(2)
   aiNamingState.running = true
   aiNamingState.stopRequested = false
   aiNamingState.paused = false
@@ -5648,24 +6298,41 @@ async function runAiNamingSuggestions() {
   resetAiNamingRunState()
   aiNamingState.runStartedAt = runStartedAt
   aiNamingState.eligibleBookmarks = aiNamingState.bookmarks.length
+  aiNamingState.runTotalBookmarks = aiNamingState.bookmarks.length
   renderAvailabilitySection()
 
   try {
     const settings = aiNamingManagerState.settings
     const bookmarks = aiNamingState.bookmarks.slice()
-    await runAiNamingSuggestionChunks(bookmarks, settings, controller)
+    await runAiNamingSuggestionChunks(bookmarks, settings, controller, failureCircuit)
 
     aiNamingState.lastCompletedAt = Date.now()
     recalculateAiNamingSummary()
     if (aiNamingState.stopRequested || controller.signal.aborted) {
+      aiNamingState.lastRunOutcome = 'stopped'
       aiNamingState.lastError = `已手动停止，本轮保留 ${aiNamingState.results.length} 条已生成结果。`
+    } else {
+      aiNamingState.lastRunOutcome = 'completed'
     }
     notifyAiNamingRunFinished({
-      stopped: aiNamingState.stopRequested || controller.signal.aborted,
+      outcome: aiNamingState.lastRunOutcome,
       startedAt: runStartedAt,
       completedAt: aiNamingState.lastCompletedAt
     }).catch((error) => {
       console.warn('[Curator] 书签智能分析完成通知发送失败', error)
+    })
+  } catch (error) {
+    aiNamingState.lastCompletedAt = Date.now()
+    aiNamingState.lastRunOutcome = 'failed'
+    aiNamingState.lastError = normalizeAiNamingRunFailure(error)
+    recalculateAiNamingSummary()
+    notifyAiNamingRunFinished({
+      outcome: 'failed',
+      errorMessage: aiNamingState.lastError,
+      startedAt: runStartedAt,
+      completedAt: aiNamingState.lastCompletedAt
+    }).catch((notificationError) => {
+      console.warn('[Curator] 书签智能分析失败通知发送失败', notificationError)
     })
   } finally {
     aiNamingState.running = false
@@ -5680,7 +6347,13 @@ async function runAiNamingSuggestions() {
   }
 }
 
-async function runAiNamingSuggestionChunks(bookmarks, settings, controller, start = 0) {
+async function runAiNamingSuggestionChunks(
+  bookmarks,
+  settings,
+  controller,
+  failureCircuit: AiFailureCircuit,
+  start = 0
+) {
   if (start >= bookmarks.length || aiNamingState.stopRequested) {
     return
   }
@@ -5704,9 +6377,18 @@ async function runAiNamingSuggestionChunks(bookmarks, settings, controller, star
 
   if (!preparedItems.length || aiNamingState.stopRequested) {
     if (retryCandidates.length && !aiNamingState.stopRequested) {
-      await retryAiNamingBookmarks(retryCandidates, settings)
+      await retryAiNamingBookmarks(retryCandidates, settings, {
+        controller,
+        failureCircuit
+      })
     }
-    await runAiNamingSuggestionChunks(bookmarks, settings, controller, start + settings.batchSize)
+    await runAiNamingSuggestionChunks(
+      bookmarks,
+      settings,
+      controller,
+      failureCircuit,
+      start + settings.batchSize
+    )
     return
   }
 
@@ -5718,6 +6400,7 @@ async function runAiNamingSuggestionChunks(bookmarks, settings, controller, star
     if (!aiNamingRequestStillActive) {
       return
     }
+    recordAiGenerationSuccess(failureCircuit)
     const failedPreparedItems = await mergeAiNamingBatchResults(preparedItems, aiResponseItems, settings)
     retryCandidates.push(...failedPreparedItems.map((preparedItem) => {
       return {
@@ -5727,21 +6410,43 @@ async function runAiNamingSuggestionChunks(bookmarks, settings, controller, star
       }
     }))
   } catch (error) {
+    if (aiNamingState.stopRequested || controller.signal.aborted) {
+      return
+    }
+    const failureDecision = recordAiGenerationFailure(failureCircuit, error)
+    if (failureDecision.shouldStop) {
+      upsertAiNamingResult(buildAiNamingFailedResult(preparedItems[0].bookmark, error))
+      markAiNamingBookmarkCompleted(preparedItems[0].bookmark.id)
+      sortAiNamingResults()
+      recalculateAiNamingSummary()
+      scheduleAvailabilityRender()
+      throw createAiNamingRunFailure(error, failureDecision, settings)
+    }
     retryCandidates.push(...preparedItems.map((preparedItem) => {
       return {
         bookmark: preparedItem.bookmark,
+        preparedItem,
         initialError: error
       }
     }))
   }
 
   if (retryCandidates.length && !aiNamingState.stopRequested) {
-    await retryAiNamingBookmarks(retryCandidates, settings)
+    await retryAiNamingBookmarks(retryCandidates, settings, {
+      controller,
+      failureCircuit
+    })
   }
 
   recalculateAiNamingSummary()
   scheduleAvailabilityRender()
-  await runAiNamingSuggestionChunks(bookmarks, settings, controller, start + settings.batchSize)
+  await runAiNamingSuggestionChunks(
+    bookmarks,
+    settings,
+    controller,
+    failureCircuit,
+    start + settings.batchSize
+  )
 }
 
 async function prepareAiNamingChunk(chunk, settings, controller) {
@@ -5773,10 +6478,6 @@ async function prepareAiNamingChunk(chunk, settings, controller) {
         bookmark,
         initialError: error
       })
-    } finally {
-      aiNamingState.checkedBookmarks += 1
-      recalculateAiNamingSummary()
-      scheduleAvailabilityRender()
     }
   })
 
@@ -5784,16 +6485,28 @@ async function prepareAiNamingChunk(chunk, settings, controller) {
 }
 
 async function notifyAiNamingRunFinished({
-  stopped = false,
+  outcome = 'completed',
+  errorMessage = '',
   startedAt = 0,
   completedAt = Date.now()
 } = {}): Promise<void> {
   const processed = Math.max(0, Number(aiNamingState.checkedBookmarks) || 0)
-  const total = Math.max(processed, Number(aiNamingState.eligibleBookmarks) || 0)
-  const title = stopped ? '书签智能分析已停止' : '书签智能分析已完成'
-  const message = stopped
-    ? `已处理 ${processed}/${total} 条，保留 ${aiNamingState.results.length} 条已生成结果。`
-    : `已处理 ${processed}/${total} 条，建议改名 ${aiNamingState.suggestedCount} 条，待确认 ${aiNamingState.manualReviewCount} 条，失败 ${aiNamingState.failedCount} 条。`
+  const total = Math.max(
+    processed,
+    Number(aiNamingState.runTotalBookmarks || aiNamingState.eligibleBookmarks) || 0
+  )
+  const failed = outcome === 'failed'
+  const stopped = outcome === 'stopped'
+  const title = failed
+    ? '书签智能分析失败并已停止'
+    : stopped
+      ? '书签智能分析已停止'
+      : '书签智能分析已完成'
+  const message = failed
+    ? truncateText(errorMessage || 'AI 生成失败，已提前停止。', 220)
+    : stopped
+      ? `已处理 ${processed}/${total} 条，保留 ${aiNamingState.results.length} 条已生成结果。`
+      : `已处理 ${processed}/${total} 条，建议改名 ${aiNamingState.suggestedCount} 条，待确认 ${aiNamingState.manualReviewCount} 条，失败 ${aiNamingState.failedCount} 条。`
   const elapsedCopy = formatElapsedTime(Math.max(0, Number(completedAt) - Number(startedAt || completedAt)))
   const scopeMeta = getCurrentAiNamingScopeMeta()
 
@@ -5802,7 +6515,7 @@ async function notifyAiNamingRunFinished({
     message,
     contextMessage: `范围：${scopeMeta.label}${elapsedCopy ? ` · 用时 ${elapsedCopy}` : ''}`,
     priority: 1,
-    requireInteraction: false,
+    requireInteraction: failed,
     silent: false
   })
 }
@@ -5885,7 +6598,15 @@ function formatElapsedTime(elapsedMs: number): string {
   return `${minutes} 分 ${seconds} 秒`
 }
 
-async function retryAiNamingBookmarks(retryCandidates: any[], settings = aiNamingManagerState.settings) {
+async function retryAiNamingBookmarks(
+  retryCandidates: any[],
+  settings = aiNamingManagerState.settings,
+  options: {
+    controller: AbortController
+    failureCircuit: AiFailureCircuit
+  }
+) {
+  const { controller, failureCircuit } = options
   let shouldStopRetry = false
   await runSequentially(retryCandidates, async (candidate) => {
     if (shouldStopRetry) {
@@ -5896,18 +6617,63 @@ async function retryAiNamingBookmarks(retryCandidates: any[], settings = aiNamin
       return
     }
 
-    if (aiNamingState.stopRequested) {
+    if (aiNamingState.stopRequested || controller.signal.aborted) {
       shouldStopRetry = true
       return
     }
 
+    let preparedItem = candidate.preparedItem
+    if (!preparedItem) {
+      try {
+        preparedItem = await buildAiNamingPreparedItem(
+          candidate.bookmark,
+          settings.timeoutMs,
+          { signal: controller.signal }
+        )
+        throwIfAborted(controller.signal)
+      } catch (retryError) {
+        if (aiNamingState.stopRequested || controller.signal.aborted) {
+          shouldStopRetry = true
+          return
+        }
+        upsertAiNamingResult(
+          buildAiNamingRetriedFailureResult(candidate.bookmark, candidate.initialError, retryError)
+        )
+        markAiNamingBookmarkCompleted(candidate.bookmark.id)
+        recalculateAiNamingSummary()
+        scheduleAvailabilityRender()
+        return
+      }
+    }
+
     try {
-      const { modelItem, preparedItem } = await generateAiNamingResultForBookmark(candidate.bookmark, settings)
+      const aiResponseItems = await requestAiNamingBatch([preparedItem], {
+        signal: controller.signal
+      })
+      const modelItem = aiResponseItems.find((item) => {
+        return String(item.bookmarkId) === String(candidate.bookmark.id)
+      })
+      if (!modelItem) {
+        throw new Error('AI 返回中缺少该书签的命名结果。')
+      }
+      recordAiGenerationSuccess(failureCircuit)
       await commitAiNamingResult(candidate.bookmark, modelItem, settings, preparedItem)
     } catch (retryError) {
+      if (aiNamingState.stopRequested || controller.signal.aborted) {
+        shouldStopRetry = true
+        return
+      }
       upsertAiNamingResult(
         buildAiNamingRetriedFailureResult(candidate.bookmark, candidate.initialError, retryError)
       )
+      markAiNamingBookmarkCompleted(candidate.bookmark.id)
+      const failureDecision = recordAiGenerationFailure(failureCircuit, retryError)
+      recalculateAiNamingSummary()
+      sortAiNamingResults()
+      scheduleAvailabilityRender()
+      if (failureDecision.shouldStop) {
+        throw createAiNamingRunFailure(retryError, failureDecision, settings)
+      }
     }
 
     recalculateAiNamingSummary()
@@ -5918,20 +6684,46 @@ async function retryAiNamingBookmarks(retryCandidates: any[], settings = aiNamin
   scheduleAvailabilityRender()
 }
 
-async function generateAiNamingResultForBookmark(
-  bookmark,
-  settings = aiNamingManagerState.settings,
-  options: { signal?: AbortSignal | null } = {}
-) {
-  const preparedItem = await buildAiNamingPreparedItem(bookmark, settings.timeoutMs, options)
-  throwIfAborted(options.signal)
-  const aiResponseItems = await requestAiNamingBatch([preparedItem], options)
-  const modelItem = aiResponseItems.find((item) => String(item.bookmarkId) === String(bookmark.id))
-  if (!modelItem) {
-    throw new Error('AI 返回中缺少该书签的命名结果。')
-  }
+function createAiNamingRunFailure(
+  error: unknown,
+  decision: AiFailureCircuitDecision,
+  settings = aiNamingManagerState.settings
+): Error {
+  const model = String(settings.model || '未配置模型').trim() || '未配置模型'
+  const detail = getAiNamingFailureMessage(error)
+  const failureSummary = decision.immediate
+    ? '首个请求已被 AI 渠道明确拒绝'
+    : `连续 ${decision.consecutiveFailures} 次生成失败`
+  const failure = new Error(
+    `书签智能分析已停止：模型“${model}”${failureSummary}。API 返回：${detail} ${getAiNamingFailureAction(error)}`
+  )
+  failure.name = 'AiNamingRunFailureError'
+  return failure
+}
 
-  return { modelItem, preparedItem }
+function normalizeAiNamingRunFailure(error: unknown): string {
+  const message = getAiNamingFailureMessage(error)
+  if (error instanceof Error && error.name === 'AiNamingRunFailureError') {
+    return message
+  }
+  return `书签智能分析已停止：${message}`
+}
+
+function getAiNamingFailureAction(error: unknown): string {
+  const status = error instanceof AiRuntimeError ? Number(error.status) : Number.NaN
+  if (status === 401 || status === 403) {
+    return '请检查 API Key、账户权限和接口授权后重试。'
+  }
+  if (status === 404) {
+    return '请检查接口地址和模型 ID 后重试。'
+  }
+  if (status === 429) {
+    return '请检查账户额度和服务限流设置，稍后再试。'
+  }
+  if (status === 400 || status === 415 || status === 422) {
+    return '请检查模型 ID、API 协议和推理强度设置后重试。'
+  }
+  return '请检查 API Key、模型 ID、接口地址和账户额度后重试。'
 }
 
 async function commitAiNamingResult(bookmark, modelItem, settings = aiNamingManagerState.settings, preparedItem = null) {
@@ -5946,6 +6738,8 @@ async function commitAiNamingResult(bookmark, modelItem, settings = aiNamingMana
   ) {
     aiNamingState.selectedResultIds.add(String(bookmark.id))
   }
+
+  markAiNamingBookmarkCompleted(bookmark.id)
 }
 
 function buildAiNamingResultFromModelItem(bookmark, modelItem, preparedItem = null) {
@@ -6613,8 +7407,8 @@ function buildAiNamingFailedResult(bookmark, error) {
     currentTitle: bookmark.title,
     suggestedTitle: bookmark.title,
     status: 'failed',
-    confidence: 'low',
-    confidenceScore: 0,
+    confidence: 'none',
+    confidenceScore: null,
     summary: '',
     contentType: '',
     topics: [],
@@ -6722,7 +7516,7 @@ function cleanAiSuggestedTitle(title) {
 function renderAvailabilityScopeControls() {
   const scopeMeta = getCurrentAvailabilityScopeMeta()
   const aiScopeMeta = getCurrentAiNamingScopeMeta()
-  const scopeDisabled = availabilityState.running || availabilityState.retestingSelection || availabilityState.deleting || availabilityState.catalogLoading
+  const scopeDisabled = hasActiveAvailabilityRunSession() || availabilityState.deleting || availabilityState.catalogLoading
   publishScopePickerTrigger('availability', {
     disabled: scopeDisabled,
     label: scopeMeta.label,
@@ -7426,7 +8220,9 @@ function getAvailabilityResultMetadata(result) {
   metadata.push(`状态：${getAvailabilityResultStatusLabel(result)}`)
   metadata.push(`置信度：${getAvailabilityConfidenceLabel(result)}`)
 
-  if (result.status === 'review' || result.status === 'failed') {
+  if (isUnverifiedAvailabilityResult(result)) {
+    metadata.push('验证状态：等待目标授权')
+  } else if (result.status === 'review' || result.status === 'failed') {
     metadata.push(`连续异常：${Math.max(1, Number(result.abnormalStreak) || 1)} 次`)
     metadata.push(`历史：${result.historyStatus === 'persistent' ? '持续异常' : result.historyStatus === 'new' ? '新增异常' : '无上次记录'}`)
   }
@@ -7436,6 +8232,9 @@ function getAvailabilityResultMetadata(result) {
 }
 
 function getAvailabilityConfidenceLabel(result) {
+  if (isUnverifiedAvailabilityResult(result)) {
+    return '未验证'
+  }
   const status = String(result?.status || '')
   if (status === 'failed') {
     return '高'
@@ -7651,6 +8450,8 @@ function moveSelectedAvailabilityResults(targetStatus) {
 async function retestSelectedAvailabilityResults() {
   if (
     isInteractionLocked() ||
+    backupRestoreState.restoring ||
+    hasActiveAvailabilityRunSession() ||
     availabilityState.catalogLoading ||
     availabilityState.requestingPermission
   ) {
@@ -7671,39 +8472,69 @@ async function retestSelectedAvailabilityResults() {
   }
 
   availabilityState.lastError = ''
-  const retestOrigins = collectRequestOrigins(targetBookmarks)
-  const probeEnabled = await ensureProbePermissionForRun({
-    interactive: true,
-    origins: retestOrigins
-  })
-  if (!probeEnabled) {
-    availabilityState.lastError = '未授予所选书签目标网站访问权限，已取消重新测试。'
-    renderAvailabilitySection()
+  const sessionId = beginAvailabilityRunSession('retest')
+  if (!sessionId) {
     return
   }
 
-  availabilityState.retestingSelection = true
-  availabilityState.runStartedAt = Date.now()
-  availabilityState.retestSelectionTotal = targetBookmarks.length
-  availabilityState.retestSelectionCompleted = 0
-  availabilityState.retestSelectionProbeEnabled = probeEnabled
-  const scheduler = createAvailabilityScheduler()
-  updateAvailabilityRunnerStatus(scheduler)
-  renderAvailabilitySection()
-
+  const retestOrigins = collectRequestOrigins([
+    ...targetBookmarks,
+    ...selectedResults.map((result) => ({ url: result.finalUrl }))
+  ])
+  let scheduler: AvailabilityRunScheduler | null = null
+  let networkRunStarted = false
   let processedCount = 0
+  const retestedResults: AvailabilityResult[] = []
+  let auditStatus: 'success' | 'cancelled' | 'error' = 'success'
+  let auditReason = ''
 
   try {
+    const probeEnabled = await ensureProbePermissionForRun({
+      interactive: true,
+      origins: retestOrigins
+    })
+    if (!isAvailabilityRunSessionOwner(sessionId) || availabilityState.stopRequested) {
+      availabilityState.lastError = '已取消重新测试。'
+      return
+    }
+    if (!probeEnabled) {
+      availabilityState.lastError = '未授予所选书签目标网站访问权限，已取消重新测试。'
+      return
+    }
+    if (!(await acquireGlobalAvailabilityRunLock(sessionId))) {
+      return
+    }
+    if (!availabilityRunSessions.transition(sessionId, 'running')) {
+      return
+    }
+
+    networkRunStarted = true
+    availabilityState.retestingSelection = true
+    availabilityState.runStartedAt = Date.now()
+    availabilityState.runQueue = targetBookmarks.slice()
+    availabilityState.retestSelectionTotal = targetBookmarks.length
+    availabilityState.retestSelectionCompleted = 0
+    availabilityState.retestSelectionProbeEnabled = probeEnabled
+    scheduler = createAvailabilityScheduler()
+    updateAvailabilityRunnerStatus(scheduler)
+    renderAvailabilitySection()
+
     await runAvailabilityQueue({
       items: targetBookmarks,
       scheduler,
       getUrl: (bookmark) => bookmark?.url,
+      shouldContinue: () => waitForAvailabilityRun(sessionId),
       shouldSkip: (bookmark) => !bookmark,
       wait: waitForAvailabilityQueueDelay,
       onWait: () => {
-        updateAvailabilityRunnerStatus(scheduler)
+        if (isAvailabilityRunSessionOwner(sessionId)) {
+          updateAvailabilityRunnerStatus(scheduler)
+        }
       },
       onItemSettled: () => {
+        if (!isAvailabilityRunSessionOwner(sessionId)) {
+          return
+        }
         availabilityState.retestSelectionCompleted += 1
         updateAvailabilityRunnerStatus(scheduler)
         scheduleAvailabilityRender()
@@ -7713,37 +8544,86 @@ async function retestSelectedAvailabilityResults() {
           return
         }
 
-        const result = await inspectBookmarkAvailability(bookmark, { probeEnabled, scheduler })
-        if (result && !isBookmarkRemovedDuringRun(result.id)) {
+        const result = await inspectBookmarkAvailability(bookmark, {
+          probeEnabled,
+          scheduler,
+          sessionId
+        })
+        if (
+          result &&
+          isAvailabilityRunSessionOwner(sessionId) &&
+          !availabilityState.stopRequested &&
+          !isBookmarkRemovedDuringRun(result.id)
+        ) {
           applyRetestedAvailabilityResult(result)
+          retestedResults.push(result)
           processedCount += 1
         }
       }
     })
 
+    const stopped = availabilityState.stopRequested
+    const catalogChangedDuringRun = availabilityCatalogRefreshPending
+    if (!stopped) {
+      availabilityRunSessions.transition(sessionId, 'finalizing')
+      renderAvailabilitySection()
+    }
+
     sortResultsByPath(availabilityState.reviewResults)
     sortResultsByPath(availabilityState.failedResults)
     sortResultsByPath(availabilityState.redirectResults)
 
-    try {
-      await persistRedirectCacheSnapshot(redirectsCallbacks, {
-        savedAt: Date.now(),
-        scope: getCurrentAvailabilityScopeMeta()
-      })
-    } catch {}
-
-    availabilityState.lastError = `已重新测试 ${processedCount} 条已选书签。`
+    if (stopped) {
+      auditStatus = 'cancelled'
+      auditReason = `用户停止重新测试，已处理 ${processedCount} 条。`
+      availabilityState.lastError = `已停止重新测试，保留 ${processedCount} 条已完成结果。`
+    } else {
+      auditReason = `完成重新测试 ${processedCount} 条。`
+      availabilityState.lastError = `已重新测试 ${processedCount} 条已选书签。`
+      if (catalogChangedDuringRun) {
+        availabilityState.lastError += ' 检测期间书签发生变化，本次重测未写入重定向缓存。'
+      } else {
+        try {
+          await mergeRetestedRedirectCache(retestedResults)
+        } catch (error) {
+          const detail = error instanceof Error ? `：${error.message}` : ''
+          availabilityState.lastError += ` 重定向缓存保存失败${detail}`
+        }
+      }
+    }
   } catch (error) {
-    availabilityState.lastError =
-      error instanceof Error
-        ? `重新测试所选书签失败：${error.message}`
-        : '重新测试所选书签失败，请稍后重试。'
+    if (availabilityState.stopRequested || isAbortError(error)) {
+      auditStatus = 'cancelled'
+      auditReason = `用户停止重新测试，已处理 ${processedCount} 条。`
+      availabilityState.lastError = `已停止重新测试，保留 ${processedCount} 条已完成结果。`
+    } else {
+      auditStatus = 'error'
+      availabilityState.lastError =
+        error instanceof Error
+          ? `重新测试所选书签失败：${error.message}`
+          : '重新测试所选书签失败，请稍后重试。'
+      auditReason = availabilityState.lastError
+    }
   } finally {
-    availabilityState.retestingSelection = false
+    if (networkRunStarted) {
+      recordPrivacyAudit({
+        feature: 'availability-check',
+        label: '死链/重定向重新测试',
+        target: '所选书签目标网站',
+        itemCount: Math.max(processedCount, availabilityState.retestSelectionCompleted),
+        fields: ['URL', 'HTTP 状态', '重定向地址', '错误码'],
+        includesBody: false,
+        status: auditStatus,
+        reason: auditReason || `完成重新测试 ${processedCount} 条。`
+      })
+    }
+
     availabilityState.retestSelectionTotal = 0
     availabilityState.retestSelectionCompleted = 0
-    availabilityState.retestSelectionProbeEnabled = false
-    updateAvailabilityRunnerStatus(scheduler)
+    if (scheduler && isAvailabilityRunSessionOwner(sessionId)) {
+      updateAvailabilityRunnerStatus(scheduler)
+    }
+    await finishAvailabilityRunSession(sessionId)
     renderAvailabilitySection()
   }
 }
@@ -7758,12 +8638,16 @@ function applyRetestedAvailabilityResult(result) {
   removeAvailabilityResultById(bookmarkId)
 
   if (result.status === 'available') {
+    availabilityState.checkedHealthyBookmarkIds.add(bookmarkId)
+    availabilityState.checkedHealthyBookmarkUrls.set(bookmarkId, String(result.url || ''))
     availabilityState.availableCount += 1
     managerState.selectedAvailabilityIds.delete(bookmarkId)
     return
   }
 
   if (result.status === 'redirected') {
+    availabilityState.checkedHealthyBookmarkIds.add(bookmarkId)
+    availabilityState.checkedHealthyBookmarkUrls.set(bookmarkId, String(result.url || ''))
     upsertResult(availabilityState.redirectResults, {
       ...result,
       finalUrl: result.finalUrl || result.url
@@ -7773,12 +8657,29 @@ function applyRetestedAvailabilityResult(result) {
     return
   }
 
-  const historyStatus = managerState.previousHistoryMap.has(bookmarkId) ? 'persistent' : 'new'
-  const abnormalStreak = managerState.previousHistoryMap.has(bookmarkId)
-    ? getHistoricalAbnormalStreak(bookmarkId, historyCallbacks) + 1
+  if (isUnverifiedAvailabilityResult(result)) {
+    availabilityState.checkedHealthyBookmarkIds.delete(bookmarkId)
+    availabilityState.checkedHealthyBookmarkUrls.delete(bookmarkId)
+    upsertResult(availabilityState.reviewResults, {
+      ...result,
+      historyStatus: '',
+      abnormalStreak: 0
+    })
+    availabilityState.reviewCount = availabilityState.reviewResults.length
+    managerState.selectedAvailabilityIds.delete(bookmarkId)
+    return
+  }
+
+  const hasPreviousHistory = hasMatchingPreviousHistoryEntry(result)
+  const historyStatus = hasPreviousHistory ? 'persistent' : 'new'
+  const qualifiedResult = requireRepeatedFailureEvidence(result, hasPreviousHistory)
+  availabilityState.checkedHealthyBookmarkIds.delete(bookmarkId)
+  availabilityState.checkedHealthyBookmarkUrls.delete(bookmarkId)
+  const abnormalStreak = hasPreviousHistory
+    ? getHistoricalAbnormalStreak(bookmarkId, result.url, historyCallbacks) + 1
     : 1
   const nextResult = {
-    ...result,
+    ...qualifiedResult,
     historyStatus,
     abnormalStreak
   }
@@ -7805,7 +8706,10 @@ function applyRetestedAvailabilityResult(result) {
   }
 }
 
-function removeAvailabilityResultById(bookmarkId) {
+function removeAvailabilityResultById(
+  bookmarkId,
+  { removeHistoryEntry = true }: { removeHistoryEntry?: boolean } = {}
+) {
   const normalizedId = String(bookmarkId || '').trim()
   if (!normalizedId) {
     return
@@ -7820,9 +8724,11 @@ function removeAvailabilityResultById(bookmarkId) {
   managerState.suppressedResults = managerState.suppressedResults.filter((result) => {
     return String(result.id) !== normalizedId
   })
-  managerState.currentHistoryEntries = managerState.currentHistoryEntries.filter((entry) => {
-    return String(entry.id) !== normalizedId
-  })
+  if (removeHistoryEntry) {
+    managerState.currentHistoryEntries = managerState.currentHistoryEntries.filter((entry) => {
+      return String(entry.id) !== normalizedId
+    })
+  }
   removeRedirectIdsFromState([normalizedId])
 
   availabilityState.reviewCount = availabilityState.reviewResults.length
@@ -7861,15 +8767,31 @@ async function ignoreSelectedAvailabilityResults(kind) {
     return
   }
 
-  let addedCount = 0
-
-  for (const result of candidateResults) {
-    if (addAvailabilityIgnoreRule(result, kind)) {
-      addedCount += 1
-    }
+  const releaseMutationLock = await claimAvailabilityMutationLock()
+  if (!releaseMutationLock) {
+    return
   }
 
-  await saveIgnoreRules()
+  let addedCount = 0
+  try {
+    const nextIgnoreRules = normalizeIgnoreRules(managerState.ignoreRules)
+    for (const result of candidateResults) {
+      if (addAvailabilityIgnoreRule(nextIgnoreRules, result, kind)) {
+        addedCount += 1
+      }
+    }
+
+    if (addedCount) {
+      await saveIgnoreRules(nextIgnoreRules)
+    }
+  } catch (error) {
+    availabilityState.lastError =
+      error instanceof Error ? `忽略规则保存失败：${error.message}` : '忽略规则保存失败。'
+    renderAvailabilitySection()
+    return
+  } finally {
+    releaseMutationLock()
+  }
   repartitionAvailabilityResultsByIgnoreRules()
   clearAvailabilitySelection()
   availabilityState.lastError = `已新增 ${addedCount} 条忽略规则。`
@@ -7908,68 +8830,86 @@ async function ignoreSingleAvailabilityResult(bookmarkId, kind) {
     return
   }
 
-  const added = addAvailabilityIgnoreRule(result, kind)
+  const releaseMutationLock = await claimAvailabilityMutationLock()
+  if (!releaseMutationLock) {
+    return
+  }
+
+  let added = false
+  try {
+    const nextIgnoreRules = normalizeIgnoreRules(managerState.ignoreRules)
+    added = addAvailabilityIgnoreRule(nextIgnoreRules, result, kind)
+    if (added) {
+      await saveIgnoreRules(nextIgnoreRules)
+    }
+  } catch (error) {
+    availabilityState.lastError =
+      error instanceof Error ? `忽略规则保存失败：${error.message}` : '忽略规则保存失败。'
+    renderAvailabilitySection()
+    return
+  } finally {
+    releaseMutationLock()
+  }
   if (!added) {
     availabilityState.lastError = '没有新增忽略规则。'
     renderAvailabilitySection()
     return
   }
 
-  await saveIgnoreRules()
   repartitionAvailabilityResultsByIgnoreRules()
   availabilityState.lastError = `已${getIgnoreKindActionLabel(kind)}，后续检测会自动过滤。`
   renderAvailabilitySection()
 }
 
-function addAvailabilityIgnoreRule(result, kind) {
+function addAvailabilityIgnoreRule(ignoreRules, result, kind) {
   if (!result) {
     return false
   }
 
   if (kind === 'bookmark') {
     const bookmarkId = String(result.id || '').trim()
-    if (!bookmarkId || managerState.ignoreRules.bookmarkIds.has(bookmarkId)) {
+    if (!bookmarkId || ignoreRules.bookmarkIds.has(bookmarkId)) {
       return false
     }
 
-    managerState.ignoreRules.bookmarks.push({
+    ignoreRules.bookmarks.push({
       bookmarkId,
       title: result.title,
       url: result.url,
       createdAt: Date.now()
     })
-    managerState.ignoreRules.bookmarkIds.add(bookmarkId)
+    ignoreRules.bookmarkIds.add(bookmarkId)
     return true
   }
 
   if (kind === 'domain') {
     const domain = String(result.domain || '').trim().toLowerCase()
-    if (!domain || managerState.ignoreRules.domainValues.has(domain)) {
+    if (!domain || ignoreRules.domainValues.has(domain)) {
       return false
     }
 
-    managerState.ignoreRules.domains.push({
+    ignoreRules.domains.push({
       domain,
       createdAt: Date.now()
     })
-    managerState.ignoreRules.domainValues.add(domain)
+    ignoreRules.domainValues.add(domain)
     return true
   }
 
   if (kind === 'folder') {
     const folderId = String(result.parentId || '').trim()
-    if (!folderId || managerState.ignoreRules.folderIds.has(folderId)) {
+    if (!folderId || ignoreRules.folderIds.has(folderId)) {
       return false
     }
 
     const folder = availabilityState.folderMap.get(folderId)
-    managerState.ignoreRules.folders.push({
+    ignoreRules.folders.push({
       folderId,
       title: folder?.title || '未命名文件夹',
       path: folder?.path || result.path || '',
       createdAt: Date.now()
     })
-    managerState.ignoreRules.folderIds.add(folderId)
+    ignoreRules.folderIds.add(folderId)
     return true
   }
 
@@ -8029,7 +8969,7 @@ function hideAvailabilityResultForCurrentRun(bookmarkId) {
     return
   }
 
-  removeAvailabilityResultById(bookmarkId)
+  removeAvailabilityResultById(bookmarkId, { removeHistoryEntry: false })
   managerState.selectedAvailabilityIds.delete(String(bookmarkId))
   availabilityState.lastError = `已从本次结果隐藏“${result.title || '未命名书签'}”。不会新增忽略规则，重新检测后可能再次出现。`
   renderAvailabilitySection()
@@ -8039,7 +8979,11 @@ function isAvailabilityResultActionLocked() {
   return availabilityState.deleting ||
     availabilityState.retestingSelection ||
     availabilityState.stopRequested ||
-    (availabilityState.running && !availabilityState.paused)
+    availabilityState.runSessionActive
+}
+
+function isUnverifiedAvailabilityResult(result): boolean {
+  return isUnverifiedAvailabilityErrorCode(result?.errorCode)
 }
 
 function getAvailabilityResultById(bookmarkId) {
@@ -8076,7 +9020,10 @@ async function deleteSelectedAvailabilityResults() {
   }
 
   await deleteBookmarksToRecycle(
-    selectedResults.map((result) => result.id),
+    selectedResults.map((result) => ({
+      id: String(result.id),
+      expectedUrl: String(result.url || '')
+    })),
     '异常书签批量删除',
     recycleCallbacks
   )
@@ -8101,7 +9048,7 @@ function openMoveModal() {
 function openScopeModal(source) {
   const locked = source === 'ai'
     ? aiNamingState.running || aiNamingState.applying || availabilityState.catalogLoading
-    : availabilityState.running || availabilityState.retestingSelection || availabilityState.deleting || availabilityState.catalogLoading
+    : hasActiveAvailabilityRunSession() || availabilityState.deleting || availabilityState.catalogLoading
 
   if (locked) {
     return
@@ -8351,7 +9298,7 @@ async function handleScopeFolderSelection(folderId: string): Promise<void> {
     return
   }
 
-  if (source !== 'ai' && (availabilityState.running || availabilityState.retestingSelection || availabilityState.deleting)) {
+  if (source !== 'ai' && (hasActiveAvailabilityRunSession() || availabilityState.deleting)) {
     return
   }
 
@@ -8423,12 +9370,16 @@ function openDeleteModal() {
     !availabilityState.failedResults.length ||
     availabilityState.deleting ||
     availabilityState.stopRequested ||
-    (availabilityState.running && !availabilityState.paused)
+    availabilityState.runSessionActive
   ) {
     return
   }
 
   availabilityState.deleteModalOpen = true
+  availabilityDeleteModalSnapshot = availabilityState.failedResults.map((result) => ({
+    id: String(result.id),
+    expectedUrl: String(result.url || '')
+  }))
   renderDeleteModal()
 }
 
@@ -8438,37 +9389,42 @@ function closeDeleteModal() {
   }
 
   availabilityState.deleteModalOpen = false
+  availabilityDeleteModalSnapshot = []
   renderDeleteModal()
 }
 
 async function confirmDeleteFailedBookmarks() {
   if (
-    !availabilityState.failedResults.length ||
+    !availabilityDeleteModalSnapshot.length ||
     availabilityState.deleting ||
     availabilityState.stopRequested ||
-    (availabilityState.running && !availabilityState.paused)
+    availabilityState.runSessionActive
   ) {
     return
   }
 
   availabilityState.deleteModalOpen = false
+  const deleteCandidates = availabilityDeleteModalSnapshot.slice()
+  availabilityDeleteModalSnapshot = []
   renderDeleteModal()
 
   await deleteBookmarksToRecycle(
-    availabilityState.failedResults.map((result) => result.id),
+    deleteCandidates,
     '高置信异常批量删除',
     recycleCallbacks
   )
 }
 
 function removeDeletedResultsFromState(bookmarkIds) {
-  const removedIdSet = new Set(bookmarkIds.flatMap(id => { const mappedResult = String(id); return mappedResult ? [mappedResult] : [] }))
+  const removedIdSet = new Set<string>(bookmarkIds.flatMap(id => { const mappedResult = String(id); return mappedResult ? [mappedResult] : [] }))
   if (!removedIdSet.size) {
     return
   }
 
   removedIdSet.forEach((bookmarkId) => {
     availabilityState.deletedBookmarkIds.add(bookmarkId)
+    availabilityState.checkedHealthyBookmarkIds.delete(bookmarkId)
+    availabilityState.checkedHealthyBookmarkUrls.delete(bookmarkId)
     managerState.selectedAvailabilityIds.delete(bookmarkId)
     managerState.selectedDuplicateIds.delete(bookmarkId)
   })
@@ -8602,7 +9558,7 @@ function reconcileCatalogAfterMutation() {
   managerState.suppressedResults = syncBookmarkMetadataForResults(managerState.suppressedResults)
   managerState.currentHistoryEntries = managerState.currentHistoryEntries.flatMap((flatMapValue, flatMapIndex, flatMapArray) => { const mappedResult = ((entry) => {
       const latestBookmark = availabilityState.bookmarkMap.get(String(entry.id))
-      if (!latestBookmark) {
+      if (!latestBookmark || String(latestBookmark.url || '') !== String(entry.url || '')) {
         return null
       }
 
@@ -8621,7 +9577,7 @@ function reconcileCatalogAfterMutation() {
 function syncBookmarkMetadataForResults(results) {
   return results.flatMap((flatMapValue, flatMapIndex, flatMapArray) => { const mappedResult = ((result) => {
       const latestBookmark = availabilityState.bookmarkMap.get(String(result.id))
-      if (!latestBookmark) {
+      if (!latestBookmark || String(latestBookmark.url || '') !== String(result.url || '')) {
         return null
       }
 
@@ -8726,7 +9682,7 @@ function getModeCopyText() {
   }
 
   if (!availabilityState.bookmarks.length) {
-    return '当前没有可检测的 http/https 书签。'
+    return '当前没有适合外部检测的书签。'
   }
 
   if (availabilityState.probePermissionGranted) {
@@ -8755,12 +9711,21 @@ function getAvailabilityResultRecommendation(result): string {
 function getAvailabilityActionText() {
   const scopeMeta = getCurrentAvailabilityScopeMeta()
   const scopeActionLabel = scopeMeta.type === 'all' ? '全部书签' : '当前范围'
+  const activeSession = availabilityRunSessions.getActive()
 
   if (availabilityState.catalogLoading) {
     return '正在准备检测…'
   }
 
-  if (availabilityState.requestingPermission) {
+  if (activeSession?.phase === 'stopping') {
+    return '停止中…'
+  }
+
+  if (activeSession?.phase === 'finalizing') {
+    return '正在保存检测结果…'
+  }
+
+  if (availabilityState.requestingPermission || activeSession?.phase === 'authorizing') {
     return '正在请求站点授权…'
   }
 
@@ -8784,6 +9749,7 @@ function getAvailabilityActionText() {
 }
 
 function getAvailabilityStatusCopy() {
+  const activeSession = availabilityRunSessions.getActive()
   if (availabilityState.lastError) {
     return availabilityState.lastError
   }
@@ -8796,8 +9762,18 @@ function getAvailabilityStatusCopy() {
     return '正在读取本地数据。'
   }
 
-  if (availabilityState.requestingPermission) {
-    return '正在申请站点权限。'
+  if (activeSession?.phase === 'stopping') {
+    return availabilityState.running || availabilityState.retestingSelection
+      ? '正在停止，已完成结果会保留。'
+      : '正在取消本次检测。'
+  }
+
+  if (activeSession?.phase === 'finalizing') {
+    return '检测已完成，正在保存历史和重定向缓存。'
+  }
+
+  if (availabilityState.requestingPermission || activeSession?.phase === 'authorizing') {
+    return '正在核对并申请当前范围所需的站点权限。'
   }
 
   if (availabilityState.retestingSelection) {
@@ -8826,10 +9802,10 @@ function getAvailabilityStatusCopy() {
       return `已停止 · 完成 ${availabilityState.checkedBookmarks} · 可访问 ${availabilityState.availableCount} · 重定向 ${availabilityState.redirectedCount} · 异常 ${abnormalCount}`
     }
 
-    return `已完成 ${availabilityState.eligibleBookmarks} 条 · 可访问 ${availabilityState.availableCount} · 重定向 ${availabilityState.redirectedCount} · 异常 ${abnormalCount} · 忽略 ${availabilityState.ignoredCount}`
+    return `已完成 ${availabilityState.checkedBookmarks} 条 · 可访问 ${availabilityState.availableCount} · 重定向 ${availabilityState.redirectedCount} · 异常 ${abnormalCount} · 忽略 ${availabilityState.ignoredCount} · 保护跳过 ${availabilityState.skippedCount}`
   }
 
-  return '仅检测 http/https 书签。'
+  return '仅检测适合外部访问的 http/https 书签；敏感地址会自动跳过。'
 }
 
 function scheduleAvailabilityRender() {
@@ -8850,6 +9826,8 @@ function resetDetectionResults() {
   availabilityState.reviewCount = 0
   availabilityState.failedCount = 0
   availabilityState.ignoredCount = 0
+  availabilityState.checkedHealthyBookmarkIds = new Set()
+  availabilityState.checkedHealthyBookmarkUrls = new Map()
   availabilityState.reviewResults = []
   availabilityState.failedResults = []
   availabilityState.reviewResultsPage = 1

@@ -41,32 +41,6 @@ interface TrackMetrics {
   span: number
 }
 
-interface SparkleParticle {
-  flow: number
-  phase: number
-  radius: number
-  twinkle: number
-  x: number
-  y: number
-}
-
-interface ConfettiParticle {
-  color: string
-  life: number
-  size: number
-  ttl: number
-  vx: number
-  vy: number
-  x: number
-  y: number
-}
-
-interface CanvasBox {
-  dpr: number
-  height: number
-  width: number
-}
-
 type SelectorView = 'menu' | 'advanced'
 
 const FALLBACK_LEVEL: ReasoningEffortLevel = { id: 'default', label: '—' }
@@ -76,8 +50,6 @@ const SPRING_STIFFNESS = 900
 const SPRING_DAMPING = 42
 const VELOCITY_WINDOW_MS = 90
 const VELOCITY_MAX = 2.2
-const CONFETTI_MARGIN_X = 32
-const CONFETTI_MARGIN_Y = 40
 
 const PANEL_CLASS = cx(
   'reasoning-effort-popover !block !w-[var(--anchor-width)] !min-w-0 !max-w-[calc(100vw-24px)] !overflow-hidden !rounded-ds-lg !border-ds-border !bg-ds-surface-2 !p-0',
@@ -147,10 +119,6 @@ export function ReasoningEffortSelector({
   const trackRef = useRef<HTMLDivElement | null>(null)
   const fillRef = useRef<HTMLDivElement | null>(null)
   const knobRef = useRef<HTMLDivElement | null>(null)
-  const sparkleCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const confettiCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const openRef = useRef(open)
-  const viewRef = useRef<SelectorView>(view)
   const previewIndexRef = useRef(valueIndex)
   const positionRef = useRef(maxIndex > 0 ? valueIndex / maxIndex : 0)
   const draggingRef = useRef(false)
@@ -158,15 +126,6 @@ export function ReasoningEffortSelector({
   const trackMetricsRef = useRef<TrackMetrics | null>(null)
   const samplesRef = useRef<Array<{ time: number; value: number }>>([])
   const springFrameRef = useRef(0)
-  const sparkleFrameRef = useRef(0)
-  const sparkleLastRef = useRef(0)
-  const sparkleParticlesRef = useRef<SparkleParticle[]>([])
-  const sparkleBoxRef = useRef<CanvasBox | null>(null)
-  const confettiFrameRef = useRef(0)
-  const confettiLastRef = useRef(0)
-  const confettiParticlesRef = useRef<ConfettiParticle[]>([])
-  const confettiBoxRef = useRef<CanvasBox | null>(null)
-  const lastBurstRef = useRef(0)
   const previousAnimatedIndexRef = useRef(valueIndex)
 
   const safePreviewIndex = Math.min(maxIndex, Math.max(0, previewIndex))
@@ -180,25 +139,6 @@ export function ReasoningEffortSelector({
     [resolvedLevels]
   )
   const speedLabel = getSpeedLabel(currentLevel?.id, safePreviewIndex, maxIndex)
-
-  const stopSparkles = useCallback(() => {
-    window.cancelAnimationFrame(sparkleFrameRef.current)
-    sparkleFrameRef.current = 0
-  }, [])
-
-  const stopConfetti = useCallback(() => {
-    window.cancelAnimationFrame(confettiFrameRef.current)
-    confettiFrameRef.current = 0
-    confettiParticlesRef.current = []
-    const canvas = confettiCanvasRef.current
-    const box = confettiBoxRef.current
-    if (!canvas || !box) {
-      return
-    }
-    const context = canvas.getContext('2d')
-    context?.setTransform(box.dpr, 0, 0, box.dpr, 0, 0)
-    context?.clearRect(0, 0, box.width, box.height)
-  }, [])
 
   const readTrackMetrics = useCallback((): TrackMetrics | null => {
     const track = trackRef.current
@@ -257,215 +197,12 @@ export function ReasoningEffortSelector({
     }
   }, [maxIndex, onChange, resolvedLevels, value])
 
-  const sizeSparkleCanvas = useCallback(() => {
-    const track = trackRef.current
-    const canvas = sparkleCanvasRef.current
-    if (!track || !canvas) {
-      return
-    }
-    const width = track.clientWidth
-    const height = track.clientHeight
-    if (!width || !height) {
-      return
-    }
-    const dpr = Math.min(2, window.devicePixelRatio || 1)
-    const previousBox = sparkleBoxRef.current
-    if (
-      previousBox &&
-      previousBox.width === width &&
-      previousBox.height === height &&
-      previousBox.dpr === dpr
-    ) {
-      return
-    }
-    canvas.width = width * dpr
-    canvas.height = height * dpr
-    canvas.style.width = `${width}px`
-    canvas.style.height = `${height}px`
-    sparkleBoxRef.current = { dpr, height, width }
-    const count = Math.max(6, Math.round(width / 24))
-    sparkleParticlesRef.current = Array.from({ length: count }, () => ({
-      flow: 85 + Math.random() * 50,
-      phase: Math.random() * Math.PI * 2,
-      radius: 0.8 + Math.random() * 0.9,
-      twinkle: 2.5 + Math.random() * 4.5,
-      x: Math.random() * width,
-      y: 4 + Math.random() * Math.max(1, height - 8)
-    }))
-  }, [])
-
-  const drawSparkles = useCallback((time: number, staticFrame = false) => {
-    const canvas = sparkleCanvasRef.current
-    const box = sparkleBoxRef.current
-    if (!canvas || !box) {
-      return
-    }
-    const context = canvas.getContext('2d')
-    if (!context) {
-      return
-    }
-    const delta = staticFrame
-      ? 0
-      : Math.min(0.032, Math.max(0, (time - sparkleLastRef.current) / 1000))
-    sparkleLastRef.current = time
-    context.setTransform(box.dpr, 0, 0, box.dpr, 0, 0)
-    context.clearRect(0, 0, box.width, box.height)
-    context.fillStyle = '#ffffff'
-    const seconds = time / 1000
-    for (const particle of sparkleParticlesRef.current) {
-      particle.x -= particle.flow * delta
-      if (particle.x < -3) {
-        particle.x += box.width + 6
-      }
-      const wave = 0.5 + 0.5 * Math.sin(
-        staticFrame ? particle.phase * 3 : seconds * particle.twinkle + particle.phase
-      )
-      context.globalAlpha = 0.06 + 0.74 * wave * wave
-      context.beginPath()
-      context.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2)
-      context.fill()
-    }
-    context.globalAlpha = 1
-  }, [])
-
-  const startSparkles = useCallback(() => {
-    stopSparkles()
-    sizeSparkleCanvas()
-    const now = performance.now()
-    if (prefersReducedMotion()) {
-      drawSparkles(now, true)
-      return
-    }
-    sparkleLastRef.current = now
-    const tick = (time: number) => {
-      drawSparkles(time)
-      sparkleFrameRef.current = window.requestAnimationFrame(tick)
-    }
-    sparkleFrameRef.current = window.requestAnimationFrame(tick)
-  }, [drawSparkles, sizeSparkleCanvas, stopSparkles])
-
-  const fireConfetti = useCallback(() => {
-    if (
-      prefersReducedMotion() ||
-      !openRef.current ||
-      viewRef.current !== 'advanced'
-    ) {
-      return
-    }
-    const now = performance.now()
-    if (now - lastBurstRef.current < 350) {
-      return
-    }
-    const slider = sliderRef.current
-    const canvas = confettiCanvasRef.current
-    if (!slider || !canvas) {
-      return
-    }
-    const sliderWidth = slider.clientWidth
-    const sliderHeight = slider.clientHeight
-    if (!sliderWidth) {
-      return
-    }
-    lastBurstRef.current = now
-    const width = sliderWidth + CONFETTI_MARGIN_X * 2
-    const height = sliderHeight + CONFETTI_MARGIN_Y * 2
-    const dpr = Math.min(2, window.devicePixelRatio || 1)
-    const previousBox = confettiBoxRef.current
-    if (
-      !previousBox ||
-      previousBox.width !== width ||
-      previousBox.height !== height ||
-      previousBox.dpr !== dpr
-    ) {
-      canvas.width = width * dpr
-      canvas.height = height * dpr
-      canvas.style.width = `${width}px`
-      canvas.style.height = `${height}px`
-      confettiBoxRef.current = { dpr, height, width }
-    }
-
-    const centerX = KNOB_DIAMETER_PX / 2 + positionRef.current * Math.max(0, sliderWidth - KNOB_DIAMETER_PX) + CONFETTI_MARGIN_X
-    const centerY = sliderHeight / 2 + CONFETTI_MARGIN_Y
-    const colors = ['#c9b0f0', '#bfa5f2', '#d4c3f7', '#b79ef5']
-    const radius = KNOB_DIAMETER_PX / 2
-    const particleCount = 14
-    for (let index = 0; index < particleCount; index += 1) {
-      const angle = (index / particleCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.35
-      const speed = 105 + Math.random() * 45
-      confettiParticlesRef.current.push({
-        color: colors[index % colors.length],
-        life: 0,
-        size: 4.5 + Math.random(),
-        ttl: 0.2 + Math.random() * 0.08,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed - 25,
-        x: centerX + Math.cos(angle) * radius,
-        y: centerY + Math.sin(angle) * radius
-      })
-    }
-    if (!confettiFrameRef.current) {
-      confettiLastRef.current = now
-      const tick = (time: number) => {
-        const activeCanvas = confettiCanvasRef.current
-        const activeBox = confettiBoxRef.current
-        if (!activeCanvas || !activeBox) {
-          confettiFrameRef.current = 0
-          return
-        }
-        const context = activeCanvas.getContext('2d')
-        if (!context) {
-          confettiFrameRef.current = 0
-          return
-        }
-        const delta = Math.min(0.032, Math.max(0, (time - confettiLastRef.current) / 1000))
-        confettiLastRef.current = time
-        context.setTransform(activeBox.dpr, 0, 0, activeBox.dpr, 0, 0)
-        context.clearRect(0, 0, activeBox.width, activeBox.height)
-        confettiParticlesRef.current = confettiParticlesRef.current.filter((particle) => {
-          particle.life += delta
-          if (particle.life >= particle.ttl) {
-            return false
-          }
-          const damp = Math.exp(-6 * delta)
-          particle.vx *= damp
-          particle.vy = particle.vy * damp - 20 * delta
-          particle.x += particle.vx * delta
-          particle.y += particle.vy * delta
-          const progress = particle.life / particle.ttl
-          context.globalAlpha = Math.pow(1 - progress, 1.5)
-          context.fillStyle = particle.color
-          context.beginPath()
-          context.arc(particle.x, particle.y, particle.size / 2, 0, Math.PI * 2)
-          context.fill()
-          return true
-        })
-        context.globalAlpha = 1
-        if (confettiParticlesRef.current.length) {
-          confettiFrameRef.current = window.requestAnimationFrame(tick)
-        } else {
-          confettiFrameRef.current = 0
-          context.clearRect(0, 0, activeBox.width, activeBox.height)
-        }
-      }
-      confettiFrameRef.current = window.requestAnimationFrame(tick)
-    }
-    if (!draggingRef.current && knobRef.current?.animate) {
-      knobRef.current.animate(
-        [{ scale: '1' }, { scale: '1.05' }, { scale: '1' }],
-        { duration: 180, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' }
-      )
-    }
-  }, [])
-
-  const startSpring = useCallback((targetIndex: number, initialVelocity: number, celebrate: boolean) => {
+  const startSpring = useCallback((targetIndex: number, initialVelocity: number) => {
     cancelSpring()
     const targetProgress = maxIndex > 0 ? targetIndex / maxIndex : 0
     const settle = () => {
       updateVisualProgress(targetProgress)
       springFrameRef.current = 0
-      if (celebrate && targetIndex === maxIndex) {
-        fireConfetti()
-      }
     }
     if (prefersReducedMotion() || Math.abs(positionRef.current - targetProgress) < 0.001) {
       settle()
@@ -489,7 +226,7 @@ export function ReasoningEffortSelector({
       springFrameRef.current = window.requestAnimationFrame(step)
     }
     springFrameRef.current = window.requestAnimationFrame(step)
-  }, [cancelSpring, fireConfetti, maxIndex, updateVisualProgress])
+  }, [cancelSpring, maxIndex, updateVisualProgress])
 
   const progressFromPointer = useCallback((clientX: number) => {
     const metrics = trackMetricsRef.current ?? readTrackMetrics()
@@ -556,7 +293,7 @@ export function ReasoningEffortSelector({
     // 语义状态在指针释放时立即提交；弹簧只负责随后跟手的视觉收尾。
     // 这样用户马上点击“保存/测试连接”时，请求不会仍读取上一个强度。
     commitLevel(targetIndex)
-    startSpring(targetIndex, velocity, targetIndex === maxIndex && maxIndex > 0)
+    startSpring(targetIndex, velocity)
   }, [commitLevel, maxIndex, startSpring])
 
   const handleSliderKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -583,10 +320,7 @@ export function ReasoningEffortSelector({
     const clampedIndex = Math.min(maxIndex, Math.max(0, nextIndex))
     updateVisualProgress(maxIndex > 0 ? clampedIndex / maxIndex : 0)
     commitLevel(clampedIndex)
-    if (clampedIndex !== currentIndex && clampedIndex === maxIndex && maxIndex > 0) {
-      fireConfetti()
-    }
-  }, [cancelSpring, commitLevel, disabled, fireConfetti, maxIndex, updateVisualProgress])
+  }, [cancelSpring, commitLevel, disabled, maxIndex, updateVisualProgress])
 
   useLayoutEffect(() => {
     trackMetricsRef.current = readTrackMetrics()
@@ -623,14 +357,7 @@ export function ReasoningEffortSelector({
   }, [safePreviewIndex])
 
   useEffect(() => {
-    openRef.current = open
-    viewRef.current = view
-  }, [open, view])
-
-  useEffect(() => {
     if (!open) {
-      stopSparkles()
-      stopConfetti()
       return undefined
     }
     const focusFrame = window.requestAnimationFrame(() => {
@@ -640,17 +367,8 @@ export function ReasoningEffortSelector({
         advancedButtonRef.current?.focus({ preventScroll: true })
       }
     })
-    if (view === 'advanced') {
-      const sparkleFrame = window.requestAnimationFrame(() => startSparkles())
-      return () => {
-        window.cancelAnimationFrame(focusFrame)
-        window.cancelAnimationFrame(sparkleFrame)
-        stopSparkles()
-      }
-    }
-    stopSparkles()
     return () => window.cancelAnimationFrame(focusFrame)
-  }, [open, startSparkles, stopConfetti, stopSparkles, view])
+  }, [open, view])
 
   useEffect(() => {
     const track = trackRef.current
@@ -660,20 +378,14 @@ export function ReasoningEffortSelector({
     const observer = new ResizeObserver(() => {
       trackMetricsRef.current = readTrackMetrics()
       updateVisualProgress(positionRef.current, false)
-      sizeSparkleCanvas()
-      if (openRef.current && viewRef.current === 'advanced') {
-        startSparkles()
-      }
     })
     observer.observe(track)
     return () => observer.disconnect()
-  }, [readTrackMetrics, sizeSparkleCanvas, startSparkles, updateVisualProgress])
+  }, [readTrackMetrics, updateVisualProgress])
 
   useEffect(() => () => {
     cancelSpring()
-    stopSparkles()
-    stopConfetti()
-  }, [cancelSpring, stopConfetti, stopSparkles])
+  }, [cancelSpring])
 
   const handleOpenChange = (nextOpen: boolean) => {
     if (disabled && nextOpen) {
@@ -878,23 +590,12 @@ export function ReasoningEffortSelector({
                     ref={fillRef}
                     className="absolute inset-0 z-10 overflow-hidden rounded-full bg-[#006efe] after:pointer-events-none after:absolute after:inset-0 after:z-0 after:bg-[linear-gradient(90deg,#006efe_0%,#9440d5_68%,#c472fb_100%)] after:opacity-0 after:transition-opacity after:duration-[300ms] after:ease-[var(--ease-smooth-out)] data-[highest=true]:after:opacity-100 motion-reduce:after:transition-none"
                     data-highest={isHighestLevel}
-                  >
-                    <canvas
-                      ref={sparkleCanvasRef}
-                      className="pointer-events-none absolute inset-0 z-10 size-full"
-                      aria-hidden="true"
-                    />
-                  </div>
+                  />
                 </div>
                 <div
                   className={KNOB_CLASS}
                   ref={knobRef}
                   data-dragging={dragging}
-                  aria-hidden="true"
-                />
-                <canvas
-                  ref={confettiCanvasRef}
-                  className="pointer-events-none absolute left-[-32px] top-[-40px] z-30"
                   aria-hidden="true"
                 />
               </div>

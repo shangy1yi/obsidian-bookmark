@@ -35,10 +35,14 @@ const popupCss = read('src/popup/popup.css')
 const optionsChrome = read('src/options/components/options-chrome-classes.ts')
 const optionsCss = read('src/options/options.css')
 const optionsMain = read('src/options/main.tsx')
+const aiProviderSettings = read('src/options/components/AiProviderSettings.tsx')
 const aiProviderSettingsClasses = read('src/options/components/ai-provider-settings-classes.ts')
+const reasoningEffortSelector = read('src/options/components/ReasoningEffortSelector.tsx')
 const aiSettingsCardClasses = read('src/options/components/ai-settings-card-classes.ts')
 const optionsModalClasses = read('src/options/components/options-modal-classes.ts')
 const optionLayoutClasses = read('src/options/components/option-layout-classes.ts')
+const availabilityControls = read('src/options/components/AvailabilityControls.tsx')
+const availabilityDecisionPanel = read('src/options/components/AvailabilityDecisionPanel.tsx')
 const switchClasses = read('src/ui/switch-classes.ts')
 const featureSettingsControls = read('src/options/components/FeatureSettingsControls.tsx')
 const featureSettingsStore = read('src/options/components/feature-settings-store.ts')
@@ -139,6 +143,27 @@ assert.ok(
     optionsCss.includes('.folder-picker-toggle:active') &&
     optionsCss.includes('@media (prefers-reduced-transparency: reduce)'),
   'The AI provider dialog must keep its centered geometry while honoring reduced motion and transparency.'
+)
+
+assert.ok(
+  (aiProviderSettings.match(/showLoader=\{false\}/g) || []).length === 2 &&
+    aiProviderSettings.includes('<StatusBusyLoadingLabel label={modelTools.fetchModelsStatus}') &&
+    availabilityControls.includes('showLoader={false}') &&
+    availabilityDecisionPanel.includes('<StatusBusyLoadingLabel label={state.progressLabel}') &&
+    aiProviderSettingsClasses.includes('ai-provider-advanced-trigger flex min-h-8 w-fit max-w-full') &&
+    !aiProviderSettingsClasses.includes('ai-provider-advanced-trigger flex w-full') &&
+    !optionLayoutClasses.includes("'curator-motion-row grid min-h-[66px]") &&
+    optionLayoutClasses.includes("'curator-motion-chip relative inline-flex") &&
+    !popupModals.includes('active:bg-black/20'),
+  'Busy and press feedback must stay on the smallest relevant control instead of duplicating loaders or animating whole option rows.'
+)
+
+assert.ok(
+  !reasoningEffortSelector.includes('<canvas') &&
+    !reasoningEffortSelector.includes('sparkle') &&
+    !reasoningEffortSelector.includes('confetti') &&
+    reasoningEffortSelector.includes('startSpring(targetIndex, velocity)'),
+  'Reasoning effort should keep direct slider motion without looping or celebratory particle decoration.'
 )
 
 assert.ok(

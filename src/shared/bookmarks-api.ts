@@ -12,6 +12,60 @@ export function getBookmarkTree(): Promise<chrome.bookmarks.BookmarkTreeNode[]> 
   })
 }
 
+export function getBookmarkById(
+  bookmarkId: string
+): Promise<chrome.bookmarks.BookmarkTreeNode | null> {
+  const normalizedBookmarkId = String(bookmarkId || '').trim()
+  if (!normalizedBookmarkId) {
+    return Promise.resolve(null)
+  }
+
+  return new Promise<chrome.bookmarks.BookmarkTreeNode | null>((resolve, reject) => {
+    chrome.bookmarks.get(normalizedBookmarkId, (nodes) => {
+      const error = chrome.runtime.lastError
+      if (error) {
+        reject(new Error(error.message))
+        return
+      }
+
+      resolve(Array.isArray(nodes) ? nodes[0] || null : null)
+    })
+  }).catch(async (lookupError) => {
+    try {
+      const tree = await getBookmarkTree()
+      return findBookmarkNodeById(tree, normalizedBookmarkId)
+    } catch (treeError) {
+      const lookupMessage = lookupError instanceof Error
+        ? lookupError.message
+        : '书签查询失败'
+      const treeMessage = treeError instanceof Error
+        ? treeError.message
+        : '书签树查询失败'
+      throw new Error(`无法确认书签是否存在：${lookupMessage}；${treeMessage}`)
+    }
+  })
+}
+
+function findBookmarkNodeById(
+  roots: chrome.bookmarks.BookmarkTreeNode[],
+  bookmarkId: string
+): chrome.bookmarks.BookmarkTreeNode | null {
+  const pending = [...roots]
+  while (pending.length) {
+    const node = pending.pop()
+    if (!node) {
+      continue
+    }
+    if (String(node.id) === bookmarkId) {
+      return node
+    }
+    if (node.children?.length) {
+      pending.push(...node.children)
+    }
+  }
+  return null
+}
+
 export function moveBookmark(
   bookmarkId: string,
   parentId: string,

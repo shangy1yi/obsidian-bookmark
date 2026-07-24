@@ -9,9 +9,8 @@
   box-sizing: border-box;
 }
 
-/* Large Popup lists cannot safely cross-blur: rasterizing hundreds of glyphs
-   can leave the live content frozen in a blurry intermediate frame. Preserve
-   the t-skel state model, but reveal Popup content on compositor properties. */
+/* Popup content cannot safely cross-blur: rasterizing dense glyph layers can
+   leave live text frozen in an intermediate frame. */
 .t-skel.popup-t-skel .t-skel-skeleton {
   filter: none;
   transform: none;
@@ -37,6 +36,24 @@
   transform: translate3d(0, 0, 0);
 }
 
+/* Keep the dense two-pane workspace geometrically fixed during cold start.
+   Compact cards may still use the subtle translate reveal above. */
+.t-skel.popup-workspace-reveal .t-skel-content,
+.t-skel.popup-workspace-reveal.is-revealed .t-skel-content {
+  transform: none;
+}
+
+.t-skel.popup-workspace-reveal .t-skel-content {
+  transition:
+    opacity var(--reveal-dur) var(--reveal-ease);
+}
+
+/* Loading feedback belongs to the placeholder marks, never the pane surfaces. */
+.popup-workspace-reveal .popup-skeleton-pulse {
+  animation: t-skel-pulse var(--pulse-dur) ease-in-out var(--pulse-count);
+  --pulse-min: 0.72;
+}
+
 html,
 body {
   margin: 0;
@@ -56,6 +73,12 @@ body {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   text-rendering: optimizeLegibility;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .popup-workspace-reveal .popup-skeleton-pulse {
+    animation: none;
+  }
 }
 
 body {
@@ -363,12 +386,6 @@ button:focus-visible {
   --resize-dur: 1ms;
   --popup-keyboard-selection-dur: var(--duration-micro);
   --popup-keyboard-selection-ease: var(--ease-smooth-out);
-}
-
-#popup-app-shell[data-keyboard-nav="true"] .popup-active-result-indicator {
-  transition:
-    opacity var(--popup-keyboard-selection-dur) var(--popup-keyboard-selection-ease),
-    transform 1ms var(--popup-keyboard-selection-ease);
 }
 
 #popup-app-shell[data-keyboard-nav="true"] .popup-list-button {

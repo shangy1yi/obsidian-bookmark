@@ -2,18 +2,25 @@ import {
   BOOKMARKS_BAR_ID,
   RECYCLE_BIN_LIMIT
 } from '../../shared/constants.js'
-import { createBookmark, getBookmarkTree } from '../../shared/bookmarks-api.js'
+import {
+  createBookmark,
+  getBookmarkById,
+  getBookmarkTree
+} from '../../shared/bookmarks-api.js'
 import { buildBookmarkCatalogSnapshot } from '../../shared/bookmark-catalog.js'
 import {
   deleteBookmarkToRecycle,
   loadRecycleBinEntries,
   mergeRecycleEntries,
+  RECYCLE_RESTORE_ROLLBACK_FAILED_CODE,
+  RECYCLE_RESTORE_SOURCE_EXISTS_CODE,
   removeRecycleEntries,
+  restoreBookmarkFromRecycleEntry,
   type RecycleEntry
 } from '../../shared/recycle-bin.js'
 import { createAutoBackupBeforeDangerousOperation, type DangerousOperationKind } from '../../shared/backup.js'
 import { availabilityState, managerState } from '../shared-options/state.js'
-import { syncSelectionSet } from '../shared-options/utils.js'
+import { isInteractionLocked, syncSelectionSet } from '../shared-options/utils.js'
 import { publishRecycleBin } from '../components/recycle-bin-store.js'
 import { publishRecycleControls } from '../components/recycle-controls-store.js'
 
@@ -61,13 +68,14 @@ export function renderRecycleSection(callbacks) {
   publishRecycleControls({
     busy: availabilityState.deleting,
     entryCount: managerState.recycleBin.length,
+    locked: isInteractionLocked(),
     selectedCount: managerState.selectedRecycleIds.size
   })
 
   publishRecycleBin({
     entries: managerState.recycleBin,
     selectedIds: managerState.selectedRecycleIds,
-    disabled: availabilityState.deleting
+    disabled: isInteractionLocked()
   })
 }
 
@@ -78,7 +86,7 @@ export function clearRecycleSelection(callbacks) {
 
 export function toggleRecycleEntrySelection(recycleId, checked, callbacks) {
   const normalizedRecycleId = String(recycleId || '').trim()
-  if (availabilityState.deleting || !normalizedRecycleId) {
+  if (isInteractionLocked() || !normalizedRecycleId) {
     return
   }
 
@@ -96,7 +104,7 @@ export function toggleRecycleEntrySelection(recycleId, checked, callbacks) {
 
 export function clearRecycleEntry(recycleId, callbacks) {
   const normalizedRecycleId = String(recycleId || '').trim()
-  if (availabilityState.deleting || !normalizedRecycleId) {
+  if (isInteractionLocked() || !normalizedRecycleId) {
     return
   }
 
@@ -105,7 +113,7 @@ export function clearRecycleEntry(recycleId, callbacks) {
 
 export function restoreRecycleEntry(recycleId, callbacks) {
   const normalizedRecycleId = String(recycleId || '').trim()
-  if (availabilityState.deleting || !normalizedRecycleId) {
+  if (isInteractionLocked() || !normalizedRecycleId) {
     return
   }
 
@@ -118,7 +126,7 @@ async function clearRecycleEntriesByIds(recycleIds, callbacks) {
     return targetSet.has(String(entry.recycleId))
   })
 
-  if (!targetEntries.length || availabilityState.deleting) {
+  if (!targetEntries.length || isInteractionLocked()) {
     return
   }
 
@@ -136,22 +144,58 @@ async function clearRecycleEntriesByIds(recycleIds, callbacks) {
   if (!confirmed) {
     return
   }
-
-  managerState.recycleBin = managerState.recycleBin.filter((entry) => {
-    return !targetSet.has(String(entry.recycleId))
-  })
-  for (const recycleId of targetSet) {
-    managerState.selectedRecycleIds.delete(recycleId)
+  if (isInteractionLocked()) {
+    return
   }
-  await removeRecycleEntries([...targetSet])
-  await refreshRecycleBinState()
-  availabilityState.lastError = targetEntries.length === 1
-    ? '已清除 1 条回收站记录。'
-    : `已清除 ${targetEntries.length} 条回收站记录。`
+
+  const releaseMutationLock = await callbacks.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
+  }
+  const lockedTargetEntries = managerState.recycleBin.filter((entry) => {
+    return targetSet.has(String(entry.recycleId))
+  })
+  if (!lockedTargetEntries.length) {
+    releaseMutationLock()
+    return
+  }
+
+  availabilityState.deleting = true
+  availabilityState.lastError = ''
   callbacks.renderAvailabilitySection()
+
+  try {
+    await removeRecycleEntries([...targetSet])
+    managerState.recycleBin = managerState.recycleBin.filter((entry) => {
+      return !targetSet.has(String(entry.recycleId))
+    })
+    for (const recycleId of targetSet) {
+      managerState.selectedRecycleIds.delete(recycleId)
+    }
+    try {
+      await refreshRecycleBinState()
+      availabilityState.lastError = lockedTargetEntries.length === 1
+        ? '已清除 1 条回收站记录。'
+        : `已清除 ${lockedTargetEntries.length} 条回收站记录。`
+    } catch (error) {
+      const detail = error instanceof Error ? `：${error.message}` : ''
+      availabilityState.lastError = `已清除 ${lockedTargetEntries.length} 条回收站记录，但刷新本地状态失败${detail}。`
+    }
+  } catch (error) {
+    availabilityState.lastError =
+      error instanceof Error ? `回收站记录清除失败：${error.message}` : '回收站记录清除失败。'
+  } finally {
+    availabilityState.deleting = false
+    releaseMutationLock()
+    callbacks.renderAvailabilitySection()
+  }
 }
 
 export function selectAllRecycleEntries(callbacks) {
+  if (isInteractionLocked()) {
+    return
+  }
+
   managerState.selectedRecycleIds = new Set(
     managerState.recycleBin.map((entry) => String(entry.recycleId))
   )
@@ -159,7 +203,7 @@ export function selectAllRecycleEntries(callbacks) {
 }
 
 export async function restoreSelectedRecycleEntries(callbacks) {
-  if (!managerState.selectedRecycleIds.size || availabilityState.deleting) {
+  if (!managerState.selectedRecycleIds.size || isInteractionLocked()) {
     return
   }
 
@@ -168,7 +212,7 @@ export async function restoreSelectedRecycleEntries(callbacks) {
 }
 
 export async function clearSelectedRecycleEntries(callbacks) {
-  if (!managerState.selectedRecycleIds.size || availabilityState.deleting) {
+  if (!managerState.selectedRecycleIds.size || isInteractionLocked()) {
     return
   }
 
@@ -177,11 +221,19 @@ export async function clearSelectedRecycleEntries(callbacks) {
 
 async function restoreRecycleEntriesByIds(recycleIds, callbacks) {
   const targetSet = new Set(recycleIds.flatMap(id => { const mappedResult = String(id); return mappedResult ? [mappedResult] : [] }))
+  if (isInteractionLocked()) {
+    return
+  }
+
+  const releaseMutationLock = await callbacks.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
+  }
   const targetEntries = managerState.recycleBin.filter((entry) => {
     return targetSet.has(String(entry.recycleId))
   })
-
   if (!targetEntries.length) {
+    releaseMutationLock()
     return
   }
 
@@ -189,8 +241,10 @@ async function restoreRecycleEntriesByIds(recycleIds, callbacks) {
   availabilityState.lastError = ''
   callbacks.renderAvailabilitySection()
 
-  const restoredIds = []
-  let restoreError = null
+  let committedRestoredCount = 0
+  let restoreError: unknown = null
+  const reconciliationWarnings: string[] = []
+  const committedRecycleIds = new Set<string>()
 
   try {
     const currentFolderIds = await loadCurrentFolderIds()
@@ -199,40 +253,76 @@ async function restoreRecycleEntriesByIds(recycleIds, callbacks) {
         ? entry.parentId
         : BOOKMARKS_BAR_ID
 
-      await createBookmark({
-        parentId: fallbackParentId,
-        index: Number.isFinite(entry.index) ? entry.index : undefined,
-        title: entry.title,
-        url: entry.url
-      })
-      restoredIds.push(String(entry.recycleId))
+      await restoreBookmarkFromRecycleEntry(
+        String(entry.recycleId),
+        () => createBookmark({
+          parentId: fallbackParentId,
+          index: Number.isFinite(entry.index) ? entry.index : undefined,
+          title: entry.title,
+          url: entry.url
+        })
+      )
+      committedRecycleIds.add(String(entry.recycleId))
+      committedRestoredCount += 1
     })
   } catch (error) {
     restoreError = error
   } finally {
-    availabilityState.deleting = false
-
-    if (restoredIds.length) {
-      const restoredSet = new Set(restoredIds)
+    if (committedRecycleIds.size) {
       managerState.recycleBin = managerState.recycleBin.filter((entry) => {
-        return !restoredSet.has(String(entry.recycleId))
+        return !committedRecycleIds.has(String(entry.recycleId))
       })
-      await removeRecycleEntries(restoredIds)
+      committedRecycleIds.forEach((recycleId) => {
+        managerState.selectedRecycleIds.delete(recycleId)
+      })
+    }
+
+    try {
       await Promise.all([
         refreshRecycleBinState(),
         callbacks.hydrateAvailabilityCatalog({ preserveResults: true })
       ])
+    } catch (error) {
+      reconciliationWarnings.push(
+        error instanceof Error ? `目录刷新失败：${error.message}` : '目录刷新失败'
+      )
     }
 
     if (restoreError) {
-      availabilityState.lastError =
-        restoreError instanceof Error
-          ? `恢复过程中断，已恢复 ${restoredIds.length} 条：${restoreError.message}`
-          : `恢复过程中断，已恢复 ${restoredIds.length} 条。`
+      if (committedRestoredCount === 0) {
+        const detail = restoreError instanceof Error ? `：${restoreError.message}` : ''
+        const errorCode =
+          typeof restoreError === 'object' &&
+          restoreError !== null &&
+          'code' in restoreError
+            ? String(restoreError.code || '')
+            : ''
+        if (errorCode === RECYCLE_RESTORE_SOURCE_EXISTS_CODE) {
+          availabilityState.lastError = restoreError instanceof Error
+            ? restoreError.message
+            : '原书签仍然存在，已取消重复恢复。'
+        } else if (errorCode === RECYCLE_RESTORE_ROLLBACK_FAILED_CODE) {
+          availabilityState.lastError =
+            `恢复未提交${detail} 自动回滚也失败，可能已经创建了书签且回收站记录仍保留；` +
+            '请先检查目标文件夹，不要立即重试。'
+        } else {
+          availabilityState.lastError =
+            `恢复未提交${detail} 已撤销本次恢复，未创建重复书签。`
+        }
+      } else {
+        availabilityState.lastError =
+          restoreError instanceof Error
+            ? `恢复过程中断，已提交 ${committedRestoredCount} 条：${restoreError.message}`
+            : `恢复过程中断，已提交 ${committedRestoredCount} 条。`
+      }
     } else {
-      availabilityState.lastError = `已从回收站恢复 ${restoredIds.length} 条书签。`
+      availabilityState.lastError = `已从回收站恢复 ${committedRestoredCount} 条书签。`
     }
-
+    if (reconciliationWarnings.length) {
+      availabilityState.lastError += ` 但本地状态同步未完全成功：${reconciliationWarnings.join('；')}。`
+    }
+    availabilityState.deleting = false
+    releaseMutationLock()
     callbacks.renderAvailabilitySection()
   }
 }
@@ -250,7 +340,7 @@ async function loadCurrentFolderIds(): Promise<Set<string>> {
 }
 
 export async function clearRecycleBin(callbacks) {
-  if (!managerState.recycleBin.length || availabilityState.deleting) {
+  if (!managerState.recycleBin.length || isInteractionLocked()) {
     return
   }
 
@@ -266,47 +356,104 @@ export async function clearRecycleBin(callbacks) {
   if (!confirmed) {
     return
   }
-
-  const recycleIds = managerState.recycleBin.map((entry) => String(entry.recycleId))
-  managerState.recycleBin = []
-  await removeRecycleEntries(recycleIds)
-  await refreshRecycleBinState()
-  clearRecycleSelection(callbacks)
-  availabilityState.lastError = '已清空回收站记录。'
-  callbacks.renderAvailabilitySection()
-}
-
-export async function deleteBookmarksToRecycle(bookmarkIds: unknown[], source: string, callbacks: any) {
-  const uniqueIds = [...new Set(bookmarkIds.flatMap(id => { const mappedResult = String(id); return mappedResult ? [mappedResult] : [] }))]
-  if (!uniqueIds.length) {
+  if (isInteractionLocked()) {
     return
   }
 
+  const releaseMutationLock = await callbacks.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
+  }
+  const recycleIds = managerState.recycleBin.map((entry) => String(entry.recycleId))
+  if (!recycleIds.length) {
+    releaseMutationLock()
+    return
+  }
+  availabilityState.deleting = true
+  availabilityState.lastError = ''
+  callbacks.renderAvailabilitySection()
+
+  try {
+    await removeRecycleEntries(recycleIds)
+    managerState.recycleBin = []
+    managerState.selectedRecycleIds.clear()
+    try {
+      await refreshRecycleBinState()
+      availabilityState.lastError = '已清空回收站记录。'
+    } catch (error) {
+      const detail = error instanceof Error ? `：${error.message}` : ''
+      availabilityState.lastError = `已清空回收站记录，但刷新本地状态失败${detail}。`
+    }
+  } catch (error) {
+    availabilityState.lastError =
+      error instanceof Error ? `清空回收站失败：${error.message}` : '清空回收站失败。'
+  } finally {
+    availabilityState.deleting = false
+    releaseMutationLock()
+    callbacks.renderAvailabilitySection()
+  }
+}
+
+export async function deleteBookmarksToRecycle(bookmarkCandidates: unknown[], source: string, callbacks: any) {
+  const candidateMap = new Map<string, { id: string; expectedUrl: string }>()
+  for (const candidate of Array.isArray(bookmarkCandidates) ? bookmarkCandidates : []) {
+    const candidateRecord = candidate && typeof candidate === 'object'
+      ? candidate as { id?: unknown; expectedUrl?: unknown }
+      : { id: candidate }
+    const id = String(candidateRecord.id || '').trim()
+    const expectedUrl = String(candidateRecord.expectedUrl || '').trim()
+    if (id && expectedUrl) {
+      candidateMap.set(id, { id, expectedUrl })
+    }
+  }
+  const uniqueCandidates = [...candidateMap.values()]
+  if (!uniqueCandidates.length || isInteractionLocked()) {
+    return
+  }
+
+  const releaseMutationLock = await callbacks.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
+  }
   availabilityState.deleting = true
   availabilityState.lastError = ''
   callbacks.renderAvailabilitySection()
 
   const removedIds = []
+  const skippedIds = []
   const recycleEntries = []
   let removalError = null
+  const reconciliationWarnings = []
 
   try {
     await createAutoBackupBeforeDangerousOperation({
       kind: inferDeleteBackupKind(source),
       source: 'options',
       reason: source || '删除书签前自动备份',
-      targetBookmarkIds: uniqueIds,
-      estimatedChangeCount: uniqueIds.length
+      targetBookmarkIds: uniqueCandidates.map((candidate) => candidate.id),
+      estimatedChangeCount: uniqueCandidates.length
     })
-
-    await runRecycleEntriesSequentially(uniqueIds, async (bookmarkId) => {
-      const bookmark = callbacks.getBookmarkRecord(bookmarkId)
-      if (!bookmark?.url) {
+    await runRecycleEntriesSequentially(uniqueCandidates, async (candidate) => {
+      const bookmarkId = candidate.id
+      const latestBookmark = await getBookmarkById(bookmarkId)
+      if (
+        !latestBookmark?.url ||
+        candidate.expectedUrl !== String(latestBookmark.url)
+      ) {
+        skippedIds.push(bookmarkId)
         return
       }
 
-      const recycleEntry = buildRecycleEntry(bookmark, source)
-      await deleteBookmarkToRecycle(bookmarkId, recycleEntry)
+      const recycleEntry = buildRecycleEntry(latestBookmark, source)
+      const deleted = await deleteBookmarkToRecycle(
+        bookmarkId,
+        recycleEntry,
+        { expectedUrl: candidate.expectedUrl }
+      )
+      if (!deleted) {
+        skippedIds.push(bookmarkId)
+        return
+      }
       removedIds.push(bookmarkId)
       recycleEntries.push(recycleEntry)
     })
@@ -318,25 +465,54 @@ export async function deleteBookmarksToRecycle(bookmarkIds: unknown[], source: s
         recycleEntries as RecycleEntry[],
         managerState.recycleBin as RecycleEntry[]
       )
-      await refreshRecycleBinState()
-      callbacks.removeDeletedResultsFromState(removedIds)
-      await callbacks.hydrateAvailabilityCatalog({ preserveResults: true })
-      await callbacks.saveRedirectCache()
+      try {
+        await refreshRecycleBinState()
+      } catch (error) {
+        reconciliationWarnings.push(
+          error instanceof Error ? `回收站刷新失败：${error.message}` : '回收站刷新失败'
+        )
+      }
+      try {
+        callbacks.removeDeletedResultsFromState(removedIds)
+        await callbacks.hydrateAvailabilityCatalog({ preserveResults: true })
+      } catch (error) {
+        reconciliationWarnings.push(
+          error instanceof Error ? `目录刷新失败：${error.message}` : '目录刷新失败'
+        )
+      }
+      try {
+        await callbacks.saveRedirectCache()
+      } catch (error) {
+        reconciliationWarnings.push(
+          error instanceof Error ? `缓存保存失败：${error.message}` : '缓存保存失败'
+        )
+      }
     }
 
-    availabilityState.deleting = false
-    availabilityState.deleteModalOpen = false
+    try {
+      if (removalError) {
+        availabilityState.lastError =
+          removalError instanceof Error
+            ? `删除过程中断，已删除 ${removedIds.length} 条：${removalError.message}`
+            : `删除过程中断，已删除 ${removedIds.length} 条。`
+      } else if (removedIds.length) {
+        const skippedCopy = skippedIds.length
+          ? ` ${skippedIds.length} 条因 URL 已变化或书签不存在而跳过。`
+          : ''
+        availabilityState.lastError = `已删除 ${removedIds.length} 条书签，并移入回收站。可在左侧“回收站”查看并恢复。${skippedCopy}`.trim()
+      } else if (skippedIds.length) {
+        availabilityState.lastError = `${skippedIds.length} 条书签因 URL 已变化或已不存在而跳过，未执行删除。`
+      }
 
-    if (removalError) {
-      availabilityState.lastError =
-        removalError instanceof Error
-          ? `删除过程中断，已删除 ${removedIds.length} 条：${removalError.message}`
-          : `删除过程中断，已删除 ${removedIds.length} 条。`
-    } else if (removedIds.length) {
-      availabilityState.lastError = `已删除 ${removedIds.length} 条书签，并移入回收站。可在左侧“回收站”查看并恢复。`
+      if (reconciliationWarnings.length) {
+        availabilityState.lastError = `${availabilityState.lastError || `已删除 ${removedIds.length} 条书签。`} 但本地状态同步未完全成功：${reconciliationWarnings.join('；')}。`
+      }
+    } finally {
+      availabilityState.deleting = false
+      availabilityState.deleteModalOpen = false
+      releaseMutationLock()
+      callbacks.renderAvailabilitySection()
     }
-
-    callbacks.renderAvailabilitySection()
   }
 }
 

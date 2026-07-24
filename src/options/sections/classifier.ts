@@ -1,4 +1,5 @@
 import { displayUrl, normalizeText } from '../../shared/text.js'
+import { isExternallyCheckableUrl } from '../../shared/sensitive-url.js'
 import type {
   AvailabilityResult,
   BookmarkRecord,
@@ -8,6 +9,7 @@ import type {
   ProbeKind,
   ProbeResult
 } from '../../shared/types.js'
+import type { AvailabilityProbeResult } from '../../shared/messages.js'
 
 export const FETCH_TIMEOUT_MS = 20000
 
@@ -49,6 +51,17 @@ const AMBIGUOUS_NAVIGATION_ERRORS = new Set([
   'net::ERR_ABORTED'
 ])
 
+const UNVERIFIED_AVAILABILITY_ERROR_CODES = new Set([
+  'permission-missing',
+  'private-network-endpoint',
+  'sensitive-redirect',
+  'sensitive-url',
+  'ungranted-redirect',
+  'unsupported-address-space',
+  'unsupported-dns-boundary',
+  'unverified-network-endpoint'
+])
+
 const TIMEOUT_NAVIGATION_ERRORS = new Set([
   'timeout',
   'net::ERR_TIMED_OUT',
@@ -84,6 +97,18 @@ export function buildFailureClassification(
   probe: ProbeResult | null,
   probeEnabled: boolean
 ): AvailabilityResult {
+  const successfulNavigation = attempts
+    .slice()
+    .reverse()
+    .find(shouldAcceptNavigationSuccess)
+  if (successfulNavigation) {
+    return buildNavigationSuccess(
+      bookmark,
+      successfulNavigation,
+      attempts.length > 1 ? '重试后台导航成功' : '首轮后台导航成功'
+    )
+  }
+
   const baseResult = {
     ...bookmark,
     finalUrl: attempts.at(-1)?.finalUrl || bookmark.url
@@ -93,6 +118,48 @@ export function buildFailureClassification(
   const requestProbe = classifyNavigationNetworkEvidenceFromAttempts(attempts)
   const effectiveProbe = chooseEffectiveProbe(probe, requestProbe)
   const effectiveProbeEnabled = probeEnabled || Boolean(effectiveProbe)
+  const unverifiedAttempt = attempts.find((attempt) => {
+    return isUnverifiedAvailabilityErrorCode(attempt.errorCode)
+  })
+  const unverifiedProbe = isUnverifiedAvailabilityErrorCode(probe?.errorCode)
+
+  if (
+    probe?.kind === 'ok' &&
+    !probe.errorCode &&
+    hasOnlyClientBlockingNavigationErrors(attempts)
+  ) {
+    const finalUrl = probe.finalUrl || bookmark.url
+    const redirected = Boolean(probe.redirected) ||
+      isRedirectedNavigation(bookmark.url, finalUrl)
+    return {
+      ...baseResult,
+      finalUrl,
+      status: redirected ? 'redirected' : 'available',
+      badgeText: redirected ? '网络校验跳转' : '网络校验可访问',
+      detail: joinEvidenceDetail(
+        navigationSummary,
+        probe.detail,
+        '后台标签页受本地扩展或浏览器规则拦截；独立网络校验已确认目标可达'
+      )
+    }
+  }
+
+  if (unverifiedAttempt || unverifiedProbe) {
+    const errorCode = String(unverifiedAttempt?.errorCode || probe?.errorCode)
+    return {
+      ...baseResult,
+      finalUrl: unverifiedAttempt?.finalUrl || probe?.finalUrl || baseResult.finalUrl,
+      status: 'review',
+      badgeText: getUnverifiedAvailabilityBadge(errorCode),
+      errorCode,
+      detail: joinEvidenceDetail(
+        navigationSummary,
+        formatNavigationNetworkEvidence(unverifiedAttempt?.networkEvidence),
+        probe?.detail,
+        getUnverifiedAvailabilityDetail(errorCode)
+      )
+    }
+  }
 
   if (!effectiveProbeEnabled || !effectiveProbe) {
     return {
@@ -145,11 +212,11 @@ export function buildFailureClassification(
   if (effectiveProbe.kind === 'missing') {
     return {
       ...baseResult,
-      status: 'failed',
-      badgeText: '高置信异常',
+      status: 'review',
+      badgeText: '资源不存在·待确认',
       detail: joinEvidenceDetail(
         navigationSummary,
-        `网络探测(${effectiveProbe.method})返回 ${effectiveProbe.label}，较大概率是失效链接`
+        `匿名网络探测(${effectiveProbe.method})返回 ${effectiveProbe.label}；私有资源和登录后内容也可能用 404/410 隐藏访问状态，需由你确认后再移入异常`
       )
     }
   }
@@ -276,7 +343,7 @@ export function shouldRetryNavigation(result: NavigationAttempt | null | undefin
 }
 
 export function shouldAcceptNavigationSuccess(result: NavigationAttempt | null | undefined): boolean {
-  if (!result || result.status !== 'available') {
+  if (!result || result.status !== 'available' || result.errorCode) {
     return false
   }
 
@@ -286,7 +353,40 @@ export function shouldAcceptNavigationSuccess(result: NavigationAttempt | null |
     return false
   }
 
-  return Boolean(evidence?.requestSent && statusCode > 0 && statusCode < 400)
+  if (evidence?.errorCode || statusCode >= 400) {
+    return false
+  }
+
+  if (statusCode > 0) {
+    return statusCode < 400
+  }
+
+  return isHttpNavigationUrl(result.finalUrl)
+}
+
+export function getSafeSameOriginRedirectUrl(
+  sourceUrl: unknown,
+  attempt: NavigationAttempt | null | undefined
+): string {
+  if (!attempt || attempt.errorCode !== 'ungranted-redirect') {
+    return ''
+  }
+
+  try {
+    const source = new URL(String(sourceUrl || '').trim())
+    const target = new URL(String(attempt.finalUrl || '').trim())
+    if (
+      !/^https?:$/i.test(target.protocol) ||
+      source.origin !== target.origin ||
+      normalizeNavigationUrl(source.href) === normalizeNavigationUrl(target.href) ||
+      !isExternallyCheckableUrl(target.href)
+    ) {
+      return ''
+    }
+    return target.href
+  } catch {
+    return ''
+  }
 }
 
 function summarizeNavigationEvidence(attempts: NavigationAttempt[]): NavigationEvidence {
@@ -315,6 +415,16 @@ function summarizeNavigationEvidence(attempts: NavigationAttempt[]): NavigationE
   }
 }
 
+function hasOnlyClientBlockingNavigationErrors(
+  attempts: NavigationAttempt[]
+): boolean {
+  return attempts.length > 0 && attempts.every((attempt) => {
+    return CLIENT_BLOCKING_NAVIGATION_ERRORS.has(
+      String(attempt.errorCode || '').trim()
+    )
+  })
+}
+
 function shouldClassifyAsHighConfidence(
   navigationEvidence: NavigationEvidence | null | undefined,
   probeKind: ProbeKind | string
@@ -340,7 +450,7 @@ function shouldClassifyAsHighConfidence(
 }
 
 export function shouldFallbackToGet(statusCode: number): boolean {
-  return [401, 403, 405, 429, 451, 500, 501, 502, 503, 504].includes(statusCode)
+  return [401, 403, 404, 405, 410, 451, 500, 501, 502, 503, 504].includes(statusCode)
 }
 
 export function classifyProbeResponse(
@@ -393,6 +503,108 @@ export function classifyProbeResponse(
     method,
     label,
     detail: `网络探测(${method})返回 ${label}。`
+  }
+}
+
+export function classifyAvailabilityProbeResult(
+  result: AvailabilityProbeResult,
+  method: string
+): ProbeResult {
+  if (result.errorCode) {
+    return {
+      kind: 'unknown',
+      method,
+      label: result.status ? `HTTP ${result.status}` : '探测受限',
+      detail: result.detail,
+      finalUrl: result.finalUrl,
+      redirected: result.redirected,
+      errorCode: result.errorCode
+    }
+  }
+
+  return {
+    ...classifyProbeResponse({
+      ok: result.ok,
+      redirected: result.redirected,
+      status: result.status,
+      url: result.finalUrl
+    }, method),
+    finalUrl: result.finalUrl,
+    redirected: result.redirected
+  }
+}
+
+export function isUnverifiedAvailabilityErrorCode(value: unknown): boolean {
+  return UNVERIFIED_AVAILABILITY_ERROR_CODES.has(String(value || '').trim())
+}
+
+export function requireRepeatedFailureEvidence(
+  result: AvailabilityResult,
+  hasMatchingPreviousEvidence: boolean
+): AvailabilityResult {
+  if (result.status !== 'failed' || hasMatchingPreviousEvidence) {
+    return result
+  }
+
+  return {
+    ...result,
+    status: 'review',
+    badgeText: '首次异常·待复核',
+    detail: joinEvidenceDetail(
+      result.detail,
+      '匿名探测可能受登录墙或访问策略影响；首次异常只列入复核，连续检测仍异常后才升级为失效'
+    )
+  }
+}
+
+function getUnverifiedAvailabilityBadge(errorCode: string): string {
+  if (errorCode === 'ungranted-redirect') {
+    return '待授权重定向'
+  }
+  if (errorCode === 'sensitive-redirect' || errorCode === 'sensitive-url') {
+    return '受保护链接'
+  }
+  if (errorCode === 'permission-missing') {
+    return '站点未授权'
+  }
+  if (errorCode === 'private-network-endpoint') {
+    return '网络边界受限'
+  }
+  return '探测能力受限'
+}
+
+function getUnverifiedAvailabilityDetail(errorCode: string): string {
+  if (errorCode === 'ungranted-redirect') {
+    return '已在发出下一跳请求前阻断；最终地址尚未验证，可授权后重新测试'
+  }
+  if (errorCode === 'sensitive-redirect' || errorCode === 'sensitive-url') {
+    return '目标属于受保护地址，未继续发出请求；此结果不计入异常历史'
+  }
+  if (errorCode === 'permission-missing') {
+    return '站点权限已缺失，未发出请求；此结果不计入异常历史'
+  }
+  if (errorCode === 'private-network-endpoint') {
+    return '安全探测观察到本机或私网连接端点；本地代理也可能产生这一信号，不能据此判断网站失效，此结果不计入异常历史'
+  }
+  return '浏览器缺少安全探测边界，未发出请求；此结果不计入异常历史'
+}
+
+export async function classifyProbeResponseAndDiscardBody(
+  response: Response,
+  method: string
+): Promise<ProbeResult> {
+  const result = classifyProbeResponse(response, method)
+  await discardProbeResponseBody(response)
+  return result
+}
+
+export async function discardProbeResponseBody(
+  response: Pick<Response, 'body'>
+): Promise<void> {
+  try {
+    await response.body?.cancel()
+  } catch {
+    // A locked or already-consumed stream does not change the response evidence.
   }
 }
 
@@ -560,13 +772,21 @@ export function classifyProbeError(error: unknown): ProbeResult {
     error && typeof error === 'object'
       ? String((error as { name?: unknown }).name || '')
       : ''
+  const rawErrorCode =
+    error && typeof error === 'object'
+      ? String((error as { code?: unknown }).code || '').trim()
+      : ''
+  const errorCode = /^[a-z][a-z0-9._:-]*$/i.test(rawErrorCode)
+    ? rawErrorCode
+    : undefined
 
   if (errorName === 'AbortError') {
     return {
       kind: 'unknown',
       method: 'GET',
       label: '探测超时',
-      detail: `网络探测超时，超过 ${Math.round(FETCH_TIMEOUT_MS / 1000)} 秒仍未返回。`
+      detail: `网络探测超时，超过 ${Math.round(FETCH_TIMEOUT_MS / 1000)} 秒仍未返回。`,
+      errorCode
     }
   }
 
@@ -575,7 +795,8 @@ export function classifyProbeError(error: unknown): ProbeResult {
       kind: 'network',
       method: 'GET',
       label: '网络探测失败',
-      detail: '网络探测未能建立连接。'
+      detail: '网络探测未能建立连接。',
+      errorCode
     }
   }
 
@@ -583,7 +804,8 @@ export function classifyProbeError(error: unknown): ProbeResult {
     kind: 'unknown',
     method: 'GET',
     label: '探测失败',
-    detail: error instanceof Error ? error.message : '网络探测失败。'
+    detail: error instanceof Error ? error.message : '网络探测失败。',
+    errorCode
   }
 }
 
@@ -595,13 +817,39 @@ function normalizeNavigationUrl(url: unknown): string {
   try {
     const parsedUrl = new URL(String(url || ''))
     parsedUrl.hash = ''
-    parsedUrl.hostname = parsedUrl.hostname.replace(/^www\./i, '').toLowerCase()
+    const protocol = parsedUrl.protocol.toLowerCase()
+    const hostname = parsedUrl.hostname.toLowerCase()
+    const port = getEffectiveNavigationPort(protocol, parsedUrl.port)
     const pathname = normalizeNavigationPathname(parsedUrl.pathname)
     const search = normalizeNavigationSearch(parsedUrl.search)
-    return `${parsedUrl.hostname}${pathname}${search}`
+    return `${protocol}//${hostname}:${port}${pathname}${search}`
   } catch (error) {
     return normalizeText(String(url || ''))
   }
+}
+
+function isHttpNavigationUrl(url: unknown): boolean {
+  try {
+    return /^https?:$/i.test(new URL(String(url || '')).protocol)
+  } catch {
+    return false
+  }
+}
+
+function getEffectiveNavigationPort(protocol: string, explicitPort: string): string {
+  if (explicitPort) {
+    return explicitPort
+  }
+
+  if (protocol === 'http:') {
+    return '80'
+  }
+
+  if (protocol === 'https:') {
+    return '443'
+  }
+
+  return ''
 }
 
 function normalizeNavigationPathname(pathname: unknown): string {
@@ -628,5 +876,9 @@ function normalizeNavigationSearch(search: string): string {
     return ''
   }
 
-  return `?${normalizedPairs.map(([key, value]) => `${key}=${value}`).join('&')}`
+  const normalizedParams = new URLSearchParams()
+  normalizedPairs.forEach(([key, value]) => {
+    normalizedParams.append(key, value)
+  })
+  return `?${normalizedParams.toString()}`
 }

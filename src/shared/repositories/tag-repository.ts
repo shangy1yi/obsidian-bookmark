@@ -1,19 +1,22 @@
 import { STORAGE_KEYS } from '../constants.js'
-import { getLocalStorage, removeLocalStorage, setLocalStorage } from '../storage.js'
+import {
+  getLocalStorage,
+  removeLocalStorage,
+  setLocalStorage,
+  type LocalStorageTransaction
+} from '../storage.js'
 import type {
   BookmarkTagIndex,
   BookmarkTagRecord
 } from '../bookmark-tags.js'
 import {
   CURATOR_DATA_STORES,
-  applyCuratorDataStoreDelta,
-  clearCuratorDataStore,
+  applyCuratorDataStoreDeltaWithMeta,
   isCuratorDataDbAvailable,
   readCuratorDataStore,
   readCuratorDataStoreMeta,
   resetCuratorDataDbForTest,
-  replaceCuratorDataStore,
-  writeCuratorDataStoreMeta
+  replaceCuratorDataStoreWithMeta
 } from './curator-data-db.js'
 
 const BOOKMARK_TAG_REPOSITORY_META_KEY = 'bookmarkTags'
@@ -32,7 +35,9 @@ export function configureBookmarkTagRepository(normalizerConfig: BookmarkTagRepo
   normalizers = normalizerConfig
 }
 
-export async function loadBookmarkTagIndexFromRepository(): Promise<BookmarkTagIndex> {
+export async function loadBookmarkTagIndexFromRepository(
+  transaction?: LocalStorageTransaction
+): Promise<BookmarkTagIndex> {
   const { normalizeIndex } = requireBookmarkTagRepositoryNormalizers()
   const idbIndex = await loadBookmarkTagIndexFromIndexedDb().catch(() => null)
   if (idbIndex) {
@@ -44,7 +49,7 @@ export async function loadBookmarkTagIndexFromRepository(): Promise<BookmarkTagI
         Number(localIndex.updatedAt) > Number(idbIndex.updatedAt)
       )
     ) {
-      await migrateBookmarkTagIndexToIndexedDb(localIndex).catch(() => {})
+      await migrateBookmarkTagIndexToIndexedDb(localIndex, transaction).catch(() => {})
       return localIndex
     }
     return idbIndex
@@ -52,37 +57,57 @@ export async function loadBookmarkTagIndexFromRepository(): Promise<BookmarkTagI
 
   const localIndex = await loadBookmarkTagIndexFromLocalStorage()
   if (Object.keys(localIndex.records).length && isCuratorDataDbAvailable()) {
-    await migrateBookmarkTagIndexToIndexedDb(localIndex).catch(() => {})
+    await migrateBookmarkTagIndexToIndexedDb(localIndex, transaction).catch(() => {})
   }
   return normalizeIndex(localIndex)
 }
 
-export async function saveBookmarkTagIndexToRepository(index: BookmarkTagIndex): Promise<BookmarkTagIndex> {
+export async function saveBookmarkTagIndexToRepository(
+  index: BookmarkTagIndex,
+  transaction?: LocalStorageTransaction
+): Promise<BookmarkTagIndex> {
   const { normalizeIndex } = requireBookmarkTagRepositoryNormalizers()
   const normalized = normalizeIndex(index)
   if (!isCuratorDataDbAvailable()) {
-    await writeBookmarkTagIndexToLocalStorage(normalized)
+    await writeBookmarkTagIndexToLocalStorage(normalized, transaction)
     return normalized
   }
 
   try {
     await replaceBookmarkTagIndexInIndexedDb(normalized)
-    await compactBookmarkTagIndexLocalStorage(normalized).catch(() => {})
+    await compactBookmarkTagIndexLocalStorage(normalized, transaction).catch(() => {})
   } catch {
-    await writeBookmarkTagIndexToLocalStorage(normalized)
+    await writeBookmarkTagIndexToLocalStorage(normalized, transaction)
   }
   return normalized
 }
 
-export async function updateBookmarkTagIndexInRepository(
-  updater: (index: BookmarkTagIndex) => BookmarkTagIndex
+export async function restoreBookmarkTagIndexInRepositoryStrict(
+  index: BookmarkTagIndex,
+  transaction?: LocalStorageTransaction
 ): Promise<BookmarkTagIndex> {
   const { normalizeIndex } = requireBookmarkTagRepositoryNormalizers()
-  const current = await loadBookmarkTagIndexFromRepository()
+  const normalized = normalizeIndex(index)
+  if (!isCuratorDataDbAvailable()) {
+    await writeBookmarkTagIndexToLocalStorage(normalized, transaction)
+    return normalized
+  }
+
+  await replaceBookmarkTagIndexInIndexedDb(normalized)
+  await compactBookmarkTagIndexLocalStorage(normalized, transaction)
+  return normalized
+}
+
+export async function updateBookmarkTagIndexInRepository(
+  updater: (index: BookmarkTagIndex) => BookmarkTagIndex,
+  transaction?: LocalStorageTransaction
+): Promise<BookmarkTagIndex> {
+  const { normalizeIndex } = requireBookmarkTagRepositoryNormalizers()
+  const current = await loadBookmarkTagIndexFromRepository(transaction)
   const nextIndex = normalizeIndex(updater(current))
 
   if (!isCuratorDataDbAvailable()) {
-    await writeBookmarkTagIndexToLocalStorage(nextIndex)
+    await writeBookmarkTagIndexToLocalStorage(nextIndex, transaction)
     return nextIndex
   }
 
@@ -91,30 +116,31 @@ export async function updateBookmarkTagIndexInRepository(
     if (delta.replaceAll) {
       await replaceBookmarkTagIndexInIndexedDb(nextIndex)
     } else {
-      await applyCuratorDataStoreDelta(
+      await applyCuratorDataStoreDeltaWithMeta(
         CURATOR_DATA_STORES.bookmarkTags,
         delta.upserts,
-        delta.deletedIds
+        delta.deletedIds,
+        buildBookmarkTagRepositoryMeta(nextIndex)
       )
-      await writeBookmarkTagRepositoryMeta(nextIndex)
     }
-    await compactBookmarkTagIndexLocalStorage(nextIndex).catch(() => {})
+    await compactBookmarkTagIndexLocalStorage(nextIndex, transaction).catch(() => {})
   } catch {
-    await writeBookmarkTagIndexToLocalStorage(nextIndex)
+    await writeBookmarkTagIndexToLocalStorage(nextIndex, transaction)
   }
   return nextIndex
 }
 
-export async function clearBookmarkTagIndexInRepository(): Promise<void> {
+export async function clearBookmarkTagIndexInRepository(
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   if (isCuratorDataDbAvailable()) {
-    await clearCuratorDataStore(CURATOR_DATA_STORES.bookmarkTags)
-    await writeBookmarkTagRepositoryMeta({
+    await replaceBookmarkTagIndexInIndexedDb({
       version: 1,
       updatedAt: Date.now(),
       records: {}
     })
   }
-  await removeLocalStorage(STORAGE_KEYS.bookmarkTagIndex)
+  await removeLocalStorage(STORAGE_KEYS.bookmarkTagIndex, { transaction })
 }
 
 export function resetBookmarkTagRepositoryForTest(): void {
@@ -157,31 +183,37 @@ async function loadBookmarkTagIndexFromLocalStorage(): Promise<BookmarkTagIndex>
   return normalizeIndex(stored[STORAGE_KEYS.bookmarkTagIndex])
 }
 
-async function migrateBookmarkTagIndexToIndexedDb(index: BookmarkTagIndex): Promise<void> {
+async function migrateBookmarkTagIndexToIndexedDb(
+  index: BookmarkTagIndex,
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   await replaceBookmarkTagIndexInIndexedDb(index)
-  await compactBookmarkTagIndexLocalStorage(index).catch(() => {})
+  await compactBookmarkTagIndexLocalStorage(index, transaction).catch(() => {})
 }
 
 async function replaceBookmarkTagIndexInIndexedDb(index: BookmarkTagIndex): Promise<void> {
-  await replaceCuratorDataStore(
+  await replaceCuratorDataStoreWithMeta(
     CURATOR_DATA_STORES.bookmarkTags,
-    Object.values(index.records)
+    Object.values(index.records),
+    buildBookmarkTagRepositoryMeta(index)
   )
-  await writeBookmarkTagRepositoryMeta(index)
 }
 
-async function writeBookmarkTagRepositoryMeta(index: BookmarkTagIndex): Promise<void> {
-  await writeCuratorDataStoreMeta({
+function buildBookmarkTagRepositoryMeta(index: BookmarkTagIndex) {
+  return {
     key: BOOKMARK_TAG_REPOSITORY_META_KEY,
-    version: 1,
+    version: 1 as const,
     updatedAt: Number(index.updatedAt) || 0,
     recordCount: Object.keys(index.records || {}).length,
     migratedAt: Date.now(),
     compactedAt: Date.now()
-  })
+  }
 }
 
-async function compactBookmarkTagIndexLocalStorage(index: BookmarkTagIndex): Promise<void> {
+async function compactBookmarkTagIndexLocalStorage(
+  index: BookmarkTagIndex,
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   await setLocalStorage({
     [STORAGE_KEYS.bookmarkTagIndex]: {
       version: 1,
@@ -192,13 +224,16 @@ async function compactBookmarkTagIndexLocalStorage(index: BookmarkTagIndex): Pro
       recordCount: Object.keys(index.records || {}).length,
       compactedAt: Date.now()
     }
-  })
+  }, { transaction })
 }
 
-async function writeBookmarkTagIndexToLocalStorage(index: BookmarkTagIndex): Promise<void> {
+async function writeBookmarkTagIndexToLocalStorage(
+  index: BookmarkTagIndex,
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   await setLocalStorage({
     [STORAGE_KEYS.bookmarkTagIndex]: index
-  })
+  }, { transaction })
 }
 
 function diffBookmarkTagIndexes(

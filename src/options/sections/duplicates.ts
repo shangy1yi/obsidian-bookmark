@@ -342,9 +342,21 @@ export async function deleteSelectedDuplicates(callbacks) {
   }
 
   const targetIds = getSelectedDuplicateIds()
+  const deleteCandidates = targetIds.flatMap((bookmarkId) => {
+    const item = getDuplicateItemById(bookmarkId)
+    return item?.url
+      ? [{
+          id: String(item.id),
+          expectedUrl: String(item.url)
+        }]
+      : []
+  })
+  if (!deleteCandidates.length) {
+    return
+  }
   const confirmed = callbacks.confirm
     ? await callbacks.confirm({
-        title: `移入回收站 ${targetIds.length} 条重复书签？`,
+        title: `移入回收站 ${deleteCandidates.length} 条重复书签？`,
         copy: `这些重复项会从 Chrome 书签中移除并进入扩展回收站；本次会保留 ${selectionStats.keepCount} 条。`,
         confirmLabel: '移入回收站',
         label: '移入回收站',
@@ -356,8 +368,8 @@ export async function deleteSelectedDuplicates(callbacks) {
   }
 
   await deleteBookmarksToRecycle(
-    targetIds,
-    `重复书签批量清理：移入回收站 ${targetIds.length} 条，保留 ${selectionStats.keepCount} 条`,
+    deleteCandidates,
+    `重复书签批量清理：移入回收站 ${deleteCandidates.length} 条，保留 ${selectionStats.keepCount} 条`,
     callbacks.recycleCallbacks
   )
   clearDuplicateSelection(callbacks)
@@ -568,6 +580,17 @@ function getSelectedDuplicateIds() {
   }
 
   return ids
+}
+
+function getDuplicateItemById(bookmarkId) {
+  const normalizedId = String(bookmarkId || '')
+  for (const group of managerState.duplicateGroups) {
+    const item = group.items.find((candidate) => String(candidate.id) === normalizedId)
+    if (item) {
+      return item
+    }
+  }
+  return null
 }
 
 function normalizeDuplicateStrategy(strategy) {

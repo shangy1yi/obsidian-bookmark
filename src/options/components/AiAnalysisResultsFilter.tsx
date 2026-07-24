@@ -5,25 +5,18 @@ import { handleAiResultsFilterChange } from '../options-controller'
 import { AI_ANALYSIS_SMALL_BUTTON_CLASS } from './ai-analysis-classes.js'
 import { useAiAnalysisResultsFilter } from './ai-analysis-status-store.js'
 
-const statusOptions: SelectOption[] = [
-  { value: 'all', label: '全部状态' },
+const resultOptions: SelectOption[] = [
+  { value: 'all', label: '全部结果' },
   { value: 'suggested', label: '建议改名' },
-  { value: 'changed', label: '标题变化大' },
   { value: 'manual_review', label: '待人工确认' },
+  { value: 'unchanged', label: '无需改名' },
   { value: 'failed', label: '失败' }
-]
-
-const confidenceOptions: SelectOption[] = [
-  { value: 'all', label: '全部置信度' },
-  { value: 'high', label: '高置信' },
-  { value: 'medium', label: '中置信' },
-  { value: 'low', label: '低置信' }
 ]
 
 const AI_RESULTS_FILTER_ROW_CLASS =
   'mt-[14px] min-w-0'
 const AI_RESULTS_FILTER_ACTIONS_CLASS =
-  'grid w-full min-w-0 grid-cols-[minmax(260px,286px)_minmax(220px,242px)_minmax(220px,242px)_auto] items-end gap-2.5 max-[980px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] max-[760px]:grid-cols-1'
+  'grid w-full min-w-0 grid-cols-[minmax(260px,1fr)_minmax(220px,242px)_auto] items-end gap-2.5 max-[760px]:grid-cols-1'
 const AI_RESULTS_FILTER_FIELD_CLASS =
   'grid min-w-0 gap-1.5'
 const AI_RESULTS_FILTER_LABEL_CLASS =
@@ -60,28 +53,15 @@ export function AiAnalysisResultsFilter() {
           />
         </label>
         <Select
-          ariaLabel="按状态筛选书签智能分析结果"
+          ariaLabel="按结果筛选书签智能分析结果"
           className={AI_RESULTS_FILTER_SELECT_CLASS}
-          label="状态"
-          options={statusOptions}
+          label="结果"
+          options={resultOptions}
           triggerClassName={AI_RESULTS_FILTER_SELECT_TRIGGER_CLASS}
           value={state.status}
           onValueChange={(value) => handleAiResultsFilterChange({
             action: 'change',
             key: 'status',
-            value: value || 'all'
-          })}
-        />
-        <Select
-          ariaLabel="按置信度筛选书签智能分析结果"
-          className={AI_RESULTS_FILTER_SELECT_CLASS}
-          label="置信度"
-          options={confidenceOptions}
-          triggerClassName={AI_RESULTS_FILTER_SELECT_TRIGGER_CLASS}
-          value={state.confidence}
-          onValueChange={(value) => handleAiResultsFilterChange({
-            action: 'change',
-            key: 'confidence',
             value: value || 'all'
           })}
         />

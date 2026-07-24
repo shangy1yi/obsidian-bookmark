@@ -79,6 +79,7 @@ export const availabilityState = {
   storageLoading: true,
   probePermissionGranted: false,
   currentRunProbeEnabled: false,
+  runSessionActive: false,
   running: false,
   retestingSelection: false,
   retestSelectionTotal: 0,
@@ -96,6 +97,8 @@ export const availabilityState = {
   folderMap: new Map(),
   runQueue: [],
   deletedBookmarkIds: new Set(),
+  checkedHealthyBookmarkIds: new Set<string>(),
+  checkedHealthyBookmarkUrls: new Map<string, string>(),
   abortController: null as AbortController | null,
   activeNavigationCheckIds: new Set<string>(),
   requestOrigins: [],
@@ -108,6 +111,7 @@ export const availabilityState = {
   failedCount: 0,
   ignoredCount: 0,
   skippedCount: 0,
+  runTotalBookmarks: 0,
   runStartedAt: 0,
   reviewResults: [],
   failedResults: [],
@@ -122,6 +126,7 @@ export const availabilityState = {
   settingsOpen: false,
   settingsStatus: '',
   settingsStatusTone: 'muted',
+  settingsSaving: false,
   settings: {
     concurrency: 2,
     navigationTimeoutMs: 30000
@@ -200,7 +205,6 @@ export const aiNamingState = {
   paused: false,
   pauseResolvers: [],
   filterStatus: 'all',
-  filterConfidence: 'all',
   filterQuery: '',
   resultsPage: 1,
   expandedTagResultIds: new Set(),
@@ -222,15 +226,14 @@ export const aiNamingState = {
   permissionStateHydrated: false,
   remoteParserPermissionGranted: false,
   runStartedAt: 0,
+  runTotalBookmarks: 0,
   checkedBookmarks: 0,
+  completedBookmarkIds: new Set<string>(),
   eligibleBookmarks: 0,
   suggestedCount: 0,
   rejectedCount: 0,
   manualReviewCount: 0,
   unchangedCount: 0,
-  highConfidenceCount: 0,
-  mediumConfidenceCount: 0,
-  lowConfidenceCount: 0,
   failedCount: 0,
   results: [],
   rejectedSuggestions: [],
@@ -246,6 +249,7 @@ export const aiNamingState = {
   lastConnectivityTestStatus: '',
   lastConnectivityTestMessage: '',
   lastCompletedAt: 0,
+  lastRunOutcome: '',
   lastError: ''
 }
 
@@ -258,5 +262,7 @@ export const backupRestoreState = {
   backup: null,
   preview: null,
   restoring: false,
-  status: ''
+  status: '',
+  operationKey: '',
+  operationId: ''
 }

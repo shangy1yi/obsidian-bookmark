@@ -1238,7 +1238,28 @@ async function verifyOptions(page, extensionId) {
   await page.goto(`chrome-extension://${extensionId}/src/options/options.html#general`, { waitUntil: 'domcontentloaded' })
   const advancedSettings = page.locator('#ai-advanced-settings')
   await advancedSettings.waitFor({ state: 'visible', timeout: 20_000 })
-  await advancedSettings.locator('.t-acc-head').click()
+  const advancedTrigger = advancedSettings.locator('.t-acc-head')
+  const [advancedSettingsBox, advancedTriggerBox] = await Promise.all([
+    advancedSettings.boundingBox(),
+    advancedTrigger.boundingBox()
+  ])
+  assert.ok(advancedSettingsBox && advancedTriggerBox, 'AI provider advanced settings should be measurable')
+  assert.ok(
+    advancedTriggerBox.width < advancedSettingsBox.width * 0.5,
+    `Advanced-settings highlight should stay content-sized: ${JSON.stringify({ advancedSettingsBox, advancedTriggerBox })}`
+  )
+  await advancedTrigger.focus()
+  await waitForFrames(page, 10)
+  const advancedFocusFeedback = await advancedTrigger.evaluate((element) => ({
+    background: getComputedStyle(element).backgroundColor,
+    focusVisible: element.matches(':focus-visible')
+  }))
+  assert.ok(
+    advancedFocusFeedback.focusVisible && advancedFocusFeedback.background !== 'rgba(0, 0, 0, 0)',
+    `Advanced-settings keyboard focus should retain a compact visible highlight: ${JSON.stringify(advancedFocusFeedback)}`
+  )
+  await captureVisual(page, 'options-advanced-trigger-compact')
+  await advancedTrigger.click()
   await page.waitForFunction(() => {
     const panel = document.querySelector('#ai-advanced-settings .t-acc-panel')
     return panel?.hasAttribute('data-open') && panel.getAnimations().length === 0
@@ -1316,18 +1337,14 @@ async function verifyOptions(page, extensionId) {
     Math.abs(trackCenterY - knobCenterY) <= 1,
     `Reasoning effort knob should be vertically centered on its track: ${JSON.stringify({ knobCenterY, trackCenterY })}`
   )
+  assert.equal(
+    await reasoningSlider.locator('canvas').count(),
+    0,
+    'Reasoning effort feedback should avoid decorative looping canvases'
+  )
   await captureVisual(page, 'options-reasoning-advanced')
   const reasoningTrackBox = await reasoningSlider.boundingBox()
   assert.ok(reasoningTrackBox, 'Reasoning effort track should be measurable')
-  const sparkleCanvas = reasoningSlider.locator('canvas').first()
-  await page.waitForFunction((canvas) => canvas instanceof HTMLCanvasElement && canvas.width > 0, await sparkleCanvas.elementHandle())
-  const sparkleAnimated = await sparkleCanvas.evaluate(async (canvas) => {
-    const firstFrame = canvas.toDataURL()
-    await new Promise((resolve) => setTimeout(resolve, 120))
-    return canvas.toDataURL() !== firstFrame
-  })
-  assert.ok(sparkleAnimated, 'Reasoning effort fill should render a moving particle stream')
-  const celebrationCanvas = reasoningSlider.locator('canvas').nth(1)
   const reasoningBefore = await reasoningSlider.getAttribute('aria-valuenow')
   await recordAnimationFrames(page, 'reasoning effort drag and spring settle', 800, async () => {
     const startX = reasoningTrackBox.x + 28
@@ -1337,10 +1354,6 @@ async function verifyOptions(page, extensionId) {
     await page.mouse.down()
     await page.mouse.move(endX, y, { steps: 8 })
     await page.mouse.up()
-    await page.waitForFunction(
-      (canvas) => canvas instanceof HTMLCanvasElement && canvas.width > 0,
-      await celebrationCanvas.elementHandle()
-    )
   })
   await page.waitForFunction((previous) => document.querySelector('[role="slider"][aria-label="推理强度"]')?.getAttribute('aria-valuenow') !== previous, reasoningBefore)
   await captureVisual(page, 'options-reasoning-highest')
@@ -1355,6 +1368,20 @@ async function verifyOptions(page, extensionId) {
   await page.keyboard.press('Escape')
   await verifyAvailabilitySettingsPopover(page, extensionId)
   await verifyOptionsScopePickers(page, extensionId)
+  if (visualCaptureDir) {
+    await page.setViewportSize({ width: 1280, height: 800 })
+    await page.goto(`chrome-extension://${extensionId}/src/options/options.html#ai`, { waitUntil: 'domcontentloaded' })
+    await page.locator('button[aria-label="按结果筛选书签智能分析结果"]')
+      .waitFor({ state: 'visible' })
+    await captureVisual(page, 'options-ai-analysis-desktop', { fullPage: true })
+    await page.setViewportSize({ width: 430, height: 900 })
+    await waitForFrames(page)
+    await captureVisual(page, 'options-ai-analysis-narrow', { fullPage: true })
+    await page.locator('button[aria-label="按结果筛选书签智能分析结果"]')
+      .scrollIntoViewIfNeeded()
+    await waitForFrames(page)
+    await captureVisual(page, 'options-ai-analysis-narrow-results')
+  }
 }
 
 async function verifyOptionsRefreshStability(page, worker, extensionId) {
@@ -1591,6 +1618,24 @@ async function verifyOptionsBorderIntegrity(page, extensionId) {
     `AI configuration status and primary action should share one 40px control height: ${JSON.stringify(aiToolbarButtonHeights)}`
   )
 
+  const aiResultFilter = page.locator('button[aria-label="按结果筛选书签智能分析结果"]')
+  await aiResultFilter.waitFor({ state: 'visible' })
+  assert.equal(
+    await page.locator('button[aria-label="按置信度筛选书签智能分析结果"]').count(),
+    0,
+    'AI results should use one result filter instead of separate status and confidence filters'
+  )
+  await aiResultFilter.click()
+  const aiResultFilterOptions = (await page.locator('[role="option"]').allTextContents())
+    .map((label) => label.trim())
+    .filter(Boolean)
+  assert.deepEqual(
+    aiResultFilterOptions,
+    ['全部结果', '建议改名', '待人工确认', '无需改名', '失败'],
+    'AI result filter should expose only the five actionable result categories'
+  )
+  await page.keyboard.press('Escape')
+
   const scopeTriggerCases = [
     { hash: 'availability', label: '选择检测范围' },
     { hash: 'history', label: '选择历史范围' },
@@ -1713,7 +1758,72 @@ async function verifyOptionsScopePickers(page, extensionId) {
         .find((candidate) => candidate.getAttribute('aria-label') === label)
       return button instanceof HTMLButtonElement && !button.disabled
     }, entry.trigger)
-    await trigger.click()
+    const triggerBox = await trigger.boundingBox()
+    assert.ok(triggerBox, `${entry.trigger} should be measurable before press feedback`)
+    const pressBefore = await trigger.evaluate((button) => {
+      const row = button.parentElement
+      const group = row?.parentElement
+      const read = (element) => {
+        if (!(element instanceof HTMLElement)) return null
+        const rect = element.getBoundingClientRect()
+        const style = getComputedStyle(element)
+        return {
+          height: rect.height,
+          scale: style.scale,
+          transform: style.transform,
+          width: rect.width
+        }
+      }
+      return { button: read(button), group: read(group), row: read(row) }
+    })
+    await page.mouse.move(
+      triggerBox.x + triggerBox.width / 2,
+      triggerBox.y + triggerBox.height / 2
+    )
+    await page.mouse.down()
+    await waitForFrames(page)
+    const pressDuring = await trigger.evaluate((button) => {
+      const row = button.parentElement
+      const group = row?.parentElement
+      const read = (element) => {
+        if (!(element instanceof HTMLElement)) return null
+        const rect = element.getBoundingClientRect()
+        const style = getComputedStyle(element)
+        return {
+          height: rect.height,
+          scale: style.scale,
+          transform: style.transform,
+          width: rect.width
+        }
+      }
+      return { button: read(button), group: read(group), row: read(row) }
+    })
+    for (const [label, before, during] of [
+      ['full option row', pressBefore.row, pressDuring.row],
+      ['surrounding range block', pressBefore.group, pressDuring.group]
+    ]) {
+      assert.equal(
+        during?.transform,
+        before?.transform,
+        `${entry.trigger} press feedback must not transform the ${label}`
+      )
+      assert.equal(
+        during?.scale,
+        before?.scale,
+        `${entry.trigger} press feedback must not scale the ${label}`
+      )
+      assert.ok(
+        Math.abs(Number(during?.width) - Number(before?.width)) < 0.1 &&
+          Math.abs(Number(during?.height) - Number(before?.height)) < 0.1,
+        `${entry.trigger} press feedback must not resize the ${label}`
+      )
+    }
+    assert.ok(
+      pressDuring.button?.transform !== pressBefore.button?.transform ||
+        pressDuring.button?.scale !== pressBefore.button?.scale,
+      `${entry.trigger} should keep direct button press feedback`
+    )
+    await page.mouse.up()
 
     const modal = page.getByRole('dialog', { name: '选择筛选文件夹' })
     const searchSurface = page.locator('label[for="scope-search-input"]')

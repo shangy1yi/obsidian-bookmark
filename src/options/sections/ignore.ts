@@ -84,10 +84,12 @@ function serializeIgnoreRules(ignoreRules) {
   }
 }
 
-export async function saveIgnoreRules() {
+export async function saveIgnoreRules(nextIgnoreRules = managerState.ignoreRules) {
+  const normalized = normalizeIgnoreRules(nextIgnoreRules)
   await setLocalStorage({
-    [STORAGE_KEYS.ignoreRules]: serializeIgnoreRules(managerState.ignoreRules)
+    [STORAGE_KEYS.ignoreRules]: serializeIgnoreRules(normalized)
   })
+  managerState.ignoreRules = normalized
 }
 
 export function matchesIgnoreRules(result) {
@@ -117,29 +119,41 @@ export function renderIgnoreSection() {
 }
 
 export async function removeIgnoreRule(kind, ruleId, callbacks) {
-  if (kind === 'bookmark') {
-    managerState.ignoreRules.bookmarks = managerState.ignoreRules.bookmarks.filter((rule) => {
-      return String(rule.bookmarkId) !== ruleId
-    })
-    managerState.ignoreRules.bookmarkIds.delete(ruleId)
+  const releaseMutationLock = await callbacks?.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
   }
 
-  if (kind === 'domain') {
-    managerState.ignoreRules.domains = managerState.ignoreRules.domains.filter((rule) => {
-      return String(rule.domain) !== ruleId
-    })
-    managerState.ignoreRules.domainValues.delete(ruleId)
-  }
+  try {
+    const nextIgnoreRules = normalizeIgnoreRules(managerState.ignoreRules)
+    if (kind === 'bookmark') {
+      nextIgnoreRules.bookmarks = nextIgnoreRules.bookmarks.filter((rule) => {
+        return String(rule.bookmarkId) !== ruleId
+      })
+      nextIgnoreRules.bookmarkIds.delete(ruleId)
+    }
 
-  if (kind === 'folder') {
-    managerState.ignoreRules.folders = managerState.ignoreRules.folders.filter((rule) => {
-      return String(rule.folderId) !== ruleId
-    })
-    managerState.ignoreRules.folderIds.delete(ruleId)
-  }
+    if (kind === 'domain') {
+      nextIgnoreRules.domains = nextIgnoreRules.domains.filter((rule) => {
+        return String(rule.domain) !== ruleId
+      })
+      nextIgnoreRules.domainValues.delete(ruleId)
+    }
 
-  await saveIgnoreRules()
-  callbacks?.onIgnoreRulesChanged?.()
+    if (kind === 'folder') {
+      nextIgnoreRules.folders = nextIgnoreRules.folders.filter((rule) => {
+        return String(rule.folderId) !== ruleId
+      })
+      nextIgnoreRules.folderIds.delete(ruleId)
+    }
+
+    await saveIgnoreRules(nextIgnoreRules)
+    callbacks?.onIgnoreRulesChanged?.()
+  } catch (error) {
+    callbacks?.onIgnoreRulesError?.(error)
+  } finally {
+    releaseMutationLock()
+  }
 }
 
 export async function clearIgnoreRules(kind, callbacks) {
@@ -175,21 +189,33 @@ export async function clearIgnoreRules(kind, callbacks) {
     return
   }
 
-  if (kind === 'bookmark') {
-    managerState.ignoreRules.bookmarks = []
-    managerState.ignoreRules.bookmarkIds = new Set()
+  const releaseMutationLock = await callbacks?.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
   }
 
-  if (kind === 'domain') {
-    managerState.ignoreRules.domains = []
-    managerState.ignoreRules.domainValues = new Set()
-  }
+  try {
+    const nextIgnoreRules = normalizeIgnoreRules(managerState.ignoreRules)
+    if (kind === 'bookmark') {
+      nextIgnoreRules.bookmarks = []
+      nextIgnoreRules.bookmarkIds = new Set()
+    }
 
-  if (kind === 'folder') {
-    managerState.ignoreRules.folders = []
-    managerState.ignoreRules.folderIds = new Set()
-  }
+    if (kind === 'domain') {
+      nextIgnoreRules.domains = []
+      nextIgnoreRules.domainValues = new Set()
+    }
 
-  await saveIgnoreRules()
-  callbacks?.onIgnoreRulesChanged?.()
+    if (kind === 'folder') {
+      nextIgnoreRules.folders = []
+      nextIgnoreRules.folderIds = new Set()
+    }
+
+    await saveIgnoreRules(nextIgnoreRules)
+    callbacks?.onIgnoreRulesChanged?.()
+  } catch (error) {
+    callbacks?.onIgnoreRulesError?.(error)
+  } finally {
+    releaseMutationLock()
+  }
 }

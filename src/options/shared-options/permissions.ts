@@ -51,14 +51,7 @@ export function containsPermissions(query: chrome.permissions.Permissions): Prom
   })
 }
 
-export async function requestPermissions(query: chrome.permissions.Permissions): Promise<boolean> {
-  try {
-    if (await containsPermissions(query)) {
-      return true
-    }
-  } catch {
-  }
-
+export function requestPermissions(query: chrome.permissions.Permissions): Promise<boolean> {
   return new Promise((resolve, reject) => {
     chrome.permissions.request(query, (granted) => {
       const error = chrome.runtime.lastError

@@ -35,6 +35,8 @@ const AI_RESULT_CURRENT_TITLE_CLASS =
   'block min-w-0 text-[13px] font-semibold leading-[1.4] text-ds-text-disabled [overflow-wrap:anywhere]'
 const AI_RESULT_SUGGESTED_TITLE_CLASS =
   'mt-2.5 mb-0 text-base font-semibold leading-[1.45] tracking-[0] text-ds-text-primary'
+const AI_RESULT_ERROR_CLASS =
+  'mt-2.5 mb-0 text-[13px] font-medium leading-[1.6] text-ds-danger-text [overflow-wrap:anywhere] [word-break:break-word]'
 const AI_RESULT_META_CLASS =
   'mt-2.5 flex flex-wrap gap-y-1.5 gap-x-3 text-xs font-semibold leading-normal text-ds-text-disabled'
 const AI_RESULT_META_ITEM_CLASS = 'min-w-0 [overflow-wrap:anywhere]'
@@ -178,6 +180,11 @@ function AiNamingResultCard({ result }: { result: AiNamingResultCardViewModel })
     >
       <strong className={AI_RESULT_CURRENT_TITLE_CLASS}>{result.currentTitle || '未命名书签'}</strong>
       <p className={AI_RESULT_SUGGESTED_TITLE_CLASS}>{result.suggestedTitle || '未生成建议标题'}</p>
+      {result.errorMessage ? (
+        <p className={AI_RESULT_ERROR_CLASS}>
+          {result.errorMessage}
+        </p>
+      ) : null}
       <div className={AI_RESULT_META_CLASS}>
         <span className={AI_RESULT_META_ITEM_CLASS}>{displayUrl(result.url)}</span>
         <span className={AI_RESULT_META_ITEM_CLASS}>{result.path || '未归档路径'}</span>

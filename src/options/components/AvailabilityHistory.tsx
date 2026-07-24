@@ -213,7 +213,7 @@ function AvailabilityHistoryLogList({
       {runs.map((run, index) => (
         <HistoryRunCard
           index={index}
-          key={run.runId || `${run.completedAt}:${index}`}
+          key={run.runId || String(run.completedAt)}
           maxAbnormalCount={maxAbnormalCount}
           run={run}
         />

@@ -525,11 +525,11 @@ async function deleteBookmarkToRecycleLazy(
   return deleteBookmarkToRecycle(...args)
 }
 
-async function removeRecycleEntryLazy(
-  ...args: Parameters<typeof import('../shared/recycle-bin.js').removeRecycleEntry>
-): ReturnType<typeof import('../shared/recycle-bin.js').removeRecycleEntry> {
-  const { removeRecycleEntry } = await import('../shared/recycle-bin.js')
-  return removeRecycleEntry(...args)
+async function restoreBookmarkFromRecycleEntryLazy(
+  ...args: Parameters<typeof import('../shared/recycle-bin.js').restoreBookmarkFromRecycleEntry>
+): ReturnType<typeof import('../shared/recycle-bin.js').restoreBookmarkFromRecycleEntry> {
+  const { restoreBookmarkFromRecycleEntry } = await import('../shared/recycle-bin.js')
+  return restoreBookmarkFromRecycleEntry(...args)
 }
 
 function loadBackgroundGalleryModule(): Promise<BackgroundGalleryModule> {
@@ -4890,7 +4890,7 @@ async function deleteActiveMenuBookmark(): Promise<void> {
     renderBookmarkMenu({ focusFirst: false, focusAction: 'delete-bookmark' })
 
     const recycleId = `recycle-${bookmark.id}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
-    await deleteBookmarkToRecycleLazy(bookmark.id, {
+    const deleted = await deleteBookmarkToRecycleLazy(bookmark.id, {
       recycleId,
       bookmarkId: String(bookmark.id),
       title: bookmark.title || '未命名书签',
@@ -4900,7 +4900,12 @@ async function deleteActiveMenuBookmark(): Promise<void> {
       path: getBookmarkFolderPath(bookmark) || DEFAULT_NEW_TAB_FOLDER_TITLE,
       source: '新标签页删除',
       deletedAt: Date.now()
+    }, {
+      expectedUrl: bookmark.url
     })
+    if (!deleted) {
+      throw new Error('书签地址已变化，已取消删除。')
+    }
     const deletedCustomIcon = state.customIcons[bookmark.id]
     if (deletedCustomIcon) {
       const nextIcons = { ...state.customIcons }
@@ -4963,15 +4968,15 @@ async function undoLastDeletedBookmark(): Promise<void> {
   try {
     const bookmark = deleted.bookmark
     const parentId = await getRestorableParentId(bookmark.parentId)
-    const createdBookmark = await createBookmarkLazy({
-      parentId,
-      index: Number.isFinite(Number(bookmark.index)) ? Number(bookmark.index) : undefined,
-      title: bookmark.title || '未命名书签',
-      url: bookmark.url
-    })
-    await removeRecycleEntryLazy(deleted.recycleId).catch((error) => {
-      console.warn('新标签页撤销删除时清理回收站记录失败。', error)
-    })
+    const createdBookmark = await restoreBookmarkFromRecycleEntryLazy(
+      deleted.recycleId,
+      () => createBookmarkLazy({
+        parentId,
+        index: Number.isFinite(Number(bookmark.index)) ? Number(bookmark.index) : undefined,
+        title: bookmark.title || '未命名书签',
+        url: bookmark.url
+      })
+    )
     if (deleted.customIcon) {
       await saveCustomIcons({
         ...state.customIcons,

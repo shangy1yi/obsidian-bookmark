@@ -19,13 +19,18 @@ const AI_ANALYSIS_STATUS_BADGE_TONE_CLASSES: Record<string, string> = {
 
 export function AiAnalysisStatusCard() {
   const state = useAiAnalysisStatus()
+  const isError = state.badgeTone === 'danger'
   const badgeClassName = [
     AI_ANALYSIS_STATUS_BADGE_BASE_CLASS,
     AI_ANALYSIS_STATUS_BADGE_TONE_CLASSES[state.badgeTone] || AI_ANALYSIS_STATUS_BADGE_TONE_CLASSES.muted
   ].join(' ')
 
   return (
-    <div className={AI_ANALYSIS_STATUS_CARD_CLASS}>
+    <div
+      className={AI_ANALYSIS_STATUS_CARD_CLASS}
+      role={isError ? 'alert' : 'status'}
+      aria-live={isError ? 'assertive' : 'polite'}
+    >
       <div className={AI_ANALYSIS_STATUS_META_CLASS}>
         <strong className={AI_ANALYSIS_STATUS_TITLE_CLASS}>执行方式</strong>
         <span className={badgeClassName}>

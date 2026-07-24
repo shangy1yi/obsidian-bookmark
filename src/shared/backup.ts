@@ -3,7 +3,11 @@ import {
   BOOKMARKS_BAR_ID,
   STORAGE_KEYS
 } from './constants.js'
-import { getBookmarkTree, createBookmark } from './bookmarks-api.js'
+import {
+  createBookmark,
+  getBookmarkTree,
+  removeBookmarkTree
+} from './bookmarks-api.js'
 import { extractBookmarkData } from './bookmark-tree.js'
 import {
   buildBookmarkTagDuplicateKey,
@@ -11,6 +15,7 @@ import {
   mergeBookmarkTagImport,
   normalizeBookmarkTagIndex,
   normalizeBookmarkTagUrl,
+  restoreBookmarkTagIndexSnapshot,
   saveBookmarkTagIndex,
   type BookmarkTagIndex
 } from './bookmark-tags.js'
@@ -18,7 +23,13 @@ import {
   loadNewTabActivityFromRepository,
   type NewTabActivityRepositoryState
 } from './repositories/activity-repository.js'
-import { getLocalStorage, setLocalStorage } from './storage.js'
+import {
+  getLocalStorage,
+  removeLocalStorage,
+  setLocalStorage,
+  withLocalStorageTransaction,
+  type LocalStorageTransaction
+} from './storage.js'
 
 const BACKUP_SCHEMA_VERSION = 1
 const BACKUP_APP = 'curator-bookmarks'
@@ -27,6 +38,14 @@ const AUTO_BACKUP_DB_NAME = 'curatorBookmarkHeavyUserData'
 const AUTO_BACKUP_DB_VERSION = 2
 const AUTO_BACKUP_STORE = 'autoBackups'
 const CONTENT_FULL_TEXT_STORE = 'contentFullText'
+const BACKUP_RESTORE_LOCK_NAME = 'curator:backup-restore'
+const BACKUP_RESTORE_JOURNAL_KEY = 'restore-journal:active'
+const BACKUP_RESTORE_RECEIPT_PREFIX = 'restore-receipt:'
+const BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION = 2
+type BackupRestoreJournalSchemaVersion = 1 | 2
+export const BACKUP_RESTORE_ROLLED_BACK_CODE = 'backup-restore-rolled-back'
+
+let fallbackBackupRestoreQueue = Promise.resolve()
 
 export type DangerousOperationKind =
   | 'batch-delete'
@@ -140,6 +159,81 @@ export interface BackupRestoreResult {
   }
   unmatchedTags: number
   skippedBookmarks: number
+}
+
+export interface JournaledBackupRestoreOptions {
+  operationId: string
+  now?: number
+  withMutationLock?: BackupRestoreMutationLock
+  beforeApply?: () => Promise<void>
+}
+
+export interface BackupRestoreRecoveryOptions {
+  withMutationLock?: BackupRestoreMutationLock
+}
+
+export interface BackupRestoreRecoveryResult {
+  operationId: string
+  recovered: boolean
+  errors: string[]
+}
+
+export type BackupRestoreMutationLock = <T>(task: () => Promise<T>) => Promise<T>
+
+type BackupRestoreJournalStatus =
+  | 'prepared'
+  | 'applying'
+  | 'copying-bookmarks'
+  | 'rolling-back'
+  | 'rollback-failed'
+
+interface BackupRestoreJournal {
+  backupId: typeof BACKUP_RESTORE_JOURNAL_KEY
+  kind: 'restore-journal'
+  schemaVersion: BackupRestoreJournalSchemaVersion
+  operationId: string
+  mode: BackupRestoreMode
+  status: BackupRestoreJournalStatus
+  startedAt: number
+  updatedAt: number
+  restoreStorageKeys: string[]
+  previousStorage: Record<string, unknown>
+  previousTagIndex: BookmarkTagIndex | null
+  expectedTagIndex: BookmarkTagIndex | null
+  expectedStorage: Record<string, unknown>
+  restoreFolderTitle: string
+  restoreFolderId: string
+  tagStateMayHaveChanged: boolean
+  storageStateMayHaveChanged: boolean
+  lastError: string
+  rollbackErrors: string[]
+}
+
+interface BackupRestoreReceipt {
+  backupId: string
+  kind: 'restore-receipt'
+  schemaVersion: BackupRestoreJournalSchemaVersion
+  operationId: string
+  mode: BackupRestoreMode
+  status: 'committed' | 'rolled-back' | 'preserved'
+  completedAt: number
+  result?: BackupRestoreResult
+  error?: string
+}
+
+interface BackupRestoreSnapshot {
+  currentBookmarks: Array<{ url: string; path?: string }>
+  previousTagIndex: BookmarkTagIndex | null
+  previousStorage: Record<string, unknown>
+  restoreStorageKeys: string[]
+}
+
+interface BackupRestoreApplyHooks {
+  restoreFolderTitle?: string
+  beforeTagChange?: (nextIndex: BookmarkTagIndex) => Promise<void> | void
+  beforeStorageChange?: (payload: Record<string, unknown>) => Promise<void> | void
+  beforeBookmarkCopy?: () => Promise<void> | void
+  restoreFolderCreated?: (folderId: string) => Promise<void> | void
 }
 
 export async function createCuratorBackupFile(
@@ -336,12 +430,254 @@ export async function buildBackupRestorePreview(
   }
 }
 
-export async function restoreCuratorBackup(
+export function restoreCuratorBackup(
   backup: CuratorBackupFileV1,
   mode: BackupRestoreMode
 ): Promise<BackupRestoreResult> {
-  const currentTree = await getBookmarkTree()
+  return withLocalStorageTransaction(async (transaction) => {
+    const snapshot = await captureBackupRestoreSnapshot(backup, mode, transaction)
+    let tagStateMayHaveChanged = false
+    let storageStateMayHaveChanged = false
+    let restoreFolderId = ''
+
+    try {
+      return await applyCuratorBackupRestore(backup, mode, transaction, snapshot, {
+        beforeTagChange() {
+          tagStateMayHaveChanged = true
+        },
+        beforeStorageChange() {
+          storageStateMayHaveChanged = true
+        },
+        restoreFolderCreated(folderId) {
+          restoreFolderId = folderId
+        }
+      })
+    } catch (error) {
+      const rollbackErrors = await rollbackBackupRestoreSnapshot(snapshot, transaction, {
+        restoreFolderId,
+        restoreFolderTitle: '',
+        restoreTagState: tagStateMayHaveChanged,
+        restoreStorageState: storageStateMayHaveChanged
+      })
+      throw buildBackupRestoreFailure(error, rollbackErrors)
+    }
+  })
+}
+
+export async function executeJournaledCuratorBackupRestore(
+  backup: CuratorBackupFileV1,
+  mode: BackupRestoreMode,
+  {
+    operationId: rawOperationId,
+    now = Date.now(),
+    withMutationLock,
+    beforeApply
+  }: JournaledBackupRestoreOptions
+): Promise<BackupRestoreResult> {
+  const operationId = normalizeBackupRestoreOperationId(rawOperationId)
+  assertBackupRestoreMode(mode)
+
+  return withBackupRestoreLock(async () => {
+    const receipt = await getBackupRestoreReceipt(operationId)
+    if (receipt) {
+      return resolveBackupRestoreReceipt(receipt)
+    }
+
+    const activeJournal = await getActiveBackupRestoreJournal()
+    if (activeJournal) {
+      const recovery = await recoverBackupRestoreJournal(
+        activeJournal,
+        withMutationLock
+      )
+      if (!recovery.recovered) {
+        throw new Error(
+          `上一次备份恢复尚未完成回滚：${recovery.errors.join('；') || '未知错误'}。`
+        )
+      }
+      if (activeJournal.operationId === operationId) {
+        const recoveredReceipt = await getBackupRestoreReceipt(operationId)
+        if (recoveredReceipt) {
+          return resolveBackupRestoreReceipt(recoveredReceipt)
+        }
+      }
+    }
+
+    return runWithOptionalBackupRestoreMutationLock(
+      mode,
+      withMutationLock,
+      async () => {
+        await beforeApply?.()
+        return withLocalStorageTransaction(async (transaction) => {
+        const snapshot = await captureBackupRestoreSnapshot(backup, mode, transaction)
+        const restoreFolderTitle = buildJournaledRestoreFolderTitle(operationId, now)
+        let journal: BackupRestoreJournal = {
+          backupId: BACKUP_RESTORE_JOURNAL_KEY,
+          kind: 'restore-journal',
+          schemaVersion: BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION,
+          operationId,
+          mode,
+          status: 'prepared',
+          startedAt: now,
+          updatedAt: now,
+          restoreStorageKeys: snapshot.restoreStorageKeys,
+          previousStorage: snapshot.previousStorage,
+          previousTagIndex: snapshot.previousTagIndex,
+          expectedTagIndex: null,
+          expectedStorage: {},
+          restoreFolderTitle,
+          restoreFolderId: '',
+          tagStateMayHaveChanged: false,
+          storageStateMayHaveChanged: false,
+          lastError: '',
+          rollbackErrors: []
+        }
+        await putAutoBackup(journal)
+
+        const updateJournal = async (
+          patch: Partial<Omit<
+            BackupRestoreJournal,
+            'backupId' | 'kind' | 'schemaVersion' | 'operationId'
+          >>
+        ): Promise<void> => {
+          journal = {
+            ...journal,
+            ...patch,
+            updatedAt: Date.now()
+          }
+          await putAutoBackup(journal)
+        }
+
+        try {
+          await updateJournal({ status: 'applying' })
+          const result = await applyCuratorBackupRestore(
+            backup,
+            mode,
+            transaction,
+            snapshot,
+            {
+              restoreFolderTitle,
+              async beforeTagChange(nextIndex) {
+                await updateJournal({
+                  tagStateMayHaveChanged: true,
+                  expectedTagIndex: normalizeBookmarkTagIndex(nextIndex)
+                })
+              },
+              async beforeStorageChange(payload) {
+                await updateJournal({
+                  storageStateMayHaveChanged: true,
+                  expectedStorage: {
+                    ...journal.expectedStorage,
+                    ...payload
+                  }
+                })
+              },
+              async beforeBookmarkCopy() {
+                if (journal.status !== 'copying-bookmarks') {
+                  await updateJournal({ status: 'copying-bookmarks' })
+                }
+              },
+              async restoreFolderCreated(folderId) {
+                await updateJournal({ restoreFolderId: folderId })
+              }
+            }
+          )
+          await replaceActiveJournalWithReceipt({
+            backupId: getBackupRestoreReceiptKey(operationId),
+            kind: 'restore-receipt',
+            schemaVersion: BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION,
+            operationId,
+            mode,
+            status: 'committed',
+            completedAt: Date.now(),
+            result
+          })
+          return result
+        } catch (error) {
+          journal = {
+            ...journal,
+            status: 'rolling-back',
+            updatedAt: Date.now(),
+            lastError: formatUnknownError(error),
+            rollbackErrors: []
+          }
+          await putAutoBackup(journal).catch(() => {})
+          const rollbackErrors = await rollbackBackupRestoreJournalUnderTransaction(
+            journal,
+            transaction
+          )
+          if (rollbackErrors.length) {
+            journal = {
+              ...journal,
+              status: 'rollback-failed',
+              updatedAt: Date.now(),
+              rollbackErrors
+            }
+            await putAutoBackup(journal).catch(() => {})
+            throw buildBackupRestoreFailure(error, rollbackErrors)
+          }
+
+          const failure = buildBackupRestoreFailure(error, [])
+          await replaceActiveJournalWithReceipt({
+            backupId: getBackupRestoreReceiptKey(operationId),
+            kind: 'restore-receipt',
+            schemaVersion: BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION,
+            operationId,
+            mode,
+            status: 'rolled-back',
+            completedAt: Date.now(),
+            error: failure.message
+          })
+          throw failure
+        }
+        })
+      }
+    )
+  })
+}
+
+export function recoverInterruptedCuratorBackupRestore(
+  { withMutationLock }: BackupRestoreRecoveryOptions = {}
+):
+  Promise<BackupRestoreRecoveryResult | null> {
+  return withBackupRestoreLock(async () => {
+    const journal = await getActiveBackupRestoreJournal()
+    return journal
+      ? recoverBackupRestoreJournal(journal, withMutationLock)
+      : null
+  })
+}
+
+async function captureBackupRestoreSnapshot(
+  backup: CuratorBackupFileV1,
+  mode: BackupRestoreMode,
+  transaction: LocalStorageTransaction
+): Promise<BackupRestoreSnapshot> {
+  const restoreStorageKeys = getBackupRestoreStorageKeys(backup, mode)
+  const [currentTree, previousTagIndex, previousStorage] = await Promise.all([
+    getBookmarkTree(),
+    mode === 'tagsOnly' || mode === 'safeFull'
+      ? loadBookmarkTagIndex({ transaction })
+      : Promise.resolve(null),
+    restoreStorageKeys.length
+      ? getLocalStorage(restoreStorageKeys)
+      : Promise.resolve({})
+  ])
   const currentData = extractBookmarkData(currentTree[0])
+  return {
+    currentBookmarks: currentData.bookmarks,
+    previousTagIndex,
+    previousStorage,
+    restoreStorageKeys
+  }
+}
+
+async function applyCuratorBackupRestore(
+  backup: CuratorBackupFileV1,
+  mode: BackupRestoreMode,
+  transaction: LocalStorageTransaction,
+  snapshot: BackupRestoreSnapshot,
+  hooks: BackupRestoreApplyHooks = {}
+): Promise<BackupRestoreResult> {
   const result: BackupRestoreResult = {
     mode,
     restored: {
@@ -355,11 +691,19 @@ export async function restoreCuratorBackup(
   }
 
   if (mode === 'tagsOnly' || mode === 'safeFull') {
-    const currentIndex = await loadBookmarkTagIndex()
-    const tagImport = mergeBookmarkTagImport(currentIndex, {
+    const tagImport = mergeBookmarkTagImport(snapshot.previousTagIndex, {
       records: Object.values(backup.storage.bookmarkTagIndex.records)
-    }, currentData.bookmarks)
-    await saveBookmarkTagIndex(tagImport.index)
+    }, snapshot.currentBookmarks)
+    const tagUpdatedAt = Date.now()
+    const tagTargetIndex = normalizeBookmarkTagIndex({
+      ...tagImport.index,
+      updatedAt: tagUpdatedAt
+    })
+    await hooks.beforeTagChange?.(tagTargetIndex)
+    await saveBookmarkTagIndex(tagTargetIndex, {
+      transaction,
+      updatedAt: tagUpdatedAt
+    })
     result.restored.tags = tagImport.added + tagImport.overwritten
     result.unmatchedTags = tagImport.unmatched
   }
@@ -367,13 +711,13 @@ export async function restoreCuratorBackup(
   if (mode === 'newTabOnly' || mode === 'safeFull') {
     const newTabPayload = buildNewTabStoragePayload(backup.storage.newTab)
     if (Object.keys(newTabPayload).length) {
-      await setLocalStorage(newTabPayload)
+      await hooks.beforeStorageChange?.(newTabPayload)
+      await setLocalStorage(newTabPayload, { transaction })
       result.restored.newTabSections = Object.keys(newTabPayload).length
     }
   }
 
   if (mode === 'safeFull') {
-    const currentAiSettings = (await getLocalStorage([STORAGE_KEYS.aiProviderSettings]))[STORAGE_KEYS.aiProviderSettings]
     const localPayload: Record<string, unknown> = {
       [STORAGE_KEYS.recycleBin]: backup.storage.recycleBin,
       [STORAGE_KEYS.ignoreRules]: backup.storage.ignoreRules,
@@ -382,13 +726,22 @@ export async function restoreCuratorBackup(
       [STORAGE_KEYS.aiRejectedSuggestions]: backup.storage.aiRejectedSuggestions
     }
     localPayload[STORAGE_KEYS.aiProviderSettings] = mergeRestoredAiProviderSettings(
-      currentAiSettings,
+      snapshot.previousStorage[STORAGE_KEYS.aiProviderSettings],
       backup.storage.aiProviderSettings
     )
-    await setLocalStorage(localPayload)
+    await hooks.beforeStorageChange?.(localPayload)
+    await setLocalStorage(localPayload, { transaction })
     result.restored.storageSections = Object.keys(localPayload).length
 
-    const copyResult = await copyMissingBookmarksToRestoreFolder(backup, currentData.bookmarks)
+    const copyResult = await copyMissingBookmarksToRestoreFolder(
+      backup,
+      snapshot.currentBookmarks,
+      {
+        restoreFolderTitle: hooks.restoreFolderTitle,
+        beforeCreate: hooks.beforeBookmarkCopy,
+        onCreated: hooks.restoreFolderCreated
+      }
+    )
     result.restored.copiedBookmarks = copyResult.copied
     result.skippedBookmarks = copyResult.skipped
   }
@@ -550,9 +903,402 @@ function buildNewTabStoragePayload(newTab: Record<string, unknown>): Record<stri
   return payload
 }
 
+function getBackupRestoreStorageKeys(
+  backup: CuratorBackupFileV1,
+  mode: BackupRestoreMode
+): string[] {
+  const keys = mode === 'newTabOnly' || mode === 'safeFull'
+    ? Object.keys(buildNewTabStoragePayload(backup.storage.newTab))
+    : []
+  if (mode === 'tagsOnly' || mode === 'safeFull') {
+    keys.push(STORAGE_KEYS.bookmarkTagIndex)
+  }
+  if (mode === 'safeFull') {
+    keys.push(
+      STORAGE_KEYS.recycleBin,
+      STORAGE_KEYS.ignoreRules,
+      STORAGE_KEYS.redirectCache,
+      STORAGE_KEYS.popupPreferences,
+      STORAGE_KEYS.aiRejectedSuggestions,
+      STORAGE_KEYS.aiProviderSettings
+    )
+  }
+  return [...new Set(keys)]
+}
+
+async function restoreLocalStorageSnapshot(
+  snapshot: Record<string, unknown>,
+  keys: string[],
+  transaction: LocalStorageTransaction
+): Promise<void> {
+  const payload: Record<string, unknown> = {}
+  const missingKeys: string[] = []
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(snapshot, key)) {
+      payload[key] = snapshot[key]
+    } else {
+      missingKeys.push(key)
+    }
+  }
+
+  if (Object.keys(payload).length) {
+    await setLocalStorage(payload, { transaction })
+  }
+  if (missingKeys.length) {
+    await removeLocalStorage(missingKeys, { transaction })
+  }
+}
+
+async function rollbackBackupRestoreSnapshot(
+  snapshot: Pick<
+    BackupRestoreSnapshot,
+    'previousTagIndex' | 'previousStorage' | 'restoreStorageKeys'
+  >,
+  transaction: LocalStorageTransaction,
+  {
+    restoreFolderId,
+    restoreFolderTitle,
+    restoreTagState,
+    restoreStorageState
+  }: {
+    restoreFolderId: string
+    restoreFolderTitle: string
+    restoreTagState: boolean
+    restoreStorageState: boolean
+  }
+): Promise<string[]> {
+  const rollbackErrors: string[] = []
+
+  if (restoreFolderId || restoreFolderTitle) {
+    try {
+      await removeOwnedRestoreFolder(restoreFolderId, restoreFolderTitle)
+    } catch (rollbackError) {
+      rollbackErrors.push(formatBackupError('恢复文件夹', rollbackError))
+    }
+  }
+  if (restoreTagState && snapshot.previousTagIndex) {
+    try {
+      await restoreBookmarkTagIndexSnapshot(snapshot.previousTagIndex, { transaction })
+    } catch (rollbackError) {
+      rollbackErrors.push(formatBackupError('标签数据', rollbackError))
+    }
+  }
+  if (restoreStorageState) {
+    try {
+      await restoreLocalStorageSnapshot(
+        snapshot.previousStorage,
+        snapshot.restoreStorageKeys,
+        transaction
+      )
+    } catch (rollbackError) {
+      rollbackErrors.push(formatBackupError('本地配置', rollbackError))
+    }
+  }
+
+  return rollbackErrors
+}
+
+async function rollbackBackupRestoreJournalUnderTransaction(
+  journal: BackupRestoreJournal,
+  transaction: LocalStorageTransaction
+): Promise<string[]> {
+  const verificationErrors: string[] = []
+  let restoreTagState = false
+  let restoreStorageKeys: string[] = []
+
+  if (
+    journal.tagStateMayHaveChanged &&
+    journal.previousTagIndex &&
+    journal.expectedTagIndex
+  ) {
+    try {
+      const currentTagIndex = await loadBookmarkTagIndex({ transaction })
+      restoreTagState = areBackupValuesEquivalent(
+        currentTagIndex,
+        journal.expectedTagIndex
+      )
+    } catch (error) {
+      verificationErrors.push(formatBackupError('标签状态校验', error))
+    }
+  }
+
+  const expectedStorageKeys = journal.storageStateMayHaveChanged
+    ? Object.keys(journal.expectedStorage)
+    : []
+  if (expectedStorageKeys.length) {
+    try {
+      const currentStorage = await getLocalStorage(expectedStorageKeys)
+      restoreStorageKeys = expectedStorageKeys.filter((storageKey) => {
+        return Object.prototype.hasOwnProperty.call(currentStorage, storageKey) &&
+          areBackupValuesEquivalent(
+            currentStorage[storageKey],
+            journal.expectedStorage[storageKey]
+          )
+      })
+    } catch (error) {
+      verificationErrors.push(formatBackupError('本地配置状态校验', error))
+    }
+  }
+
+  if (verificationErrors.length) {
+    return verificationErrors
+  }
+
+  return rollbackBackupRestoreSnapshot(
+    {
+      previousTagIndex: journal.previousTagIndex,
+      previousStorage: journal.previousStorage,
+      restoreStorageKeys
+    },
+    transaction,
+    {
+      restoreFolderId: journal.restoreFolderId,
+      restoreFolderTitle: journal.restoreFolderTitle,
+      restoreTagState,
+      restoreStorageState: restoreStorageKeys.length > 0
+    }
+  )
+}
+
+async function recoverBackupRestoreJournal(
+  journal: BackupRestoreJournal,
+  withMutationLock?: BackupRestoreMutationLock
+): Promise<BackupRestoreRecoveryResult> {
+  return runWithOptionalBackupRestoreMutationLock(
+    journal.mode,
+    withMutationLock,
+    () => withLocalStorageTransaction(async (transaction) => {
+      let currentJournal: BackupRestoreJournal = {
+        ...journal,
+        status: 'rolling-back',
+        updatedAt: Date.now(),
+        rollbackErrors: []
+      }
+      await putAutoBackup(currentJournal).catch(() => {})
+
+      const isLegacyJournal = currentJournal.schemaVersion === 1
+      const rollbackErrors = isLegacyJournal
+        ? await rollbackBackupRestoreSnapshot(
+            {
+              previousTagIndex: currentJournal.previousTagIndex,
+              previousStorage: currentJournal.previousStorage,
+              restoreStorageKeys: []
+            },
+            transaction,
+            {
+              restoreFolderId: currentJournal.restoreFolderId,
+              restoreFolderTitle: currentJournal.restoreFolderTitle,
+              restoreTagState: false,
+              restoreStorageState: false
+            }
+          )
+        : await rollbackBackupRestoreJournalUnderTransaction(
+            currentJournal,
+            transaction
+          )
+      if (rollbackErrors.length) {
+        currentJournal = {
+          ...currentJournal,
+          status: 'rollback-failed',
+          updatedAt: Date.now(),
+          rollbackErrors
+        }
+        await putAutoBackup(currentJournal).catch(() => {})
+        return {
+          operationId: currentJournal.operationId,
+          recovered: false,
+          errors: rollbackErrors
+        }
+      }
+
+      await replaceActiveJournalWithReceipt({
+        backupId: getBackupRestoreReceiptKey(currentJournal.operationId),
+        kind: 'restore-receipt',
+        schemaVersion: BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION,
+        operationId: currentJournal.operationId,
+        mode: currentJournal.mode,
+        status: isLegacyJournal ? 'preserved' : 'rolled-back',
+        completedAt: Date.now(),
+        error: isLegacyJournal
+          ? '检测到旧版恢复日志；无法安全确认哪些标签或设置由恢复写入，已保留当前数据并清理恢复专用文件夹。'
+          : currentJournal.lastError || '上一次备份恢复中断，已自动回滚。'
+      })
+      return {
+        operationId: currentJournal.operationId,
+        recovered: true,
+        errors: []
+      }
+    })
+  )
+}
+
+async function removeOwnedRestoreFolder(
+  restoreFolderId: string,
+  restoreFolderTitle: string
+): Promise<void> {
+  const normalizedId = String(restoreFolderId || '').trim()
+  const normalizedTitle = String(restoreFolderTitle || '').trim()
+  const tree = await getBookmarkTree()
+  if (normalizedId) {
+    const existing = findBookmarkNodeById(tree[0], normalizedId)
+    if (existing) {
+      await removeBookmarkTree(normalizedId)
+      return
+    }
+  }
+
+  if (!normalizedTitle) {
+    return
+  }
+  const bookmarkBar = findBookmarkNodeById(tree[0], BOOKMARKS_BAR_ID)
+  const matchingFolderIds = (bookmarkBar?.children || [])
+    .filter((node) => !node.url && String(node.title || '') === normalizedTitle)
+    .map((node) => String(node.id || '').trim())
+    .filter(Boolean)
+  for (const folderId of matchingFolderIds) {
+    await removeBookmarkTree(folderId)
+  }
+}
+
+function findBookmarkNodeById(
+  node: chrome.bookmarks.BookmarkTreeNode | undefined,
+  bookmarkId: string
+): chrome.bookmarks.BookmarkTreeNode | null {
+  if (!node) {
+    return null
+  }
+  if (String(node.id) === bookmarkId) {
+    return node
+  }
+  for (const child of node.children || []) {
+    const match = findBookmarkNodeById(child, bookmarkId)
+    if (match) {
+      return match
+    }
+  }
+  return null
+}
+
+function buildBackupRestoreFailure(error: unknown, rollbackErrors: string[]): Error {
+  const message = formatUnknownError(error) || '备份恢复失败。'
+  if (rollbackErrors.length) {
+    return new Error(`${message} 自动回滚未完全成功：${rollbackErrors.join('；')}。`)
+  }
+  return Object.assign(
+    new Error(`${message} 已自动回滚本次恢复写入。`),
+    { code: BACKUP_RESTORE_ROLLED_BACK_CODE }
+  )
+}
+
+function areBackupValuesEquivalent(left: unknown, right: unknown): boolean {
+  return JSON.stringify(normalizeBackupValueForComparison(left)) ===
+    JSON.stringify(normalizeBackupValueForComparison(right))
+}
+
+function normalizeBackupValueForComparison(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(normalizeBackupValueForComparison)
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+        .map(([key, child]) => [key, normalizeBackupValueForComparison(child)])
+    )
+  }
+  if (value === undefined) {
+    return { __curatorUndefined: true }
+  }
+  return value
+}
+
+function formatBackupError(label: string, error: unknown): string {
+  return `${label}${error instanceof Error ? `：${error.message}` : '恢复失败'}`
+}
+
+function formatUnknownError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error || '备份恢复失败。')
+}
+
+function normalizeBackupRestoreOperationId(value: unknown): string {
+  const operationId = String(value || '').trim()
+  if (
+    !operationId ||
+    operationId.length > 128 ||
+    !/^[a-z0-9._:-]+$/i.test(operationId)
+  ) {
+    throw new Error('备份恢复操作 ID 无效。')
+  }
+  return operationId
+}
+
+function assertBackupRestoreMode(mode: unknown): asserts mode is BackupRestoreMode {
+  if (mode !== 'tagsOnly' && mode !== 'newTabOnly' && mode !== 'safeFull') {
+    throw new Error('备份恢复模式无效。')
+  }
+}
+
+function buildJournaledRestoreFolderTitle(operationId: string, now: number): string {
+  const date = new Date(Number.isFinite(now) ? now : Date.now()).toISOString().slice(0, 10)
+  return `Curator Restore ${date} [${operationId}]`
+}
+
+function getBackupRestoreReceiptKey(operationId: string): string {
+  return `${BACKUP_RESTORE_RECEIPT_PREFIX}${operationId}`
+}
+
+function resolveBackupRestoreReceipt(receipt: BackupRestoreReceipt): BackupRestoreResult {
+  if (receipt.status === 'committed' && receipt.result) {
+    return receipt.result
+  }
+  const fallbackMessage = receipt.status === 'preserved'
+    ? '这次旧版备份恢复已终止；当前数据已保留，未重复执行。'
+    : '这次备份恢复此前已回滚，未重复执行。'
+  throw Object.assign(
+    new Error(receipt.error || fallbackMessage),
+    { code: BACKUP_RESTORE_ROLLED_BACK_CODE }
+  )
+}
+
+function withBackupRestoreLock<T>(task: () => Promise<T>): Promise<T> {
+  const lockManager = globalThis.navigator?.locks
+  if (lockManager) {
+    return lockManager.request(
+      BACKUP_RESTORE_LOCK_NAME,
+      { mode: 'exclusive' },
+      task
+    )
+  }
+
+  const queuedTask = fallbackBackupRestoreQueue
+    .catch(() => {})
+    .then(task)
+  fallbackBackupRestoreQueue = queuedTask.then(() => undefined, () => undefined)
+  return queuedTask
+}
+
+function runWithOptionalBackupRestoreMutationLock<T>(
+  mode: BackupRestoreMode,
+  withMutationLock: BackupRestoreMutationLock | undefined,
+  task: () => Promise<T>
+): Promise<T> {
+  return mode === 'safeFull' && withMutationLock
+    ? withMutationLock(task)
+    : task()
+}
+
 async function copyMissingBookmarksToRestoreFolder(
   backup: CuratorBackupFileV1,
-  currentBookmarks: Array<{ url: string; path?: string }>
+  currentBookmarks: Array<{ url: string; path?: string }>,
+  {
+    restoreFolderTitle = '',
+    beforeCreate,
+    onCreated
+  }: {
+    restoreFolderTitle?: string
+    beforeCreate?: () => Promise<void> | void
+    onCreated?: (folderId: string) => Promise<void> | void
+  } = {}
 ): Promise<{ copied: number; skipped: number }> {
   const knownInstances = new Set(
     currentBookmarks.map((bookmark) => buildBookmarkInstanceKey(bookmark.url, bookmark.path || ''))
@@ -566,18 +1312,18 @@ async function copyMissingBookmarksToRestoreFolder(
     return { copied: 0, skipped: 0 }
   }
 
+  await beforeCreate?.()
   const restoreFolder = await createBookmark({
     parentId: BOOKMARKS_BAR_ID,
-    title: `Curator Restore ${new Date().toISOString().slice(0, 10)}`
+    title: restoreFolderTitle || `Curator Restore ${new Date().toISOString().slice(0, 10)}`
   })
-  let copied = 0
-  let skipped = 0
-
-  const result = await copyMissingNodesSequentially(rootChildren, String(restoreFolder.id), knownInstances, '')
-  copied += result.copied
-  skipped += result.skipped
-
-  return { copied, skipped }
+  await onCreated?.(String(restoreFolder.id))
+  return copyMissingNodesSequentially(
+    rootChildren,
+    String(restoreFolder.id),
+    knownInstances,
+    ''
+  )
 }
 
 function copyMissingNodesSequentially(
@@ -775,16 +1521,68 @@ function openAutoBackupDb(): Promise<IDBDatabase> {
   })
 }
 
-async function putAutoBackup(record: Record<string, unknown>): Promise<void> {
+async function putAutoBackup(record: object): Promise<void> {
   const db = await openAutoBackupDb()
-  await runAutoBackupStoreRequest(db, 'readwrite', (store) => store.put(record))
-  db.close()
+  try {
+    await runAutoBackupStoreRequest(db, 'readwrite', (store) => store.put(record))
+  } finally {
+    db.close()
+  }
 }
 
 async function deleteAutoBackup(backupId: string): Promise<void> {
   const db = await openAutoBackupDb()
-  await runAutoBackupStoreRequest(db, 'readwrite', (store) => store.delete(backupId))
-  db.close()
+  try {
+    await runAutoBackupStoreRequest(db, 'readwrite', (store) => store.delete(backupId))
+  } finally {
+    db.close()
+  }
+}
+
+async function getAutoBackupRecord<T>(backupId: string): Promise<T | null> {
+  const db = await openAutoBackupDb()
+  try {
+    return await runAutoBackupStoreValueRequest<T | undefined>(
+      db,
+      (store) => store.get(backupId)
+    ).then((record) => record || null)
+  } finally {
+    db.close()
+  }
+}
+
+async function getActiveBackupRestoreJournal(): Promise<BackupRestoreJournal | null> {
+  const rawJournal = await getAutoBackupRecord<unknown>(BACKUP_RESTORE_JOURNAL_KEY)
+  if (!rawJournal) {
+    return null
+  }
+  return normalizeBackupRestoreJournal(rawJournal)
+}
+
+async function getBackupRestoreReceipt(
+  operationId: string
+): Promise<BackupRestoreReceipt | null> {
+  const rawReceipt = await getAutoBackupRecord<unknown>(
+    getBackupRestoreReceiptKey(operationId)
+  )
+  if (!rawReceipt) {
+    return null
+  }
+  return normalizeBackupRestoreReceipt(rawReceipt)
+}
+
+async function replaceActiveJournalWithReceipt(
+  receipt: BackupRestoreReceipt
+): Promise<void> {
+  const db = await openAutoBackupDb()
+  try {
+    await runAutoBackupStoreRequest(db, 'readwrite', (store) => {
+      store.delete(BACKUP_RESTORE_JOURNAL_KEY)
+      return store.put(receipt)
+    })
+  } finally {
+    db.close()
+  }
 }
 
 function runAutoBackupStoreRequest(
@@ -800,6 +1598,124 @@ function runAutoBackupStoreRequest(
     transaction.addEventListener('error', () => reject(transaction.error || new Error('自动备份存储失败。')))
     transaction.addEventListener('abort', () => reject(transaction.error || new Error('自动备份存储中断。')))
   })
+}
+
+function runAutoBackupStoreValueRequest<T>(
+  db: IDBDatabase,
+  createRequest: (store: IDBObjectStore) => IDBRequest
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(AUTO_BACKUP_STORE, 'readonly')
+    const store = transaction.objectStore(AUTO_BACKUP_STORE)
+    let request: IDBRequest
+    try {
+      request = createRequest(store)
+    } catch (error) {
+      reject(error)
+      return
+    }
+    transaction.addEventListener('complete', () => resolve(request.result as T))
+    transaction.addEventListener('error', () => {
+      reject(transaction.error || new Error('自动备份读取失败。'))
+    })
+    transaction.addEventListener('abort', () => {
+      reject(transaction.error || new Error('自动备份读取中断。'))
+    })
+  })
+}
+
+function normalizeBackupRestoreJournal(value: unknown): BackupRestoreJournal {
+  const source = normalizeObject(value)
+  const operationId = normalizeBackupRestoreOperationId(source.operationId)
+  assertBackupRestoreMode(source.mode)
+  const schemaVersion = source.schemaVersion === 1 || source.schemaVersion === 2
+    ? source.schemaVersion
+    : null
+  const validStatuses = new Set<BackupRestoreJournalStatus>([
+    'prepared',
+    'applying',
+    'copying-bookmarks',
+    'rolling-back',
+    'rollback-failed'
+  ])
+  if (
+    source.backupId !== BACKUP_RESTORE_JOURNAL_KEY ||
+    source.kind !== 'restore-journal' ||
+    !schemaVersion ||
+    !validStatuses.has(source.status as BackupRestoreJournalStatus)
+  ) {
+    throw new Error('备份恢复日志损坏，已停止自动恢复。')
+  }
+
+  return {
+    backupId: BACKUP_RESTORE_JOURNAL_KEY,
+    kind: 'restore-journal',
+    schemaVersion,
+    operationId,
+    mode: source.mode,
+    status: source.status as BackupRestoreJournalStatus,
+    startedAt: Number(source.startedAt) || 0,
+    updatedAt: Number(source.updatedAt) || 0,
+    restoreStorageKeys: Array.isArray(source.restoreStorageKeys)
+      ? source.restoreStorageKeys.map((key) => String(key || '').trim()).filter(Boolean)
+      : [],
+    previousStorage: normalizeObject(source.previousStorage),
+    previousTagIndex: source.previousTagIndex
+      ? normalizeBookmarkTagIndex(source.previousTagIndex)
+      : null,
+    expectedTagIndex: schemaVersion === BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION &&
+      source.expectedTagIndex
+      ? normalizeBookmarkTagIndex(source.expectedTagIndex)
+      : null,
+    expectedStorage: schemaVersion === BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION
+      ? normalizeObject(source.expectedStorage)
+      : {},
+    restoreFolderTitle: String(source.restoreFolderTitle || ''),
+    restoreFolderId: String(source.restoreFolderId || ''),
+    tagStateMayHaveChanged: Boolean(source.tagStateMayHaveChanged),
+    storageStateMayHaveChanged: Boolean(source.storageStateMayHaveChanged),
+    lastError: String(source.lastError || ''),
+    rollbackErrors: Array.isArray(source.rollbackErrors)
+      ? source.rollbackErrors.map((error) => String(error || '')).filter(Boolean)
+      : []
+  }
+}
+
+function normalizeBackupRestoreReceipt(value: unknown): BackupRestoreReceipt {
+  const source = normalizeObject(value)
+  const operationId = normalizeBackupRestoreOperationId(source.operationId)
+  assertBackupRestoreMode(source.mode)
+  const schemaVersion = source.schemaVersion === 1 || source.schemaVersion === 2
+    ? source.schemaVersion
+    : null
+  const status = source.status === 'committed' ||
+    source.status === 'rolled-back' ||
+    (
+      source.status === 'preserved' &&
+      schemaVersion === BACKUP_RESTORE_JOURNAL_SCHEMA_VERSION
+    )
+    ? source.status
+    : null
+  if (
+    source.backupId !== getBackupRestoreReceiptKey(operationId) ||
+    source.kind !== 'restore-receipt' ||
+    !schemaVersion ||
+    !status
+  ) {
+    throw new Error('备份恢复回执损坏，已停止重复执行。')
+  }
+
+  return {
+    backupId: getBackupRestoreReceiptKey(operationId),
+    kind: 'restore-receipt',
+    schemaVersion,
+    operationId,
+    mode: source.mode,
+    status,
+    completedAt: Number(source.completedAt) || 0,
+    result: source.result as BackupRestoreResult | undefined,
+    error: typeof source.error === 'string' ? source.error : undefined
+  }
 }
 
 async function updateAutoBackupIndex(

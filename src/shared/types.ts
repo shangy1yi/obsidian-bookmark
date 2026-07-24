@@ -93,6 +93,9 @@ export interface ProbeResult {
   method: string
   label: string
   detail: string
+  finalUrl?: string
+  redirected?: boolean
+  errorCode?: string
 }
 
 export interface NavigationEvidence {
@@ -111,6 +114,7 @@ export interface AvailabilityResult extends BookmarkRecord {
   badgeText: string
   finalUrl: string
   detail: string
+  errorCode?: string
   historyStatus?: 'new' | 'persistent' | ''
   abnormalStreak?: number
 }

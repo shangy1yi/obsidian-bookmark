@@ -1,4 +1,7 @@
 import type {
+  AvailabilityProbeMessage,
+  AvailabilityProbeResult,
+  BackupRestoreMessage,
   BookmarkSaveMessage,
   BookmarkSaveResult,
   InboxUndoLastMoveMessage,
@@ -7,6 +10,15 @@ import type {
   NavigationCheckMessage,
   NavigationCheckResult,
   RuntimeNotificationMessage
+} from '../shared/messages.js'
+import {
+  AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT,
+  AVAILABILITY_NAVIGATION_TIMEOUT_MAX_MS,
+  AVAILABILITY_NAVIGATION_TIMEOUT_MIN_MS,
+  parseAvailabilityProbeMessage,
+  parseBackupRestoreMessage,
+  parseNavigationCancelMessage,
+  parseNavigationCheckMessage
 } from '../shared/messages.js'
 import type { BookmarkRecord, FolderRecord, NavigationNetworkEvidence } from '../shared/types.js'
 import { extractBookmarkData } from '../shared/bookmark-tree.js'
@@ -21,7 +33,11 @@ import {
 } from '../shared/constants.js'
 import { getLocalStorage, removeLocalStorage, setLocalStorage } from '../shared/storage.js'
 import { extractDomain } from '../shared/text.js'
-import { assessSensitiveExternalUrl } from '../shared/sensitive-url.js'
+import {
+  assessSensitiveExternalUrl,
+  isPublicNetworkAddress,
+  isVerifiedHttpsLoopbackProxyResponse
+} from '../shared/sensitive-url.js'
 import {
   normalizeBookmarkTagConfidence,
   normalizeBookmarkTags,
@@ -74,6 +90,12 @@ import {
   removeContentSnapshotForBookmark,
   saveContentSnapshotFromContext
 } from '../shared/content-snapshots.js'
+import {
+  createAutoBackupBeforeDangerousOperation,
+  executeJournaledCuratorBackupRestore,
+  parseCuratorBackupFile,
+  recoverInterruptedCuratorBackupRestore
+} from '../shared/backup.js'
 import { shouldReuseBookmarkForSave } from './save-guards.js'
 
 interface PendingCheckState {
@@ -81,12 +103,19 @@ interface PendingCheckState {
   checkId: string
   requestedUrl: string
   lastUrl: string
+  lastAttemptedUrl: string
   navigationStarted: boolean
   settled: boolean
   timeoutId: number
   networkEvidence: NavigationNetworkEvidence | null
   webRequestListeners: WebRequestListenerSet | null
   resolve: (result: NavigationCheckResult) => void
+}
+
+interface PendingCheckReservation {
+  checkId: string
+  tabId: number | null
+  cancelled: boolean
 }
 
 export interface ServiceWorkerDebugSnapshot {
@@ -203,7 +232,18 @@ interface PopupCommandIntent {
 }
 
 const pendingChecks = new Map<number, PendingCheckState>()
-const pendingCheckIds = new Map<string, number>()
+const pendingCheckReservations = new Map<string, PendingCheckReservation>()
+const pendingAvailabilityProbes = new Map<string, AbortController>()
+const availabilityProbeQueues = new Map<string, Promise<void>>()
+const navigationRuleIdsByTab = new Map<number, number[]>()
+const navigationFirewallRemovalPromises = new Map<number, Promise<void>>()
+const activeNavigationRuleIds = new Set<number>()
+const NAVIGATION_RULE_ID_MIN = 1_500_000_000
+const NAVIGATION_RULE_ID_MAX = 1_500_100_000
+let nextNavigationRuleId = NAVIGATION_RULE_ID_MIN
+const navigationFirewallReady = clearStaleNavigationOriginFirewalls().catch((error) => {
+  console.warn('[Curator] 遗留可用性检测导航规则清理失败', error)
+})
 const autoClassifyInFlight = new Set<string>()
 const suppressedAutoBookmarkUrls = new Map<string, number>()
 let bookmarkAddHistoryWriteQueue = Promise.resolve()
@@ -211,7 +251,6 @@ let autoAnalyzeQueueWriteQueue: Promise<unknown> = Promise.resolve()
 let autoAnalyzeQueueProcessing = false
 let autoAnalyzeQueueTimer = 0
 let aiProviderSettingsGeneration = 0
-const MAX_PENDING_NAVIGATION_CHECKS = 4
 const AUTO_CLASSIFY_SUPPRESS_MS = 10000
 const SUPPRESSED_AUTO_BOOKMARK_URL_LIMIT = 80
 const AUTO_CLASSIFY_DELAY_MS = 900
@@ -219,6 +258,7 @@ const AUTO_CLASSIFY_FOLDER_LIMIT = 260
 const AUTO_ANALYZE_QUEUE_ALARM = 'curator-auto-analyze-queue'
 const AUTO_ANALYZE_STATUS_CLEAR_ALARM = 'curator-auto-analyze-status-clear'
 const COMMAND_FEEDBACK_BADGE_CLEAR_ALARM = 'curator-command-feedback-badge-clear'
+const BACKUP_RESTORE_RECOVERY_ALARM = 'curator-backup-restore-recovery'
 const AUTO_ANALYZE_QUEUE_LIMIT = 50
 const AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS = 3
 const AUTO_ANALYZE_QUEUE_MAX_AGE_MS = 24 * 60 * 60 * 1000
@@ -282,6 +322,8 @@ const AUTO_CLASSIFY_SCHEMA = {
 } as const
 
 type RuntimeMessage =
+  | AvailabilityProbeMessage
+  | BackupRestoreMessage
   | BookmarkSaveMessage
   | InboxUndoLastMoveMessage
   | NavigationCheckMessage
@@ -295,6 +337,13 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 })
 
 chrome.alarms?.onAlarm.addListener((alarm) => {
+  if (alarm.name === BACKUP_RESTORE_RECOVERY_ALARM) {
+    runBackupRestoreRecovery().catch((error) => {
+      console.warn('[Curator] 中断的备份恢复回滚失败', error)
+    })
+    return
+  }
+
   if (alarm.name === AUTO_ANALYZE_QUEUE_ALARM) {
     scheduleAutoAnalyzeQueueProcessing(0)
     return
@@ -343,8 +392,10 @@ restoreAutoAnalyzeStatusBadge().catch((error) => {
   console.warn('[Curator] 自动分析状态徽标恢复失败', error)
 })
 scheduleAutoAnalyzeQueueProcessing(0)
+let backupRestoreRecoveryError: Error | null = null
+const backupRestoreRecoveryReady = runBackupRestoreRecovery().catch(() => {})
 
-chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: RuntimeMessage, sender, sendResponse) => {
   if (message?.type === 'bookmark:save') {
     saveBookmarkFromMessage(message)
       .then((result) => {
@@ -376,9 +427,83 @@ chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResp
   }
 
   if (message?.type === 'availability:cancel') {
-    cancelNavigationCheck(message.checkId)
+    if (!isTrustedAvailabilityMessageSender(sender)) {
+      sendResponse({ ok: false, error: '无权取消可用性导航检查。' })
+      return undefined
+    }
+
+    const parsedMessage = parseNavigationCancelMessage(message)
+    if ('error' in parsedMessage) {
+      sendResponse({ ok: false, error: parsedMessage.error })
+      return undefined
+    }
+
+    cancelNavigationCheck(parsedMessage.value.checkId)
+    cancelAvailabilityProbe(parsedMessage.value.checkId)
     sendResponse({ ok: true })
     return undefined
+  }
+
+  if (message?.type === 'availability:probe') {
+    if (!isTrustedAvailabilityMessageSender(sender)) {
+      sendResponse({ ok: false, error: '无权发起可用性网络探测。' })
+      return undefined
+    }
+
+    const parsedMessage = parseAvailabilityProbeMessage(message)
+    if ('error' in parsedMessage) {
+      sendResponse({ ok: false, error: parsedMessage.error })
+      return undefined
+    }
+
+    performAvailabilityProbe(parsedMessage.value)
+      .then((result) => {
+        sendResponse({ ok: true, result })
+      })
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : '后台网络探测失败。',
+          errorName: error instanceof Error ? error.name : 'Error',
+          errorCode:
+            error && typeof error === 'object' && 'code' in error
+              ? String(error.code || '')
+              : ''
+        })
+      })
+
+    return true
+  }
+
+  if (message?.type === 'backup:restore') {
+    if (!isTrustedAvailabilityMessageSender(sender)) {
+      sendResponse({ ok: false, error: '无权执行备份恢复。' })
+      return undefined
+    }
+
+    const parsedMessage = parseBackupRestoreMessage(message)
+    if ('error' in parsedMessage) {
+      sendResponse({ ok: false, error: parsedMessage.error })
+      return undefined
+    }
+
+    performJournaledBackupRestore(parsedMessage.value)
+      .then((result) => {
+        sendResponse({ ok: true, result })
+      })
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : '后台备份恢复失败。',
+          errorName: error instanceof Error ? error.name : 'Error',
+          errorCode:
+            error && typeof error === 'object' && 'code' in error
+              ? String(error.code || '')
+              : ''
+        })
+      })
+
+    return true
   }
 
   if (message?.type === 'notification:create') {
@@ -400,10 +525,21 @@ chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResp
     return undefined
   }
 
+  if (!isTrustedAvailabilityMessageSender(sender)) {
+    sendResponse({ ok: false, error: '无权发起可用性导航检查。' })
+    return undefined
+  }
+
+  const parsedMessage = parseNavigationCheckMessage(message)
+  if ('error' in parsedMessage) {
+    sendResponse({ ok: false, error: parsedMessage.error })
+    return undefined
+  }
+
   performNavigationCheck({
-    url: message.url,
-    timeoutMs: message.timeoutMs,
-    checkId: message.checkId
+    url: parsedMessage.value.url,
+    timeoutMs: parsedMessage.value.timeoutMs,
+    checkId: parsedMessage.value.checkId
   })
     .then((result) => {
       sendResponse({ ok: true, result })
@@ -417,6 +553,105 @@ chrome.runtime.onMessage.addListener((message: RuntimeMessage, _sender, sendResp
 
   return true
 })
+
+async function performJournaledBackupRestore(
+  message: BackupRestoreMessage
+) {
+  await backupRestoreRecoveryReady
+  if (backupRestoreRecoveryError) {
+    await runBackupRestoreRecovery()
+  }
+
+  const backup = parseCuratorBackupFile(message.backup)
+  scheduleBackupRestoreRecoveryAlarm()
+  try {
+    return await executeJournaledCuratorBackupRestore(
+      backup,
+      message.mode,
+      {
+        operationId: message.operationId,
+        withMutationLock: withAvailabilityRestoreMutationLock,
+        beforeApply: async () => {
+          await createAutoBackupBeforeDangerousOperation({
+            kind: 'restore',
+            source: 'service-worker',
+            reason: `恢复备份：${formatBackupRestoreMode(message.mode)}`
+          })
+        }
+      }
+    )
+  } finally {
+    await runBackupRestoreRecovery().catch(() => {})
+  }
+}
+
+async function runBackupRestoreRecovery(): Promise<void> {
+  try {
+    const recovery = await recoverInterruptedCuratorBackupRestore({
+      withMutationLock: withAvailabilityRestoreMutationLock
+    })
+    if (recovery && !recovery.recovered) {
+      throw new Error(
+        `中断的备份恢复仍未完全回滚：${recovery.errors.join('；') || '未知错误'}。`
+      )
+    }
+    backupRestoreRecoveryError = null
+    await clearBackupRestoreRecoveryAlarm()
+  } catch (error) {
+    backupRestoreRecoveryError = error instanceof Error
+      ? error
+      : new Error('中断的备份恢复回滚失败。')
+    scheduleBackupRestoreRecoveryAlarm()
+    throw backupRestoreRecoveryError
+  }
+}
+
+function withAvailabilityRestoreMutationLock<T>(
+  task: () => Promise<T>
+): Promise<T> {
+  const lockManager = globalThis.navigator?.locks
+  if (!lockManager) {
+    throw new Error('当前浏览器无法锁定可用性数据，已取消恢复。')
+  }
+
+  return lockManager.request(
+    'curator:availability-run',
+    {
+      ifAvailable: true,
+      mode: 'exclusive'
+    },
+    async (lock) => {
+      if (!lock) {
+        const error = new Error('可用性数据正在被其他页面使用，已取消恢复。')
+        Object.assign(error, { code: 'availability-busy' })
+        throw error
+      }
+      return task()
+    }
+  )
+}
+
+function scheduleBackupRestoreRecoveryAlarm(): void {
+  chrome.alarms.create(BACKUP_RESTORE_RECOVERY_ALARM, {
+    delayInMinutes: 1
+  })
+}
+
+function clearBackupRestoreRecoveryAlarm(): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.alarms.clear(BACKUP_RESTORE_RECOVERY_ALARM, () => resolve())
+  })
+}
+
+function formatBackupRestoreMode(mode: BackupRestoreMessage['mode']): string {
+  if (mode === 'tagsOnly') {
+    return '只恢复标签数据'
+  }
+  if (mode === 'newTabOnly') {
+    return '只恢复新标签页设置'
+  }
+  return '恢复全部可安全恢复的数据'
+}
 
 async function handleCommand(command: string): Promise<void> {
   if (command === COMMAND_OPEN_SEARCH) {
@@ -733,6 +968,14 @@ chrome.webNavigation.onCommitted.addListener((details) => {
     return
   }
 
+  state.lastAttemptedUrl = details.url
+  if (finalizeSensitiveNavigationTarget(state, details.url)) {
+    return
+  }
+  if (finalizeUnauthorizedNavigationTarget(state, details.url)) {
+    return
+  }
+
   state.navigationStarted = true
   state.lastUrl = details.url
 })
@@ -743,7 +986,15 @@ chrome.webNavigation.onCompleted.addListener((details) => {
     return
   }
 
-  if (!state.navigationStarted && isAboutBlank(details.url)) {
+  if (isAboutBlank(details.url)) {
+    return
+  }
+
+  state.lastAttemptedUrl = details.url
+  if (finalizeSensitiveNavigationTarget(state, details.url)) {
+    return
+  }
+  if (finalizeUnauthorizedNavigationTarget(state, details.url)) {
     return
   }
 
@@ -761,7 +1012,15 @@ chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
     return
   }
 
-  if (!state.navigationStarted && isAboutBlank(details.url)) {
+  if (isAboutBlank(details.url)) {
+    return
+  }
+
+  state.lastAttemptedUrl = details.url
+  if (finalizeSensitiveNavigationTarget(state, details.url)) {
+    return
+  }
+  if (finalizeUnauthorizedNavigationTarget(state, details.url)) {
     return
   }
 
@@ -779,21 +1038,36 @@ chrome.webNavigation.onErrorOccurred.addListener((details) => {
     return
   }
 
-  if (!state.navigationStarted && isAboutBlank(details.url)) {
+  if (isAboutBlank(details.url)) {
+    return
+  }
+
+  const failedUrl = getLatestAttemptedNavigationUrl(state, details.url)
+  if (finalizeSensitiveNavigationTarget(state, failedUrl)) {
+    return
+  }
+  if (finalizeUnauthorizedNavigationTarget(state, failedUrl)) {
     return
   }
 
   finalizeNavigationCheck(details.tabId, {
     status: 'failed',
-    finalUrl: state.lastUrl || details.url || state.requestedUrl,
+    finalUrl: failedUrl,
     detail: `后台导航失败：${details.error}`,
     errorCode: details.error
   })
 })
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const reservation of pendingCheckReservations.values()) {
+    if (reservation.tabId === tabId) {
+      reservation.cancelled = true
+    }
+  }
+
   const state = pendingChecks.get(tabId)
   if (!state) {
+    void removeNavigationOriginFirewall(tabId).catch(() => {})
     return
   }
 
@@ -2891,6 +3165,595 @@ function normalizeText(value: string): string {
     .trim()
 }
 
+async function performAvailabilityProbe({
+  url,
+  method,
+  timeoutMs,
+  deadlineAtMs,
+  checkId
+}: AvailabilityProbeMessage & { checkId: string }): Promise<AvailabilityProbeResult> {
+  if (pendingAvailabilityProbes.has(checkId)) {
+    throw new Error('相同检查 ID 的网络探测已在进行中。')
+  }
+  if (pendingAvailabilityProbes.size >= AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT) {
+    throw new Error('后台网络探测正忙，请稍后重试。')
+  }
+
+  const abortController = new AbortController()
+  pendingAvailabilityProbes.set(checkId, abortController)
+  const receivedAt = Date.now()
+  const normalizedTimeout = normalizeTimeout(timeoutMs)
+  const requestedDeadline = Number(deadlineAtMs)
+  const effectiveDeadlineAtMs = Number.isSafeInteger(requestedDeadline)
+    ? Math.min(requestedDeadline, receivedAt + normalizedTimeout)
+    : receivedAt + normalizedTimeout
+
+  try {
+    return await performAvailabilityProbeRedirectChain({
+      url,
+      method,
+      deadlineAtMs: effectiveDeadlineAtMs,
+      signal: abortController.signal
+    })
+  } finally {
+    if (pendingAvailabilityProbes.get(checkId) === abortController) {
+      pendingAvailabilityProbes.delete(checkId)
+    }
+  }
+}
+
+function cancelAvailabilityProbe(checkId: string): void {
+  pendingAvailabilityProbes.get(String(checkId || ''))?.abort()
+}
+
+async function serializeAvailabilityProbeHop<T>(
+  url: string,
+  signal: AbortSignal,
+  deadlineAtMs: number,
+  task: () => Promise<T>
+): Promise<T> {
+  const normalizedUrl = normalizeNavigationUrl(url)
+  let key = normalizedUrl || String(url || '').trim()
+  try {
+    key = new URL(normalizedUrl).origin
+  } catch {
+  }
+  const previous = availabilityProbeQueues.get(key) || Promise.resolve()
+  const taskPromise = previous.catch(() => {}).then(() => {
+    throwIfAvailabilityProbeUnavailable(signal, deadlineAtMs)
+    return task()
+  })
+  const tail = taskPromise.then(() => undefined, () => undefined)
+  availabilityProbeQueues.set(key, tail)
+  void tail.then(() => {
+    if (availabilityProbeQueues.get(key) === tail) {
+      availabilityProbeQueues.delete(key)
+    }
+  })
+
+  return runWithAvailabilityProbeDeadline(taskPromise, signal, deadlineAtMs)
+}
+
+async function performAvailabilityProbeRedirectChain({
+  url,
+  method,
+  deadlineAtMs,
+  signal
+}: {
+  url: string
+  method: 'HEAD' | 'GET'
+  deadlineAtMs: number
+  signal: AbortSignal
+}): Promise<AvailabilityProbeResult> {
+  const requestedUrl = normalizeNavigationUrl(url)
+  let currentUrl = requestedUrl
+
+  for (let redirectCount = 0; redirectCount <= 8; redirectCount += 1) {
+    throwIfAvailabilityProbeUnavailable(signal, deadlineAtMs)
+
+    const urlDecision = assessSensitiveExternalUrl(currentUrl)
+    if (urlDecision.sensitive) {
+      return {
+        ok: false,
+        status: 0,
+        finalUrl: currentUrl || requestedUrl,
+        redirected: currentUrl !== requestedUrl,
+        detail: urlDecision.warning || '重定向目标属于受保护地址，已停止网络探测。',
+        errorCode: currentUrl === requestedUrl ? 'sensitive-url' : 'sensitive-redirect'
+      }
+    }
+
+    const originPattern = getOriginPermissionPattern(currentUrl)
+    const hasPermission = originPattern
+      ? await runWithAvailabilityProbeDeadline(
+          containsHostPermission(originPattern),
+          signal,
+          deadlineAtMs
+        )
+      : false
+    if (!originPattern || !hasPermission) {
+      return {
+        ok: false,
+        status: 0,
+        finalUrl: currentUrl || requestedUrl,
+        redirected: currentUrl !== requestedUrl,
+        detail: currentUrl === requestedUrl
+          ? '未授予目标网站访问权限，已取消网络探测。'
+          : '重定向目标尚未授权，未向该地址发出请求。',
+        errorCode: currentUrl === requestedUrl
+          ? 'permission-missing'
+          : 'ungranted-redirect'
+      }
+    }
+
+    throwIfAvailabilityProbeUnavailable(signal, deadlineAtMs)
+    const captured = await serializeAvailabilityProbeHop(
+      currentUrl,
+      signal,
+      deadlineAtMs,
+      () => fetchAvailabilityProbeHop(
+        currentUrl,
+        method,
+        deadlineAtMs,
+        signal
+      )
+    )
+    if (!captured.redirectUrl) {
+      return {
+        ok: captured.ok,
+        status: captured.status,
+        finalUrl: currentUrl,
+        redirected: currentUrl !== requestedUrl,
+        detail: captured.status
+          ? `网络探测(${method})返回 HTTP ${captured.status}。${captured.viaVerifiedLoopbackProxy ? ' 已通过 HTTPS 响应确认本机代理传输。' : ''}`
+          : `网络探测(${method})未返回可读取的 HTTP 状态。`,
+        errorCode: captured.status ? '' : 'opaque-response'
+      }
+    }
+
+    if (redirectCount === 8) {
+      return {
+        ok: false,
+        status: captured.status,
+        finalUrl: captured.redirectUrl,
+        redirected: true,
+        detail: '重定向次数过多，已停止网络探测。',
+        errorCode: 'too-many-redirects'
+      }
+    }
+
+    currentUrl = normalizeNavigationUrl(captured.redirectUrl)
+    if (!currentUrl) {
+      return {
+        ok: false,
+        status: captured.status,
+        finalUrl: captured.redirectUrl,
+        redirected: true,
+        detail: '重定向目标不是可安全探测的 HTTP/HTTPS 地址，已停止。',
+        errorCode: 'sensitive-redirect'
+      }
+    }
+  }
+
+  throw new Error('网络探测重定向状态异常。')
+}
+
+function getAvailabilityProbeRemainingMs(deadlineAtMs: number): number {
+  return Math.max(0, Math.ceil(deadlineAtMs - Date.now()))
+}
+
+function throwIfAvailabilityProbeUnavailable(
+  signal: AbortSignal,
+  deadlineAtMs: number
+): void {
+  if (signal.aborted) {
+    throw new DOMException('网络探测已取消。', 'AbortError')
+  }
+  if (getAvailabilityProbeRemainingMs(deadlineAtMs) <= 0) {
+    throw new DOMException('网络探测超时。', 'AbortError')
+  }
+}
+
+async function runWithAvailabilityProbeDeadline<T>(
+  task: Promise<T>,
+  signal: AbortSignal,
+  deadlineAtMs: number
+): Promise<T> {
+  throwIfAvailabilityProbeUnavailable(signal, deadlineAtMs)
+  const remainingMs = getAvailabilityProbeRemainingMs(deadlineAtMs)
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    let timeoutId = 0
+    const cleanup = () => {
+      clearTimeout(timeoutId)
+      signal.removeEventListener('abort', rejectForCancellation)
+    }
+    const resolveOnce = (value: T) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+    const rejectOnce = (error: unknown) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      reject(error)
+    }
+    const rejectForCancellation = () => {
+      rejectOnce(new DOMException('网络探测已取消。', 'AbortError'))
+    }
+
+    timeoutId = self.setTimeout(() => {
+      rejectOnce(new DOMException('网络探测超时。', 'AbortError'))
+    }, remainingMs)
+    signal.addEventListener('abort', rejectForCancellation, { once: true })
+    void task.then(resolveOnce, rejectOnce)
+  })
+}
+
+async function fetchAvailabilityProbeHop(
+  url: string,
+  method: 'HEAD' | 'GET',
+  deadlineAtMs: number,
+  runSignal: AbortSignal
+): Promise<{
+  ok: boolean
+  status: number
+  redirectUrl: string
+  viaVerifiedLoopbackProxy: boolean
+}> {
+  const originPattern = getOriginPermissionPattern(url)
+  if (!originPattern) {
+    throw new Error('网络探测 URL 无效。')
+  }
+
+  const resolvedDnsAddress = await assertAvailabilityProbeDnsAddressIsPublic(
+    url,
+    runSignal,
+    deadlineAtMs
+  )
+
+  const expectedUrl = normalizeNavigationUrl(url)
+  const extensionOrigin = new URL(chrome.runtime.getURL('/')).origin
+  const probeHeaderName = 'X-Request-ID'
+  const probeMarker = crypto.randomUUID()
+  let requestId = ''
+  let redirectUrl = ''
+  let redirectStatus = 0
+  let remoteAddress = ''
+  let observedResponseStatus = 0
+  let viaVerifiedLoopbackProxy = false
+  let networkBoundaryError: Error | null = null
+  let resolveRedirectEvidence: () => void = () => {}
+  const redirectEvidence = new Promise<void>((resolve) => {
+    resolveRedirectEvidence = resolve
+  })
+  let resolveEndpointEvidence: () => void = () => {}
+  const endpointEvidence = new Promise<void>((resolve) => {
+    resolveEndpointEvidence = resolve
+  })
+  const matchesOwnRequest = (details: {
+    initiator?: string
+    requestId: string
+    tabId: number
+    url: string
+  }) => {
+    if (
+      details.tabId !== -1 ||
+      normalizeNavigationUrl(details.url) !== expectedUrl
+    ) {
+      return false
+    }
+
+    if (!details.initiator) {
+      return true
+    }
+
+    try {
+      return new URL(details.initiator).origin === extensionOrigin
+    } catch {
+      return false
+    }
+  }
+  const beforeSendHeaders = (
+    details: chrome.webRequest.OnBeforeSendHeadersDetails
+  ) => {
+    if (requestId || !matchesOwnRequest(details)) {
+      return {}
+    }
+    const markerHeader = details.requestHeaders?.find((header) => {
+      return String(header.name || '').toLowerCase() === probeHeaderName.toLowerCase()
+    })
+    if (String(markerHeader?.value || '') === probeMarker) {
+      requestId = details.requestId
+    }
+    return {}
+  }
+  const captureRemoteAddress = (details: {
+    initiator?: string
+    ip?: string
+    requestId: string
+    statusCode?: number
+    tabId: number
+    url: string
+  }) => {
+    if (!requestId || details.requestId !== requestId) {
+      return
+    }
+
+    requestId = details.requestId
+    const capturedStatusCode = Number(details.statusCode) || 0
+    if (capturedStatusCode) {
+      observedResponseStatus = capturedStatusCode
+    }
+    const capturedAddress = String(details.ip || '').trim()
+    if (!capturedAddress) {
+      return
+    }
+    remoteAddress = capturedAddress
+    viaVerifiedLoopbackProxy = isVerifiedHttpsLoopbackProxyResponse({
+      url,
+      resolvedAddress: resolvedDnsAddress,
+      connectedAddress: capturedAddress,
+      statusCode: observedResponseStatus
+    })
+    resolveEndpointEvidence()
+    if (
+      !isPublicNetworkAddress(capturedAddress) &&
+      !viaVerifiedLoopbackProxy &&
+      !networkBoundaryError
+    ) {
+      networkBoundaryError = createAvailabilityNetworkBoundaryError(
+        '实际网络连接落到本机、内网或非公网端点，已中止探测。',
+        'private-network-endpoint'
+      )
+      controller.abort()
+    }
+  }
+  const beforeRedirect = (details: chrome.webRequest.OnBeforeRedirectDetails) => {
+    captureRemoteAddress(details)
+    if (requestId && details.requestId === requestId) {
+      requestId = details.requestId
+      redirectUrl = String(details.redirectUrl || '').trim()
+      redirectStatus = Number(details.statusCode) || 0
+      resolveRedirectEvidence()
+    }
+  }
+  const responseStarted = (details: chrome.webRequest.OnResponseStartedDetails) => {
+    captureRemoteAddress(details)
+  }
+  const completed = (details: chrome.webRequest.OnCompletedDetails) => {
+    captureRemoteAddress(details)
+  }
+  const requestErrored = (details: chrome.webRequest.OnErrorOccurredDetails) => {
+    captureRemoteAddress(details)
+  }
+  const filter: chrome.webRequest.RequestFilter = {
+    urls: [originPattern],
+    types: ['xmlhttprequest', 'other']
+  }
+  const controller = new AbortController()
+  const abortHop = () => controller.abort()
+  if (runSignal.aborted) {
+    controller.abort()
+  } else {
+    runSignal.addEventListener('abort', abortHop, { once: true })
+  }
+  const timeoutMs = getAvailabilityProbeRemainingMs(deadlineAtMs)
+  throwIfAvailabilityProbeUnavailable(runSignal, deadlineAtMs)
+  const timeoutId = self.setTimeout(() => {
+    controller.abort()
+  }, Math.max(1, timeoutMs))
+
+  chrome.webRequest.onBeforeSendHeaders.addListener(
+    beforeSendHeaders,
+    filter,
+    ['requestHeaders', 'extraHeaders']
+  )
+  chrome.webRequest.onBeforeRedirect.addListener(beforeRedirect, filter)
+  chrome.webRequest.onResponseStarted.addListener(responseStarted, filter)
+  chrome.webRequest.onCompleted.addListener(completed, filter)
+  chrome.webRequest.onErrorOccurred.addListener(requestErrored, filter)
+
+  try {
+    const request = new Request(url, {
+      method,
+      cache: 'no-store',
+      credentials: 'omit',
+      headers: {
+        [probeHeaderName]: probeMarker
+      },
+      redirect: 'manual',
+      referrerPolicy: 'no-referrer',
+      signal: controller.signal
+    })
+    let response: Response
+    try {
+      response = await fetch(request)
+    } catch (error) {
+      if (networkBoundaryError) {
+        throw networkBoundaryError
+      }
+      throw error
+    }
+    if (!response.status && !redirectUrl) {
+      await waitForRedirectEvidence(
+        redirectEvidence,
+        controller.signal,
+        Math.min(750, Math.max(100, Math.round(timeoutMs / 20)))
+      )
+    }
+    if (!remoteAddress && !controller.signal.aborted) {
+      await waitForRedirectEvidence(
+        endpointEvidence,
+        controller.signal,
+        Math.min(750, Math.max(100, Math.round(timeoutMs / 20)))
+      )
+    }
+    if (controller.signal.aborted) {
+      if (networkBoundaryError) {
+        throw networkBoundaryError
+      }
+      throw new DOMException(
+        runSignal.aborted ? '网络探测已取消。' : '网络探测超时。',
+        'AbortError'
+      )
+    }
+    if (!remoteAddress) {
+      controller.abort()
+      throw createAvailabilityNetworkBoundaryError(
+        '浏览器未提供实际连接地址，无法确认公网边界，已中止探测。',
+        'unverified-network-endpoint'
+      )
+    }
+    if (!isPublicNetworkAddress(remoteAddress) && !viaVerifiedLoopbackProxy) {
+      controller.abort()
+      throw networkBoundaryError || createAvailabilityNetworkBoundaryError(
+        '实际网络连接落到本机、内网或非公网端点，已中止探测。',
+        'private-network-endpoint'
+      )
+    }
+    const result = {
+      ok: response.ok,
+      status: redirectStatus || Number(response.status) || 0,
+      redirectUrl,
+      viaVerifiedLoopbackProxy
+    }
+    try {
+      const cancelResult = response.body?.cancel()
+      if (cancelResult) {
+        await runWithAvailabilityProbeDeadline(
+          cancelResult,
+          controller.signal,
+          deadlineAtMs
+        )
+      }
+    } catch {
+    }
+    if (runSignal.aborted || controller.signal.aborted) {
+      throw new DOMException(
+        runSignal.aborted ? '网络探测已取消。' : '网络探测超时。',
+        'AbortError'
+      )
+    }
+    throwIfAvailabilityProbeUnavailable(runSignal, deadlineAtMs)
+    return result
+  } finally {
+    clearTimeout(timeoutId)
+    runSignal.removeEventListener('abort', abortHop)
+    chrome.webRequest.onBeforeSendHeaders.removeListener(beforeSendHeaders)
+    chrome.webRequest.onBeforeRedirect.removeListener(beforeRedirect)
+    chrome.webRequest.onResponseStarted.removeListener(responseStarted)
+    chrome.webRequest.onCompleted.removeListener(completed)
+    chrome.webRequest.onErrorOccurred.removeListener(requestErrored)
+  }
+}
+
+interface ChromeDnsResolveResult {
+  address?: string
+  resultCode: number
+}
+
+interface ChromeDnsApi {
+  resolve(hostname: string): Promise<ChromeDnsResolveResult>
+}
+
+async function assertAvailabilityProbeDnsAddressIsPublic(
+  url: string,
+  signal: AbortSignal,
+  deadlineAtMs: number
+): Promise<string> {
+  const dnsApi = (chrome as typeof chrome & { dns?: ChromeDnsApi }).dns
+  if (!dnsApi?.resolve) {
+    throw createAvailabilityNetworkBoundaryError(
+      '当前浏览器无法在请求前验证目标 DNS 地址，已取消网络探测。',
+      'unsupported-dns-boundary'
+    )
+  }
+
+  let hostname = ''
+  try {
+    hostname = new URL(url).hostname.replace(/^\[|\]$/g, '')
+  } catch {
+  }
+  if (!hostname) {
+    throw createAvailabilityNetworkBoundaryError(
+      '目标主机名无效，无法验证公网边界。',
+      'unverified-network-endpoint'
+    )
+  }
+
+  let result: ChromeDnsResolveResult
+  try {
+    result = await runWithAvailabilityProbeDeadline(
+      dnsApi.resolve(hostname),
+      signal,
+      deadlineAtMs
+    )
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw error
+    }
+    throw createAvailabilityNetworkBoundaryError(
+      '目标 DNS 解析失败，无法确认公网边界。',
+      'unverified-network-endpoint'
+    )
+  }
+
+  const address = String(result?.address || '').trim()
+  if (Number(result?.resultCode) !== 0 || !address) {
+    throw createAvailabilityNetworkBoundaryError(
+      '目标 DNS 未返回可验证的公网地址，已取消网络探测。',
+      'unverified-network-endpoint'
+    )
+  }
+  if (!isPublicNetworkAddress(address)) {
+    throw createAvailabilityNetworkBoundaryError(
+      '目标 DNS 解析到本机、内网或非公网地址，未向该端点发出请求。',
+      'private-network-endpoint'
+    )
+  }
+  return address
+}
+
+function createAvailabilityNetworkBoundaryError(message: string, code: string): Error {
+  return Object.assign(new Error(message), { code })
+}
+
+async function waitForRedirectEvidence(
+  redirectEvidence: Promise<void>,
+  signal: AbortSignal,
+  waitMs: number
+): Promise<void> {
+  await new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+
+    let settled = false
+    let timeoutId = 0
+    const settle = () => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timeoutId)
+      signal.removeEventListener('abort', settle)
+      resolve()
+    }
+    timeoutId = self.setTimeout(settle, waitMs)
+    signal.addEventListener('abort', settle, { once: true })
+    void redirectEvidence.then(settle)
+  })
+}
+
 async function performNavigationCheck({
   url,
   timeoutMs,
@@ -2898,79 +3761,135 @@ async function performNavigationCheck({
 }: {
   url: string
   timeoutMs?: number
-  checkId?: string
+  checkId: string
 }): Promise<NavigationCheckResult> {
   const urlDecision = assessSensitiveExternalUrl(url)
   if (urlDecision.sensitive) {
     throw new Error(urlDecision.warning || '该链接已按敏感 URL 保护跳过检测。')
   }
 
-  if (pendingChecks.size >= MAX_PENDING_NAVIGATION_CHECKS) {
-    throw new Error('后台导航检测正忙，请稍后重试。')
-  }
-
+  const reservation = reserveNavigationCheck(checkId)
   const effectiveTimeout = normalizeTimeout(timeoutMs)
-  const tab = await createTab({
-    url: 'about:blank',
-    active: false
-  })
+  const originPattern = getOriginPermissionPattern(url)
+  let createdTabId: number | null = null
+  let registered = false
 
-  if (!tab?.id) {
-    throw new Error('后台检测标签页创建失败。')
-  }
-
-  return new Promise<NavigationCheckResult>((resolve) => {
-    const state: PendingCheckState = {
-      tabId: tab.id!,
-      checkId: String(checkId || ''),
-      requestedUrl: url,
-      lastUrl: url,
-      navigationStarted: false,
-      settled: false,
-      timeoutId: 0,
-      networkEvidence: null,
-      webRequestListeners: null,
-      resolve
+  try {
+    if (!originPattern || !(await containsHostPermission(originPattern))) {
+      throw new Error('未授予目标网站访问权限，已取消后台导航检测。')
     }
 
-    pendingChecks.set(tab.id!, state)
-    if (state.checkId) {
-      pendingCheckIds.set(state.checkId, tab.id!)
+    if (reservation.cancelled) {
+      return buildCancelledNavigationResult(url)
     }
 
-    state.timeoutId = self.setTimeout(() => {
-      finalizeNavigationCheck(tab.id!, {
-        status: 'failed',
-        finalUrl: state.lastUrl || state.requestedUrl,
-        detail: `后台导航超时，超过 ${Math.round(effectiveTimeout / 1000)} 秒仍未完成页面加载。`,
-        errorCode: 'timeout'
-      })
-    }, effectiveTimeout)
+    const allowedUrlRegex = getExactNavigationUrlRegex(url)
+    if (
+      !allowedUrlRegex ||
+      !(await isNavigationUrlRegexSupported(allowedUrlRegex))
+    ) {
+      return buildUnsupportedNavigationUrlResult(url)
+    }
 
-    startNavigationWithNetworkObserver(state, url).catch((error) => {
-      finalizeNavigationCheck(tab.id!, {
-        status: 'failed',
-        finalUrl: url,
-        detail: error instanceof Error ? error.message : '后台导航启动失败。',
-        errorCode: 'tab-update-failed'
+    if (reservation.cancelled) {
+      return buildCancelledNavigationResult(url)
+    }
+
+    const tab = await createTab({
+      url: 'about:blank',
+      active: false
+    })
+    if (!Number.isInteger(tab?.id)) {
+      throw new Error('后台检测标签页创建失败。')
+    }
+
+    createdTabId = tab.id!
+    reservation.tabId = createdTabId
+    if (reservation.cancelled) {
+      return buildCancelledNavigationResult(url)
+    }
+    await installNavigationOriginFirewall(createdTabId, allowedUrlRegex)
+    if (reservation.cancelled || !(await isTabAvailable(createdTabId))) {
+      reservation.cancelled = true
+      return buildCancelledNavigationResult(url)
+    }
+
+    return await new Promise<NavigationCheckResult>((resolve) => {
+      const state: PendingCheckState = {
+        tabId: createdTabId!,
+        checkId,
+        requestedUrl: url,
+        lastUrl: url,
+        lastAttemptedUrl: '',
+        navigationStarted: false,
+        settled: false,
+        timeoutId: 0,
+        networkEvidence: null,
+        webRequestListeners: null,
+        resolve
+      }
+
+      pendingChecks.set(createdTabId!, state)
+      registered = true
+
+      state.timeoutId = self.setTimeout(() => {
+        finalizeNavigationCheck(createdTabId!, {
+          status: 'failed',
+          finalUrl: state.lastUrl || state.requestedUrl,
+          detail: `后台导航超时，超过 ${Math.round(effectiveTimeout / 1000)} 秒仍未完成页面加载。`,
+          errorCode: 'timeout'
+        })
+      }, effectiveTimeout)
+
+      startNavigationWithNetworkObserver(state, url).catch((error) => {
+        finalizeNavigationCheck(createdTabId!, {
+          status: 'failed',
+          finalUrl: url,
+          detail: error instanceof Error ? error.message : '后台导航启动失败。',
+          errorCode: 'tab-update-failed'
+        })
       })
     })
-  })
+  } catch (error) {
+    if (reservation.cancelled) {
+      return buildCancelledNavigationResult(url)
+    }
+    throw error
+  } finally {
+    if (!registered) {
+      if (createdTabId !== null) {
+        await closeTab(createdTabId).catch(() => {})
+        await removeNavigationOriginFirewall(createdTabId).catch(() => {})
+      }
+      releaseNavigationCheckReservation(checkId, reservation)
+    }
+  }
 }
 
 async function startNavigationWithNetworkObserver(state: PendingCheckState, url: string): Promise<void> {
   if (state.settled) {
     return
   }
-  await attachWebRequestListeners(state)
 
+  const originPattern = getOriginPermissionPattern(url)
+  if (!originPattern) {
+    throw new Error('目标网站访问权限已失效，后台导航检测未启动。')
+  }
+
+  const permissionGranted = await attachWebRequestListeners(state)
+  if (state.settled) {
+    return
+  }
+  if (!permissionGranted) {
+    throw new Error('目标网站访问权限已失效，后台导航检测未启动。')
+  }
   await updateTab(state.tabId, { url })
 }
 
-async function attachWebRequestListeners(state: PendingCheckState): Promise<void> {
+async function attachWebRequestListeners(state: PendingCheckState): Promise<boolean> {
   const originPattern = getOriginPermissionPattern(state.requestedUrl)
   if (!originPattern || !(await containsHostPermission(originPattern)) || state.settled) {
-    return
+    return false
   }
 
   const filter: chrome.webRequest.RequestFilter = {
@@ -2989,7 +3908,9 @@ async function attachWebRequestListeners(state: PendingCheckState): Promise<void
     state.webRequestListeners = listeners
   } catch {
     removeWebRequestListeners(listeners)
+    return false
   }
+  return true
 }
 
 function createWebRequestListeners(state: PendingCheckState): WebRequestListenerSet {
@@ -2999,11 +3920,24 @@ function createWebRequestListeners(state: PendingCheckState): WebRequestListener
         return
       }
 
+      state.lastAttemptedUrl = details.url
       getOrCreateNetworkEvidence(state, details)
+      if (
+        finalizeSensitiveNavigationTarget(state, details.url) ||
+        finalizeUnauthorizedNavigationTarget(state, details.url)
+      ) {
+        return
+      }
+
       return undefined
     },
     beforeRedirect(details) {
       if (state.settled) {
+        return
+      }
+
+      state.lastAttemptedUrl = details.url
+      if (finalizeSensitiveNavigationTarget(state, details.url)) {
         return
       }
 
@@ -3021,9 +3955,22 @@ function createWebRequestListeners(state: PendingCheckState): WebRequestListener
       evidence.finalUrl = details.redirectUrl || evidence.finalUrl
       evidence.finalResponseObserved = false
       evidence.fromCache = Boolean(details.fromCache)
+      state.lastAttemptedUrl = details.redirectUrl || details.url
+
+      if (
+        finalizeSensitiveNavigationTarget(state, details.redirectUrl) ||
+        finalizeUnauthorizedNavigationTarget(state, details.redirectUrl)
+      ) {
+        return
+      }
     },
     headersReceived(details) {
       if (state.settled) {
+        return
+      }
+
+      state.lastAttemptedUrl = details.url
+      if (finalizeSensitiveNavigationTarget(state, details.url)) {
         return
       }
 
@@ -3047,6 +3994,11 @@ function createWebRequestListeners(state: PendingCheckState): WebRequestListener
         return
       }
 
+      state.lastAttemptedUrl = details.url
+      if (finalizeSensitiveNavigationTarget(state, details.url)) {
+        return
+      }
+
       const evidence = getOrCreateNetworkEvidence(state, details)
       evidence.statusCode = Number(details.statusCode) || evidence.statusCode
       evidence.statusUrl = details.url || evidence.statusUrl
@@ -3061,12 +4013,19 @@ function createWebRequestListeners(state: PendingCheckState): WebRequestListener
         return
       }
 
+      state.lastAttemptedUrl = details.url
       const evidence = getOrCreateNetworkEvidence(state, details)
       evidence.errorCode = details.error || evidence.errorCode
       evidence.statusUrl = details.url || evidence.statusUrl
       evidence.finalUrl = details.url || evidence.finalUrl
       evidence.timing.failedMs = details.timeStamp
       evidence.timing.totalMs = getElapsedMs(evidence.timing.requestStartMs, evidence.timing.failedMs)
+      if (
+        finalizeSensitiveNavigationTarget(state, details.url) ||
+        finalizeUnauthorizedNavigationTarget(state, details.url)
+      ) {
+        return
+      }
     }
   }
 }
@@ -3110,19 +4069,302 @@ function getOriginPermissionPattern(url: string): string {
   }
 }
 
-function cancelNavigationCheck(checkId: string): void {
-  const tabId = pendingCheckIds.get(String(checkId || ''))
-  if (!tabId) {
+async function installNavigationOriginFirewall(
+  tabId: number,
+  allowedUrlRegex: string
+): Promise<number[]> {
+  await navigationFirewallReady
+
+  const ruleIds = allocateNavigationRuleIds(2)
+  const [allowRuleId, blockRuleId] = ruleIds
+  const mainFrame = chrome.declarativeNetRequest.ResourceType.MAIN_FRAME
+
+  try {
+    await updateNavigationSessionRules({
+      addRules: [
+        {
+          id: allowRuleId,
+          priority: 2,
+          action: {
+            type: chrome.declarativeNetRequest.RuleActionType.ALLOW
+          },
+          condition: {
+            tabIds: [tabId],
+            resourceTypes: [mainFrame],
+            regexFilter: allowedUrlRegex,
+            isUrlFilterCaseSensitive: true
+          }
+        },
+        {
+          id: blockRuleId,
+          priority: 1,
+          action: {
+            type: chrome.declarativeNetRequest.RuleActionType.BLOCK
+          },
+          condition: {
+            tabIds: [tabId],
+            resourceTypes: [mainFrame],
+            regexFilter: '^https?://',
+            isUrlFilterCaseSensitive: false
+          }
+        }
+      ],
+      removeRuleIds: []
+    })
+    navigationRuleIdsByTab.set(tabId, ruleIds)
+    return ruleIds
+  } catch (error) {
+    releaseNavigationRuleIds(ruleIds)
+    throw error
+  }
+}
+
+function removeNavigationOriginFirewall(tabId: number): Promise<void> {
+  const existingRemoval = navigationFirewallRemovalPromises.get(tabId)
+  if (existingRemoval) {
+    return existingRemoval
+  }
+
+  const ruleIds = navigationRuleIdsByTab.get(tabId)
+  if (!ruleIds?.length) {
+    return Promise.resolve()
+  }
+
+  const removalPromise = updateNavigationSessionRules({
+    addRules: [],
+    removeRuleIds: ruleIds
+  })
+    .then(() => {
+      if (navigationRuleIdsByTab.get(tabId) === ruleIds) {
+        navigationRuleIdsByTab.delete(tabId)
+      }
+      releaseNavigationRuleIds(ruleIds)
+    })
+    .finally(() => {
+      navigationFirewallRemovalPromises.delete(tabId)
+    })
+
+  navigationFirewallRemovalPromises.set(tabId, removalPromise)
+  return removalPromise
+}
+
+function updateNavigationSessionRules(
+  options: chrome.declarativeNetRequest.UpdateRuleOptions
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    chrome.declarativeNetRequest.updateSessionRules(options, () => {
+      const error = chrome.runtime.lastError
+      if (error) {
+        reject(new Error(error.message))
+        return
+      }
+      resolve()
+    })
+  })
+}
+
+async function clearStaleNavigationOriginFirewalls(): Promise<void> {
+  const staleRules = (await getNavigationSessionRules()).filter((rule) => {
+    const ruleId = Number(rule.id)
+    return ruleId > NAVIGATION_RULE_ID_MIN && ruleId < NAVIGATION_RULE_ID_MAX
+  })
+  if (!staleRules.length) {
     return
   }
 
-  const state = pendingChecks.get(tabId)
-  finalizeNavigationCheck(tabId, {
-    status: 'failed',
-    finalUrl: state?.lastUrl || state?.requestedUrl || '',
-    detail: '后台导航检测已取消。',
-    errorCode: 'cancelled'
+  staleRules.forEach((rule) => {
+    activeNavigationRuleIds.add(Number(rule.id))
   })
+  const closeAttempts = new Map<number, Promise<boolean>>()
+  const removableRuleIds: number[] = []
+  const retainedRuleIdsByTab = new Map<number, number[]>()
+  for (const rule of staleRules) {
+    const tabIds = Array.isArray(rule.condition?.tabIds)
+      ? rule.condition.tabIds.filter(Number.isInteger)
+      : []
+    if (!tabIds.length) {
+      removableRuleIds.push(rule.id)
+      continue
+    }
+
+    const closed = await Promise.all(tabIds.map((tabId) => {
+      let closeAttempt = closeAttempts.get(tabId)
+      if (!closeAttempt) {
+        closeAttempt = closeStaleNavigationTab(tabId)
+        closeAttempts.set(tabId, closeAttempt)
+      }
+      return closeAttempt
+    }))
+    if (closed.every(Boolean)) {
+      removableRuleIds.push(rule.id)
+    } else {
+      tabIds.forEach((tabId) => {
+        const retainedRuleIds = retainedRuleIdsByTab.get(tabId) || []
+        retainedRuleIds.push(rule.id)
+        retainedRuleIdsByTab.set(tabId, retainedRuleIds)
+      })
+    }
+  }
+  retainedRuleIdsByTab.forEach((ruleIds, tabId) => {
+    navigationRuleIdsByTab.set(tabId, ruleIds)
+  })
+  if (!removableRuleIds.length) {
+    return
+  }
+
+  await updateNavigationSessionRules({
+    addRules: [],
+    removeRuleIds: removableRuleIds
+  })
+  releaseNavigationRuleIds(removableRuleIds)
+}
+
+async function closeStaleNavigationTab(tabId: number): Promise<boolean> {
+  try {
+    await closeTab(tabId)
+    return true
+  } catch (error) {
+    if (isMissingTabError(error)) {
+      return true
+    }
+    console.warn('[Curator] 遗留检测标签页关闭失败，继续保留导航阻断规则', error)
+    return false
+  }
+}
+
+function isMissingTabError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /No tab with id|Invalid tab ID|tab not found/i.test(message)
+}
+
+function getNavigationSessionRules(): Promise<chrome.declarativeNetRequest.Rule[]> {
+  return new Promise((resolve, reject) => {
+    chrome.declarativeNetRequest.getSessionRules((rules) => {
+      const error = chrome.runtime.lastError
+      if (error) {
+        reject(new Error(error.message))
+        return
+      }
+      resolve(Array.isArray(rules) ? rules : [])
+    })
+  })
+}
+
+function allocateNavigationRuleIds(count: number): number[] {
+  const ruleIds: number[] = []
+  while (ruleIds.length < count) {
+    nextNavigationRuleId += 1
+    if (nextNavigationRuleId >= NAVIGATION_RULE_ID_MAX) {
+      nextNavigationRuleId = NAVIGATION_RULE_ID_MIN + 1
+    }
+    if (activeNavigationRuleIds.has(nextNavigationRuleId)) {
+      continue
+    }
+    activeNavigationRuleIds.add(nextNavigationRuleId)
+    ruleIds.push(nextNavigationRuleId)
+  }
+  return ruleIds
+}
+
+function releaseNavigationRuleIds(ruleIds: number[]): void {
+  ruleIds.forEach((ruleId) => {
+    activeNavigationRuleIds.delete(ruleId)
+  })
+}
+
+function getExactNavigationUrlRegex(url: string): string {
+  try {
+    const parsedUrl = new URL(String(url || '').trim())
+    if (!/^https?:$/i.test(parsedUrl.protocol)) {
+      return ''
+    }
+    parsedUrl.hash = ''
+    return `^${escapeRegex(parsedUrl.href)}(?:#.*)?$`
+  } catch {
+    return ''
+  }
+}
+
+async function isNavigationUrlRegexSupported(regex: string): Promise<boolean> {
+  try {
+    const result = await chrome.declarativeNetRequest.isRegexSupported({
+      regex,
+      isCaseSensitive: true,
+      requireCapturing: false
+    })
+    return Boolean(result?.isSupported)
+  } catch {
+    return false
+  }
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function isTrustedAvailabilityMessageSender(sender: chrome.runtime.MessageSender): boolean {
+  if (sender.id !== chrome.runtime.id || !sender.url) {
+    return false
+  }
+
+  try {
+    const expectedUrl = new URL(chrome.runtime.getURL('src/options/options.html'))
+    const senderUrl = new URL(sender.url)
+    return (
+      senderUrl.origin === expectedUrl.origin &&
+      senderUrl.pathname === expectedUrl.pathname
+    )
+  } catch {
+    return false
+  }
+}
+
+function reserveNavigationCheck(checkId: string): PendingCheckReservation {
+  if (pendingCheckReservations.has(checkId)) {
+    throw new Error('相同检查 ID 的后台导航检测已在进行中。')
+  }
+  if (pendingCheckReservations.size >= AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT) {
+    throw new Error('后台导航检测正忙，请稍后重试。')
+  }
+
+  const reservation: PendingCheckReservation = {
+    checkId,
+    tabId: null,
+    cancelled: false
+  }
+  pendingCheckReservations.set(checkId, reservation)
+  return reservation
+}
+
+function releaseNavigationCheckReservation(
+  checkId: string,
+  reservation?: PendingCheckReservation
+): void {
+  const currentReservation = pendingCheckReservations.get(checkId)
+  if (!currentReservation || (reservation && currentReservation !== reservation)) {
+    return
+  }
+  pendingCheckReservations.delete(checkId)
+}
+
+function cancelNavigationCheck(checkId: string): void {
+  const reservation = pendingCheckReservations.get(String(checkId || ''))
+  if (!reservation) {
+    return
+  }
+
+  reservation.cancelled = true
+  if (reservation.tabId === null) {
+    return
+  }
+
+  const state = pendingChecks.get(reservation.tabId)
+  if (state) {
+    finalizeNavigationCheck(
+      reservation.tabId,
+      buildCancelledNavigationResult(state.lastUrl || state.requestedUrl)
+    )
+  }
 }
 
 function getPendingState(
@@ -3133,6 +4375,33 @@ function getPendingState(
   }
 
   return pendingChecks.get(details.tabId) || null
+}
+
+function getLatestAttemptedNavigationUrl(
+  state: PendingCheckState,
+  reportedUrl?: string
+): string {
+  const requestedNavigationUrl = normalizeNavigationUrl(state.requestedUrl)
+  const candidates = [
+    reportedUrl,
+    state.lastAttemptedUrl,
+    state.networkEvidence?.finalUrl,
+    state.lastUrl,
+    state.requestedUrl
+  ].flatMap((candidate) => {
+    const normalizedCandidate = String(candidate || '').trim()
+    return normalizedCandidate ? [normalizedCandidate] : []
+  })
+  const changedTarget = candidates.find((candidate) => {
+    const normalizedCandidate = normalizeNavigationUrl(candidate)
+    return Boolean(
+      normalizedCandidate &&
+      requestedNavigationUrl &&
+      normalizedCandidate !== requestedNavigationUrl
+    )
+  })
+
+  return changedTarget || candidates[0] || state.requestedUrl
 }
 
 function finalizeNavigationCheck(
@@ -3148,23 +4417,134 @@ function finalizeNavigationCheck(
   state.settled = true
   detachWebRequestListeners(state)
   pendingChecks.delete(tabId)
-  if (state.checkId) {
-    pendingCheckIds.delete(state.checkId)
-  }
+  releaseNavigationCheckReservation(state.checkId)
 
   if (state.timeoutId) {
     clearTimeout(state.timeoutId)
   }
 
-  if (!skipClose) {
-    closeTab(tabId).catch(() => {})
+  if (skipClose) {
+    void removeNavigationOriginFirewall(tabId).catch((error) => {
+      console.warn('[Curator] 可用性检测导航防火墙清理失败', error)
+    })
+  } else {
+    void closeNavigationTabAndReleaseFirewall(tabId)
   }
 
   state.resolve(attachNetworkEvidence(state, result))
 }
 
+async function closeNavigationTabAndReleaseFirewall(tabId: number): Promise<void> {
+  try {
+    await closeTab(tabId)
+  } catch (error) {
+    if (!isMissingTabError(error)) {
+      console.warn('[Curator] 后台检测标签页关闭失败，已保留导航阻断规则', error)
+      return
+    }
+  }
+
+  try {
+    await removeNavigationOriginFirewall(tabId)
+  } catch (error) {
+    console.warn('[Curator] 可用性检测导航防火墙清理失败', error)
+  }
+}
+
+function buildCancelledNavigationResult(finalUrl: string): NavigationCheckResult {
+  return {
+    status: 'failed',
+    finalUrl,
+    detail: '后台导航检测已取消。',
+    errorCode: 'cancelled'
+  }
+}
+
+function buildUnsupportedNavigationUrlResult(finalUrl: string): NavigationCheckResult {
+  return {
+    status: 'failed',
+    finalUrl,
+    detail: '链接过长或格式不适合建立精确导航边界，已跳过后台导航检测。',
+    errorCode: 'unsupported-navigation-url'
+  }
+}
+
+function finalizeSensitiveNavigationTarget(
+  state: PendingCheckState,
+  targetUrl: string | undefined
+): boolean {
+  const normalizedTargetUrl = String(targetUrl || '').trim()
+  if (!normalizedTargetUrl || isAboutBlank(normalizedTargetUrl)) {
+    return false
+  }
+
+  let containsCredentials = false
+  try {
+    const parsedUrl = new URL(normalizedTargetUrl)
+    containsCredentials = Boolean(parsedUrl.username || parsedUrl.password)
+  } catch {
+  }
+
+  const decision = assessSensitiveExternalUrl(normalizedTargetUrl)
+  if (!decision.sensitive && !containsCredentials) {
+    return false
+  }
+
+  const warning = containsCredentials
+    ? '重定向目标包含 URL 凭据。'
+    : decision.warning
+  finalizeNavigationCheck(state.tabId, {
+    status: 'failed',
+    finalUrl: state.lastUrl || state.requestedUrl,
+    detail: `后台导航检测发现敏感重定向目标，已立即停止并关闭检测标签页。${warning || ''}`,
+    errorCode: 'sensitive-redirect'
+  })
+  return true
+}
+
+function finalizeUnauthorizedNavigationTarget(
+  state: PendingCheckState,
+  targetUrl: string | undefined
+): boolean {
+  const normalizedTargetUrl = String(targetUrl || '').trim()
+  if (!normalizedTargetUrl || isAboutBlank(normalizedTargetUrl)) {
+    return false
+  }
+
+  const requestedNavigationUrl = normalizeNavigationUrl(state.requestedUrl)
+  const targetNavigationUrl = normalizeNavigationUrl(normalizedTargetUrl)
+  if (
+    !requestedNavigationUrl ||
+    !targetNavigationUrl ||
+    requestedNavigationUrl === targetNavigationUrl
+  ) {
+    return false
+  }
+
+  finalizeNavigationCheck(state.tabId, {
+    status: 'failed',
+    finalUrl: normalizedTargetUrl,
+    detail: '后台导航被目标网站重定向到未授权地址，已在请求发出前阻断。',
+    errorCode: 'ungranted-redirect'
+  })
+  return true
+}
+
 function isAboutBlank(url: string | undefined): boolean {
   return String(url || '').startsWith('about:blank')
+}
+
+function normalizeNavigationUrl(url: string | undefined): string {
+  try {
+    const parsedUrl = new URL(String(url || '').trim())
+    if (!/^https?:$/i.test(parsedUrl.protocol)) {
+      return ''
+    }
+    parsedUrl.hash = ''
+    return parsedUrl.href
+  } catch {
+    return ''
+  }
 }
 
 function getOrCreateNetworkEvidence(
@@ -3212,6 +4592,17 @@ function attachNetworkEvidence(
   }
 
   evidence.finalUrl = evidence.finalUrl || result.finalUrl || state.lastUrl || state.requestedUrl
+  if (
+    result.errorCode === 'cancelled' ||
+    result.errorCode === 'sensitive-redirect' ||
+    result.errorCode === 'ungranted-redirect'
+  ) {
+    return {
+      ...result,
+      networkEvidence: evidence
+    }
+  }
+
   const normalizedResult = normalizeNavigationResultWithNetworkEvidence(result, evidence)
   return {
     ...normalizedResult,
@@ -3312,7 +4703,10 @@ function normalizeTimeout(value: unknown): number {
     return 15000
   }
 
-  return Math.max(timeout, 1000)
+  return Math.max(
+    AVAILABILITY_NAVIGATION_TIMEOUT_MIN_MS,
+    Math.min(AVAILABILITY_NAVIGATION_TIMEOUT_MAX_MS, Math.round(timeout))
+  )
 }
 
 function createTab(properties: chrome.tabs.CreateProperties): Promise<chrome.tabs.Tab> {
@@ -3346,6 +4740,15 @@ function updateTab(
   })
 }
 
+function isTabAvailable(tabId: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    chrome.tabs.get(tabId, (tab) => {
+      const error = chrome.runtime.lastError
+      resolve(!error && Boolean(tab))
+    })
+  })
+}
+
 function closeTab(tabId: number): Promise<void> {
   return new Promise((resolve, reject) => {
     chrome.tabs.remove(tabId, () => {
@@ -3362,9 +4765,9 @@ function closeTab(tabId: number): Promise<void> {
 
 export function __getServiceWorkerDebugSnapshot(): ServiceWorkerDebugSnapshot {
   return {
-    pendingNavigationChecks: pendingChecks.size,
+    pendingNavigationChecks: pendingCheckReservations.size,
     pendingNavigationListeners: Array.from(pendingChecks.values()).filter((state) => Boolean(state.webRequestListeners)).length,
-    pendingNavigationIds: pendingCheckIds.size,
+    pendingNavigationIds: pendingCheckReservations.size,
     autoAnalyzeInFlight: autoClassifyInFlight.size,
     suppressedAutoBookmarkUrls: suppressedAutoBookmarkUrls.size,
     autoAnalyzeQueueProcessing,

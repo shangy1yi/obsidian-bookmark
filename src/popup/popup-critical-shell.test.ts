@@ -104,7 +104,13 @@ function run(): void {
   )
   assert(pinyinSearch.includes('Math.max(8, options.batchSize ?? 250)'), 'cooperative pinyin enrichment must honor popup-sized batches below 50 items')
   assert(!popupContent.includes('[will-change:opacity]'), 'initial content layers must not keep permanent compositor hints')
-  assert(popupContent.includes("'t-skel popup-t-skel relative h-full min-h-0'") && popupContent.includes('t-skel-skeleton is-pulsing') && popupContent.includes("isLoading ? '' : 'is-revealed'"), 'popup workspace loading must use the shared skeleton reveal state hooks')
+  assert(
+    popupContent.includes("'t-skel popup-t-skel popup-workspace-reveal relative h-full min-h-0'") &&
+      !popupContent.includes('t-skel-skeleton is-pulsing') &&
+      popupContent.includes('popup-skeleton-pulse') &&
+      popupContent.includes("isLoading ? '' : 'is-revealed'"),
+    'popup workspace loading must keep pane surfaces static while pulsing only placeholder marks'
+  )
   assert(popupSmartClassifier.includes('t-skel popup-t-skel popup-page-reveal') && popupSmartClassifier.includes('t-skel-content popup-page-content'), 'current-page loading must use the shared skeleton reveal layers')
   assert(
     motionTokens.includes('--reveal-dur: 180ms') &&
@@ -114,6 +120,11 @@ function run(): void {
     'popup skeleton reveal must remain crisp, compositor-only, and token driven'
   )
   assert(/\.t-skel\.popup-t-skel \.t-skel-content\s*\{[^}]*filter:\s*none;[^}]*transform:\s*translate3d/s.test(popupCss), 'popup loaded text must never enter through a large-area blur filter')
+  assert(
+    /\.t-skel\.popup-workspace-reveal \.t-skel-content,[\s\S]*?transform:\s*none;[\s\S]*?\.t-skel\.popup-workspace-reveal \.t-skel-content\s*\{[^}]*transition:\s*opacity/s.test(popupCss) &&
+      /\.popup-workspace-reveal \.popup-skeleton-pulse\s*\{[^}]*animation:\s*t-skel-pulse/s.test(popupCss),
+    'dense popup workspace reveal must preserve geometry and limit loading motion to placeholder marks'
+  )
   assert(!popupEmptyState.includes('useMotionEntrance') && !popupEmptyState.includes('t-stagger'), 'empty-state meaning must appear immediately without delayed text motion')
   assert(!popupSmartClassifier.includes('<TextSwap animate') && !popupSmartClassifier.includes('<NumberPop'), 'live popup status text must update without replacement motion')
   assert(popupCss.includes('@media (prefers-reduced-transparency: reduce)') && popupCss.includes('@media (prefers-contrast: more)'), 'popup must provide transparency and contrast fallbacks')
@@ -121,6 +132,11 @@ function run(): void {
   assert(main.includes("removeAttribute('data-popup-ready')"), 'popup must hide the last compositor surface before close')
   assert(main.includes("'pagehide'"), 'popup close guard must run before the action popup is discarded')
   assert(main.includes("'visibilitychange'"), 'popup close guard must run when Chrome hides the action popup')
+  assert(
+    popupController.includes('recycleBin.restoreBookmarkFromRecycleEntry(') &&
+      !popupController.includes('await recycleBin.removeRecycleEntry(payload.recycleId)'),
+    'popup undo must consume the recycle entry through the shared rollback-safe restore transaction'
+  )
 }
 
 function assert(value: unknown, message: string): void {

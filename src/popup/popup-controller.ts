@@ -4022,7 +4022,7 @@ async function confirmDeleteBookmark() {
       index: bookmark.index,
       recycleId: `recycle-${bookmark.id}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
     }
-    await recycleBin.deleteBookmarkToRecycle(bookmark.id, {
+    const deleted = await recycleBin.deleteBookmarkToRecycle(bookmark.id, {
       recycleId: state.lastDeletedBookmark.recycleId,
       bookmarkId: String(bookmark.id),
       title: bookmark.title,
@@ -4032,7 +4032,12 @@ async function confirmDeleteBookmark() {
       path: bookmark.path || '',
       source: '弹窗删除',
       deletedAt: Date.now()
+    }, {
+      expectedUrl: bookmark.url
     })
+    if (!deleted) {
+      throw new Error('书签地址已变化，已取消删除。')
+    }
     showToast({
       type: 'success',
       message: '删除成功',
@@ -4065,14 +4070,14 @@ async function undoDelete() {
   state.lastDeletedBookmark = null
   try {
     const parentId = await getRestorableParentId(payload.parentId)
-    await createBookmark({
-      ...payload,
-      parentId
-    })
-    if (payload.recycleId) {
-      const recycleBin = await loadRecycleBinModule()
-      await recycleBin.removeRecycleEntry(payload.recycleId)
-    }
+    const recycleBin = await loadRecycleBinModule()
+    await recycleBin.restoreBookmarkFromRecycleEntry(
+      payload.recycleId,
+      () => createBookmark({
+        ...payload,
+        parentId
+      })
+    )
     showToast({
       type: 'success',
       message: '已撤销删除'

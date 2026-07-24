@@ -38,6 +38,8 @@ export function RecycleControls() {
                 type="button"
                 variant="secondary"
                 aria-label="清空回收站已选书签"
+                disabled={state.locked}
+                focusableWhenDisabled={state.locked}
                 onClick={() => handleRecycleAction('clear-selection')}
               >
                 清空选择
@@ -46,8 +48,8 @@ export function RecycleControls() {
                 size="sm"
                 type="button"
                 aria-label="批量恢复回收站已选书签"
-                disabled={state.busy || !hasSelection}
-                focusableWhenDisabled={state.busy}
+                disabled={state.locked || !hasSelection}
+                focusableWhenDisabled={state.locked}
                 onClick={() => handleRecycleAction('restore-selected')}
               >
                 恢复所选
@@ -57,8 +59,8 @@ export function RecycleControls() {
                 type="button"
                 variant="danger"
                 aria-label="清除回收站已选记录"
-                disabled={state.busy || !hasSelection}
-                focusableWhenDisabled={state.busy}
+                disabled={state.locked || !hasSelection}
+                focusableWhenDisabled={state.locked}
                 onClick={() => handleRecycleAction('clear-selected')}
               >
                 清除所选
@@ -82,6 +84,8 @@ export function RecycleControls() {
               type="button"
               variant="secondary"
               aria-label="全选回收站条目"
+              disabled={state.locked}
+              focusableWhenDisabled={state.locked}
               onClick={() => handleRecycleAction('select-all')}
             >
               全选本区
@@ -91,8 +95,8 @@ export function RecycleControls() {
               type="button"
               variant="danger"
               aria-label="清空全部回收站记录"
-              disabled={state.busy}
-              focusableWhenDisabled={state.busy}
+              disabled={state.locked}
+              focusableWhenDisabled={state.locked}
               onClick={() => handleRecycleAction('clear-all')}
             >
               清空回收站

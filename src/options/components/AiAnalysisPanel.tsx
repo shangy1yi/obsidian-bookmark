@@ -42,7 +42,7 @@ export function AiAnalysisPanel({ hidden }: OptionsPanelVisibilityProps) {
       <OptionPanelHeader
         titleId="ai-title"
         title="书签智能分析"
-        description="使用 AI 批量生成标题、标签和归档建议，再按置信度确认结果。"
+        description="使用 AI 批量生成标题、标签和归档建议，再逐条确认并应用结果。"
       />
 
       {configured ? (
@@ -66,7 +66,7 @@ export function AiAnalysisPanel({ hidden }: OptionsPanelVisibilityProps) {
             <div className={AI_ANALYSIS_DECISION_HEADER_CLASS}>
               <div>
                 <strong className={AI_ANALYSIS_DECISION_TITLE_CLASS}>分析概览</strong>
-                <p className={AI_ANALYSIS_DECISION_COPY_CLASS}>先应用高置信，再处理待确认。</p>
+                <p className={AI_ANALYSIS_DECISION_COPY_CLASS}>先处理建议，再检查待确认项。</p>
               </div>
             </div>
             <AiAnalysisDecisionMetrics />

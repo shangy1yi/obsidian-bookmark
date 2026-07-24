@@ -68,11 +68,11 @@ const POPUP_CONTENT_SKELETON_BOOKMARK_ROWS = [
 const POPUP_CONTENT_SKELETON_ACTION_COUNT = 5
 
 const workspaceShellClass =
-  't-skel popup-t-skel relative h-full min-h-0'
+  't-skel popup-t-skel popup-workspace-reveal relative h-full min-h-0'
 const workspaceLayerClass = 'absolute inset-0 min-h-0'
 const workspaceSkeletonLayerClass = cx(
   workspaceLayerClass,
-  't-skel-skeleton is-pulsing pointer-events-none z-[1] [contain:layout_paint]'
+  't-skel-skeleton pointer-events-none z-[1] [contain:layout_paint]'
 )
 const workspaceContentLayerClass = cx(
   workspaceLayerClass,
@@ -165,14 +165,14 @@ const compactStateClass =
   'grid min-h-[90px] place-items-center px-4 py-3 text-center text-xs leading-[1.55] text-ds-text-muted'
 const mainStateClass = cx(compactStateClass, 'min-h-full p-[18px]')
 const skeletonBarBaseClass =
-  'rounded-full bg-[rgba(255,255,255,0.065)] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.024)]'
+  'popup-skeleton-pulse rounded-full bg-[rgba(255,255,255,0.065)] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.024)]'
 const skeletonBarClass = cx(
   skeletonBarBaseClass,
   'block h-[9px] w-[calc(var(--skeleton-width,0.7)*100%)]'
 )
 const skeletonTextBarClass = cx(skeletonBarBaseClass, 'block max-w-full')
 const skeletonDotClass =
-  'block h-7 w-7 rounded-md bg-[rgba(255,255,255,0.065)] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.024)]'
+  'popup-skeleton-pulse block h-7 w-7 rounded-md bg-[rgba(255,255,255,0.065)] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.024)]'
 const skeletonFolderTitleClass = cx(skeletonBarClass, 'min-w-[54px]')
 const skeletonFolderCountClass =
   cx(skeletonBarClass, 'max-w-[30px] min-w-4 justify-self-end')

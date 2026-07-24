@@ -78,6 +78,136 @@ function normalizeDetectionHistoryRun(run) {
   }
 }
 
+function normalizeHistoryEntrySource(entries) {
+  if (entries instanceof Map) {
+    return [...entries.values()]
+  }
+
+  return Array.isArray(entries) ? entries : []
+}
+
+function normalizeHistoryBookmarkIdSet(bookmarkIds) {
+  const source = bookmarkIds instanceof Set
+    ? [...bookmarkIds]
+    : Array.isArray(bookmarkIds)
+      ? bookmarkIds
+      : []
+
+  return new Set(source.flatMap((bookmarkId) => {
+    const normalizedId = String(bookmarkId || '').trim()
+    return normalizedId ? [normalizedId] : []
+  }))
+}
+
+function normalizeHealthyBookmarkEvidence(evidence) {
+  const normalizedEvidence = new Map()
+  const sourceEntries = evidence instanceof Map
+    ? [...evidence.entries()]
+    : evidence instanceof Set
+      ? [...evidence].map((bookmarkId) => [bookmarkId, ''])
+      : Array.isArray(evidence)
+        ? evidence.map((entry) => {
+            if (entry && typeof entry === 'object') {
+              return [entry.id, entry.url]
+            }
+            return [entry, '']
+          })
+        : []
+
+  for (const [bookmarkId, url] of sourceEntries) {
+    const normalizedId = String(bookmarkId || '').trim()
+    if (normalizedId) {
+      normalizedEvidence.set(normalizedId, String(url || '').trim())
+    }
+  }
+
+  return normalizedEvidence
+}
+
+export function isSameHistoryEntryIdentity(left, right) {
+  const leftId = String(left?.id || '').trim()
+  const rightId = String(right?.id || '').trim()
+  const leftUrl = String(left?.url || '').trim()
+  const rightUrl = String(right?.url || '').trim()
+  return Boolean(leftId && leftId === rightId && leftUrl && leftUrl === rightUrl)
+}
+
+export function hasMatchingPreviousHistoryEntry(result) {
+  const bookmarkId = String(result?.id || '').trim()
+  return isSameHistoryEntryIdentity(
+    managerState.previousHistoryMap.get(bookmarkId),
+    result
+  )
+}
+
+interface AvailabilityHistoryRunFinalizationInput {
+  checkedHealthyBookmarks?: unknown[] | Set<unknown> | Map<unknown, unknown>
+  checkedHealthyBookmarkIds?: unknown[] | Set<unknown>
+  completedAt?: number
+  currentEntries?: unknown[] | Map<unknown, unknown>
+  previousEntries?: unknown[] | Map<unknown, unknown>
+  scope?: unknown
+}
+
+export function finalizeAvailabilityHistoryRun({
+  checkedHealthyBookmarks = [],
+  checkedHealthyBookmarkIds = [],
+  completedAt = Date.now(),
+  currentEntries = [],
+  previousEntries = [],
+  scope = null
+}: AvailabilityHistoryRunFinalizationInput = {}) {
+  const previousHistoryMap = new Map(
+    normalizeHistoryResultArray(normalizeHistoryEntrySource(previousEntries))
+      .map((entry) => [entry.id, entry])
+  )
+  const currentEntriesMap = new Map()
+  const checkedHealthyIds = normalizeHistoryBookmarkIdSet(checkedHealthyBookmarkIds)
+  const checkedHealthyEvidence = normalizeHealthyBookmarkEvidence(checkedHealthyBookmarks)
+  const normalizedCompletedAt = Number.isFinite(Number(completedAt))
+    ? Number(completedAt)
+    : Date.now()
+
+  for (const result of normalizeHistoryResultArray(normalizeHistoryEntrySource(currentEntries))) {
+    currentEntriesMap.set(result.id, result)
+  }
+
+  const nextEntries = [...currentEntriesMap.values()].sort((left, right) => {
+    return compareByPathTitle(left, right)
+  })
+  const newResults = nextEntries.filter((entry) => {
+    return !isSameHistoryEntryIdentity(previousHistoryMap.get(entry.id), entry)
+  })
+  const recoveredResults = [...previousHistoryMap.values()]
+    .filter((entry) => {
+      const healthyUrl = checkedHealthyEvidence.get(entry.id)
+      const hasMatchingHealthyEvidence =
+        healthyUrl === entry.url ||
+        (checkedHealthyIds.has(entry.id) && !checkedHealthyEvidence.has(entry.id))
+      return hasMatchingHealthyEvidence && !currentEntriesMap.has(entry.id)
+    })
+    .sort((left, right) => compareByPathTitle(left, right))
+  const reviewCount = nextEntries.filter((entry) => entry.status === 'review').length
+  const failedCount = nextEntries.filter((entry) => entry.status === 'failed').length
+
+  return {
+    runId: `run-${normalizedCompletedAt}`,
+    completedAt: normalizedCompletedAt,
+    scope: normalizeHistoryRunScope(scope),
+    results: nextEntries,
+    newResults,
+    recoveredResults,
+    summary: {
+      totalAbnormal: nextEntries.length,
+      newCount: newResults.length,
+      persistentCount: nextEntries.length - newResults.length,
+      recoveredCount: recoveredResults.length,
+      reviewCount,
+      failedCount
+    }
+  }
+}
+
 function normalizeDetectionHistoryRuns(rawHistory) {
   if (Array.isArray(rawHistory.runs)) {
     return rawHistory.runs.flatMap(run => { const mappedResult = normalizeDetectionHistoryRun(run); return mappedResult ? [mappedResult] : [] })
@@ -186,9 +316,10 @@ export function getHistoryRunsForScope(callbacks, scopeKey = callbacks.getCurren
   })
 }
 
-export function getHistoricalAbnormalStreak(bookmarkId, callbacks) {
+export function getHistoricalAbnormalStreak(bookmarkId, bookmarkUrl, callbacks) {
   const normalizedId = String(bookmarkId || '').trim()
-  if (!normalizedId) {
+  const normalizedUrl = String(bookmarkUrl || '').trim()
+  if (!normalizedId || !normalizedUrl) {
     return 0
   }
 
@@ -202,7 +333,10 @@ export function getHistoricalAbnormalStreak(bookmarkId, callbacks) {
 
     const resultById = new Map((run.results || []).map((result) => [String(result.id), result]))
     const entry = resultById.get(normalizedId)
-    if (!entry) {
+    if (!isSameHistoryEntryIdentity(entry, {
+      id: normalizedId,
+      url: normalizedUrl
+    })) {
       break
     }
 
@@ -233,71 +367,32 @@ export function syncHistoryComparisonScope(callbacks) {
   }
 }
 
-export async function finalizeDetectionHistory(callbacks) {
+export async function finalizeDetectionHistory(
+  callbacks,
+  {
+    checkedHealthyBookmarks = [],
+    checkedHealthyBookmarkIds = []
+  }: Pick<
+    AvailabilityHistoryRunFinalizationInput,
+    'checkedHealthyBookmarks' | 'checkedHealthyBookmarkIds'
+  > = {}
+) {
   const scopeMeta = callbacks.getCurrentAvailabilityScopeMeta()
-  const previousHistoryMap = new Map(managerState.previousHistoryMap)
-  const currentEntriesMap = new Map()
   const completedAt = Date.now()
-
-  for (const result of managerState.currentHistoryEntries) {
-    const bookmarkId = String(result?.id || '').trim()
-    if (!bookmarkId) {
-      continue
-    }
-
-    currentEntriesMap.set(bookmarkId, {
-      id: bookmarkId,
-      title: String(result.title || '未命名书签'),
-      url: String(result.url || ''),
-      path: String(result.path || ''),
-      status: result.status === 'failed' ? 'failed' : 'review',
-      streak: Math.max(1, Number(result.streak) || 1)
-    })
-  }
-
-  const nextEntries = [...currentEntriesMap.values()].sort((left, right) => {
-    return compareByPathTitle(left, right)
-  })
-
-  managerState.historyNewCount = nextEntries.filter((entry) => {
-    return !previousHistoryMap.has(entry.id)
-  }).length
-  managerState.historyPersistentCount = nextEntries.length - managerState.historyNewCount
-
-  managerState.historyRecoveredResults = [...previousHistoryMap.values()]
-    .filter((entry) => !currentEntriesMap.has(entry.id))
-    .sort((left, right) => compareByPathTitle(left, right))
-
-  managerState.historyLastRunAt = completedAt
-  const reviewCount = nextEntries.filter((entry) => entry.status === 'review').length
-  const failedCount = nextEntries.filter((entry) => entry.status === 'failed').length
-  const latestRun = {
-    runId: `run-${completedAt}`,
+  const latestRun = finalizeAvailabilityHistoryRun({
+    checkedHealthyBookmarks,
+    checkedHealthyBookmarkIds,
     completedAt,
-    scope: scopeMeta,
-    results: nextEntries.map((entry) => ({
-      ...entry
-    })),
-    newResults: nextEntries.flatMap((combineValue, combineIndex, combineArray) => { if (!((entry) => !previousHistoryMap.has(entry.id))(combineValue)) return []; const combinedResult = ((entry) => ({
-        ...entry
-      }))(combineValue); return [combinedResult] }),
-    recoveredResults: managerState.historyRecoveredResults.map((entry) => ({
-      ...entry
-    })),
-    summary: {
-      totalAbnormal: nextEntries.length,
-      newCount: managerState.historyNewCount,
-      persistentCount: managerState.historyPersistentCount,
-      recoveredCount: managerState.historyRecoveredResults.length,
-      reviewCount,
-      failedCount
-    }
-  }
-
-  managerState.historyRuns = [latestRun, ...managerState.historyRuns]
+    currentEntries: managerState.currentHistoryEntries,
+    previousEntries: managerState.previousHistoryMap,
+    scope: scopeMeta
+  })
+  const nextHistoryRuns = [latestRun, ...managerState.historyRuns]
     .slice(0, HISTORY_LOG_LIMIT)
+
+  await saveDetectionHistory(nextHistoryRuns)
+  managerState.historyRuns = nextHistoryRuns
   syncHistoryComparisonScope(callbacks)
-  await saveDetectionHistory()
 }
 
 export function syncHistoryEntryStatus(bookmarkId, status) {
@@ -414,8 +509,7 @@ function getAvailabilityHistorySubtitle(scopeMeta, scopeRuns, latestRun): string
 export async function clearDetectionHistoryLogs(callbacks) {
   if (
     availabilityState.deleting ||
-    availabilityState.running ||
-    availabilityState.retestingSelection ||
+    availabilityState.runSessionActive ||
     managerState.historyRuns.length === 0
   ) {
     return
@@ -434,26 +528,35 @@ export async function clearDetectionHistoryLogs(callbacks) {
     return
   }
 
-  managerState.historyRuns = []
-  managerState.previousHistoryMap = new Map()
-  managerState.historyLastRunAt = 0
-  managerState.historyRecoveredResults = []
-  managerState.historyNewCount = 0
-  managerState.historyPersistentCount = 0
-  managerState.historyLogsCollapsed = false
-  availabilityState.reviewResults = availabilityState.reviewResults.map((result) => ({
-    ...result,
-    historyStatus: '',
-    abnormalStreak: 0
-  }))
-  availabilityState.failedResults = availabilityState.failedResults.map((result) => ({
-    ...result,
-    historyStatus: '',
-    abnormalStreak: 0
-  }))
-  await saveDetectionHistory([])
-  availabilityState.lastError = '已清空历史日志。'
-  callbacks.renderAvailabilitySection()
+  const releaseMutationLock = await callbacks.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
+  }
+
+  try {
+    await saveDetectionHistory([])
+    managerState.historyRuns = []
+    managerState.previousHistoryMap = new Map()
+    managerState.historyLastRunAt = 0
+    managerState.historyRecoveredResults = []
+    managerState.historyNewCount = 0
+    managerState.historyPersistentCount = 0
+    managerState.historyLogsCollapsed = false
+    availabilityState.reviewResults = availabilityState.reviewResults.map((result) => ({
+      ...result,
+      historyStatus: '',
+      abnormalStreak: 0
+    }))
+    availabilityState.failedResults = availabilityState.failedResults.map((result) => ({
+      ...result,
+      historyStatus: '',
+      abnormalStreak: 0
+    }))
+    availabilityState.lastError = '已清空历史日志。'
+    callbacks.renderAvailabilitySection()
+  } finally {
+    releaseMutationLock()
+  }
 }
 
 export function toggleHistoryLogsCollapsed(callbacks) {

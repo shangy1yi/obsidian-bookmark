@@ -18,8 +18,9 @@ export function isInteractionLocked(): boolean {
   return (
     availabilityState.deleting ||
     availabilityState.retestingSelection ||
+    availabilityState.settingsSaving ||
     availabilityState.stopRequested ||
-    (availabilityState.running && !availabilityState.paused)
+    availabilityState.runSessionActive
   )
 }
 

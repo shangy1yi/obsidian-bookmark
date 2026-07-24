@@ -16,6 +16,10 @@ export interface AiTaskStatusProps {
   title: ReactNode
   description?: ReactNode
   progress?: number | null
+  progressAriaLabel?: string
+  progressDivisions?: number
+  progressMax?: number
+  progressValueText?: string
 }
 
 const toneByStatus = {
@@ -36,8 +40,12 @@ export function AiTaskStatus({
   descriptionClassName,
   label,
   progress,
+  progressAriaLabel,
+  progressDivisions,
   progressIndicatorClassName,
   progressClassName,
+  progressMax,
+  progressValueText,
   status,
   statusNode,
   title
@@ -62,8 +70,12 @@ export function AiTaskStatus({
       {typeof progress === 'number' ? (
         <Progress
           value={progress}
+          max={progressMax}
+          divisions={progressDivisions}
+          label={progressAriaLabel}
           className={progressClassName}
           indicatorClassName={progressIndicatorClassName}
+          aria-valuetext={progressValueText}
         />
       ) : null}
       {children}

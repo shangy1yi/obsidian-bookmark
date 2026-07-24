@@ -12,11 +12,13 @@ export function ButtonBusyLoadingLabel({
   busy,
   label,
   reserveLabels = [],
+  showLoader = true,
   variant = 'bar'
 }: {
   busy: boolean
   label: string
   reserveLabels?: readonly string[]
+  showLoader?: boolean
   variant?: LoadingLabelState['variant']
 }) {
   const labels = Array.from(new Set([...reserveLabels, label]))
@@ -35,13 +37,17 @@ export function ButtonBusyLoadingLabel({
         </span>
       ))}
       <span className={LOADING_LABEL_BUTTON_LAYER_CLASS}>
-        <DotMatrixLoader
-          variant={variant}
-          className={[
-            LOADING_LABEL_BUTTON_LOADER_CLASS,
-            busy ? 'opacity-100' : 'opacity-0'
-          ].join(' ')}
-        />
+        {showLoader ? (
+          <DotMatrixLoader
+            variant={variant}
+            className={[
+              LOADING_LABEL_BUTTON_LOADER_CLASS,
+              busy ? 'opacity-100' : 'opacity-0'
+            ].join(' ')}
+          />
+        ) : (
+          <span className={LOADING_LABEL_BUTTON_LOADER_CLASS} aria-hidden="true" />
+        )}
         <TextSwap animate={busy} text={label} />
         <span aria-hidden="true" />
       </span>

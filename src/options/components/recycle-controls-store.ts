@@ -4,6 +4,7 @@ import type { RecycleControlsState } from './recycle-controls-types.js'
 const defaultRecycleControlsState: RecycleControlsState = {
   busy: false,
   entryCount: 0,
+  locked: false,
   selectedCount: 0
 }
 

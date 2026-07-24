@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT } from '../../shared/messages.js'
 import { Button } from '../../ui/base/Button'
 import { Input } from '../../ui/base/Input'
 import { Popover } from '../../ui/base/Popover'
@@ -59,6 +60,7 @@ const AVAILABILITY_ACTION_LABELS = [
   '正在请求站点授权…',
   '正在重新测试…',
   '正在检测…',
+  '正在保存检测结果…',
   '检测已暂停',
   '停止中…'
 ] as const
@@ -78,6 +80,7 @@ function BusyLabel({
       busy={busy}
       label={label}
       reserveLabels={reserveLabels}
+      showLoader={false}
     />
   )
 }
@@ -173,8 +176,9 @@ export function AvailabilityControls() {
                 type="number"
                 inputMode="numeric"
                 min="1"
-                max="6"
+                max={AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT}
                 step="1"
+                disabled={state.settingsDisabled}
                 value={state.settingsDraft.concurrency}
                 onValueChange={(value) => {
                   updateDraft({ concurrency: value })
@@ -192,6 +196,7 @@ export function AvailabilityControls() {
                 min="5"
                 max="120"
                 step="5"
+                disabled={state.settingsDisabled}
                 value={state.settingsDraft.navigationTimeoutSeconds}
                 onValueChange={(value) => {
                   updateDraft({ navigationTimeoutSeconds: value })
@@ -205,6 +210,8 @@ export function AvailabilityControls() {
                 size="sm"
                 type="button"
                 variant="secondary"
+                disabled={state.settingsDisabled}
+                focusableWhenDisabled={state.settingsDisabled}
                 onClick={() => handleAvailabilityControlsAction({ action: 'settings-reset' })}
               >
                 恢复默认
@@ -214,6 +221,8 @@ export function AvailabilityControls() {
                 size="sm"
                 type="button"
                 variant="primary"
+                disabled={state.settingsDisabled}
+                focusableWhenDisabled={state.settingsDisabled}
                 onClick={() => handleAvailabilityControlsAction({ action: 'settings-save' })}
               >
                 保存设置

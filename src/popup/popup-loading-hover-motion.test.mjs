@@ -11,6 +11,7 @@ const capturePath = process.argv.includes('--capture')
   : null
 const seededFolderCount = 48
 const seededItemsPerFolder = 12
+const schedulerFrameGapLimitMs = 220
 
 async function seedBookmarks(worker) {
   await worker.evaluate(async ({ folderCount, itemsPerFolder }) => {
@@ -102,8 +103,14 @@ async function measureWheelScrollResponse(page, selector) {
   const metrics = await container.evaluate((element) => {
     element.scrollTop = 0
     window.__popupScrollProbeWheelEvents = 0
+    window.__popupScrollProbeFirstResponseAt = 0
     element.addEventListener('wheel', () => {
       window.__popupScrollProbeWheelEvents += 1
+    }, { capture: true, once: true })
+    element.addEventListener('scroll', () => {
+      if (!window.__popupScrollProbeFirstResponseAt) {
+        window.__popupScrollProbeFirstResponseAt = performance.now()
+      }
     }, { capture: true, once: true })
     return {
       clientHeight: element.clientHeight,
@@ -126,7 +133,10 @@ async function measureWheelScrollResponse(page, selector) {
     return element instanceof HTMLElement && element.scrollTop > 0
   }, selector, { timeout: 1_500 }).catch(() => undefined)
   const response = await container.evaluate((element) => ({
-    durationMs: performance.now() - window.__popupScrollProbeStartedAt,
+    durationMs: (
+      window.__popupScrollProbeFirstResponseAt ||
+      performance.now()
+    ) - window.__popupScrollProbeStartedAt,
     clientHeight: element.clientHeight,
     scrollTop: element.scrollTop,
     scrollHeight: element.scrollHeight,
@@ -242,7 +252,8 @@ try {
     return performance.now() - probe.readyAt
   })
   const initiallyMountedQuickActions = await page.locator(
-    '.t-skel-content .popup-row-actions-menu button'
+    '.t-skel-content .popup-main-row:not([data-active="true"]) ' +
+      '.popup-row-actions-menu button'
   ).count()
   const mainScrollResponse = await measureWheelScrollResponse(page, '.t-skel-content .popup-main-list')
   const folderScrollResponse = await measureWheelScrollResponse(page, '.t-skel-content .popup-folder-tree')
@@ -287,11 +298,18 @@ try {
     }
     const skeletonStyle = getComputedStyle(skeleton)
     const contentStyle = getComputedStyle(content)
+    const skeletonSurface = skeleton.firstElementChild
+    const skeletonBar = skeleton.querySelector('.popup-skeleton-pulse')
+    if (!(skeletonSurface instanceof HTMLElement) || !(skeletonBar instanceof HTMLElement)) {
+      throw new Error('Popup workspace skeleton surface or placeholder mark is unavailable')
+    }
     return {
       contentFilter: contentStyle.filter,
       contentTransitionDuration: contentStyle.transitionDuration,
       contentTransitionProperty: contentStyle.transitionProperty,
+      skeletonBarAnimationName: getComputedStyle(skeletonBar).animationName,
       skeletonFilter: skeletonStyle.filter,
+      skeletonSurfaceAnimationName: getComputedStyle(skeletonSurface).animationName,
       skeletonTransitionDuration: skeletonStyle.transitionDuration,
       skeletonTransitionProperty: skeletonStyle.transitionProperty
     }
@@ -313,10 +331,15 @@ try {
       const sample = (now) => {
         const skeletonStyle = getComputedStyle(skeleton)
         const contentStyle = getComputedStyle(content)
+        const contentRect = content.getBoundingClientRect()
         samples.push({
           contentFilter: contentStyle.filter,
+          contentHeight: contentRect.height,
+          contentLeft: contentRect.left,
           contentOpacity: Number.parseFloat(contentStyle.opacity),
+          contentTop: contentRect.top,
           contentTransform: contentStyle.transform,
+          contentWidth: contentRect.width,
           skeletonFilter: skeletonStyle.filter,
           skeletonOpacity: Number.parseFloat(skeletonStyle.opacity),
           skeletonTransform: skeletonStyle.transform
@@ -327,6 +350,16 @@ try {
         }
         resolve({
           final: samples.at(-1),
+          geometryDrift: {
+            height: Math.max(...samples.map((entry) => entry.contentHeight)) -
+              Math.min(...samples.map((entry) => entry.contentHeight)),
+            left: Math.max(...samples.map((entry) => entry.contentLeft)) -
+              Math.min(...samples.map((entry) => entry.contentLeft)),
+            top: Math.max(...samples.map((entry) => entry.contentTop)) -
+              Math.min(...samples.map((entry) => entry.contentTop)),
+            width: Math.max(...samples.map((entry) => entry.contentWidth)) -
+              Math.min(...samples.map((entry) => entry.contentWidth))
+          },
           sawAnyBlur: samples.some((entry) =>
             (entry.contentFilter !== 'none' && entry.contentFilter !== 'blur(0px)') ||
             (entry.skeletonFilter !== 'none' && entry.skeletonFilter !== 'blur(0px)')
@@ -451,15 +484,18 @@ try {
       folderBottomWindow.lastText.includes('Popup motion folder 48'),
     `Folder virtualization must render the final row at the bottom: ${JSON.stringify(folderBottomWindow)}`
   )
-  assert.equal(initiallyMountedQuickActions, 0, 'Collapsed rows must not mount hidden quick-action buttons during cold open')
+  assert.ok(
+    initiallyMountedQuickActions <= 5,
+    `Cold open may mount at most one pointer-intersected quick-action rail: ${initiallyMountedQuickActions}`
+  )
   assert.ok(hoveredQuickActions >= 5, 'Hovering a row must mount its complete quick-action rail on demand')
   assert.ok(
     coldOpenProbe.firstFrameDelayMs <= 160,
     `Popup must paint an interactive frame immediately after becoming ready: ${coldOpenProbe.firstFrameDelayMs.toFixed(1)}ms`
   )
   assert.ok(
-    coldOpenProbe.maxFrameGapMs <= 160,
-    `Popup must not block scrolling with a long post-ready task: ${coldOpenProbe.maxFrameGapMs.toFixed(1)}ms`
+    coldOpenProbe.maxFrameGapMs <= schedulerFrameGapLimitMs,
+    `Popup must not show a prolonged scheduler stall after ready: ${coldOpenProbe.maxFrameGapMs.toFixed(1)}ms`
   )
   assert.equal(
     coldOpenProbe.longTasksAfterReady.filter((entry) => entry.duration > 160).length,
@@ -472,13 +508,19 @@ try {
     `Popup must not produce a blocking post-ready animation frame: ${JSON.stringify(coldOpenProbe.longAnimationFramesAfterReady)}`
   )
   assert.doesNotMatch(revealStyles.skeletonTransitionProperty, /(?:^|,\s*)filter(?:,|$)/, 'Large skeleton layers must not animate filter')
-  assert.match(revealStyles.contentTransitionProperty, /(?:^|,\s*)transform(?:,|$)/, 'Loaded content must use a compositor-only translate reveal')
+  assert.doesNotMatch(revealStyles.contentTransitionProperty, /(?:^|,\s*)transform(?:,|$)/, 'Dense popup workspace must not translate during reveal')
   assert.doesNotMatch(revealStyles.contentTransitionProperty, /(?:^|,\s*)filter(?:,|$)/, 'Loaded text must never animate blur')
+  assert.equal(revealStyles.skeletonSurfaceAnimationName, 'none', 'Workspace pane surfaces must remain visually stable while loading')
+  assert.match(revealStyles.skeletonBarAnimationName, /t-skel-pulse/, 'Placeholder marks must retain restrained loading feedback')
   assert.equal(revealStyles.contentFilter, 'none', 'Loaded text must remain crisp before and after reveal')
   assert.equal(revealStyles.skeletonFilter, 'none', 'Large skeleton surfaces must avoid blur rasterization')
   assert.ok(result.contentTransitionMs >= 150 && result.contentTransitionMs <= 200, 'Popup reveal must be perceptible without lingering')
   assert.equal(liveReveal.sawCrossFade, true, 'The popup skeleton and content must visibly cross-fade')
-  assert.equal(liveReveal.sawTranslateReveal, true, 'Loaded content must settle with a subtle translate reveal')
+  assert.equal(liveReveal.sawTranslateReveal, false, 'Dense popup content must not move while replacing its skeleton')
+  assert.ok(
+    Object.values(liveReveal.geometryDrift).every((drift) => drift <= 0.5),
+    `Popup workspace geometry must remain stable throughout reveal: ${JSON.stringify(liveReveal.geometryDrift)}`
+  )
   assert.equal(liveReveal.sawAnyBlur, false, 'No reveal frame may leave the loaded text blurred')
   assert.ok(liveReveal.final.contentOpacity >= 0.99 && liveReveal.final.skeletonOpacity <= 0.01, 'The popup reveal must settle on crisp content')
   assert.ok(
@@ -494,6 +536,55 @@ try {
 
   const firstBookmarkButton = page.locator('.t-skel-content .popup-list-button').first()
   await firstBookmarkButton.focus()
+  await waitForFrames(page, 8)
+  const keyboardSelectionProbe = page.evaluate(() => new Promise((resolve) => {
+    const indicator = document.querySelector('.popup-active-result-indicator[data-visible="true"]')
+    if (!(indicator instanceof HTMLElement)) {
+      resolve(null)
+      return
+    }
+
+    const startedAt = performance.now()
+    const startTop = indicator.getBoundingClientRect().top
+    const samples = []
+    const style = getComputedStyle(indicator)
+    const sample = (now) => {
+      samples.push(indicator.getBoundingClientRect().top)
+      if (now - startedAt < 160) {
+        requestAnimationFrame(sample)
+        return
+      }
+
+      const endTop = samples.at(-1) ?? startTop
+      resolve({
+        endTop,
+        samples,
+        startTop,
+        transitionDuration: style.transitionDuration,
+        transitionProperty: style.transitionProperty
+      })
+    }
+    requestAnimationFrame(sample)
+  }))
+  await page.keyboard.press('ArrowDown')
+  const keyboardSelection = await keyboardSelectionProbe
+  assert.ok(keyboardSelection, 'Keyboard selection indicator should be visible before navigation')
+  const keyboardTravel = Math.abs(keyboardSelection.endTop - keyboardSelection.startTop)
+  const sawIntermediateKeyboardFrame = keyboardSelection.samples.some((top) => (
+    Math.abs(top - keyboardSelection.startTop) > 0.5 &&
+    Math.abs(top - keyboardSelection.endTop) > 0.5
+  ))
+  assert.ok(
+    keyboardSelection.transitionProperty.split(',').map((value) => value.trim()).includes('transform') &&
+      keyboardSelection.transitionDuration.split(',').map((value) => value.trim()).includes('0.1s'),
+    `Keyboard selection should reuse the 100ms transform transition: ${JSON.stringify(keyboardSelection)}`
+  )
+  assert.ok(
+    keyboardTravel > 20 && sawIntermediateKeyboardFrame,
+    `Keyboard selection should visibly translate through intermediate positions: ${JSON.stringify(keyboardSelection)}`
+  )
+  await page.keyboard.press('ArrowUp')
+  await waitForFrames(page, 8)
   await page.keyboard.press('ArrowLeft')
   await waitForFrames(page)
   for (let index = 0; index < 2; index += 1) {

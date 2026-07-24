@@ -306,6 +306,12 @@ assert.ok(
 )
 
 assert.ok(
+  controller.includes('restoreBookmarkFromRecycleEntryLazy(') &&
+    !controller.includes('removeRecycleEntryLazy('),
+  'New Tab undo must consume the recycle entry through the shared rollback-safe restore transaction.'
+)
+
+assert.ok(
   controller.includes('chrome.storage.onChanged.addListener(handleNewTabStorageChanged)') &&
     /changes\[STORAGE_KEYS\.aiProviderSettings\][\s\S]*?newTabNaturalSearchSettingsGeneration \+= 1[\s\S]*?abortNewTabNaturalSearchRequest\(\)[\s\S]*?naturalSearchSuggestionCache\.clear\(\)[\s\S]*?naturalSearchPlanCache\.clear\(\)[\s\S]*?refreshNewTabSearchSuggestionsAfterAiSettingsChange\?\.\(\)/.test(controller),
   'Changing the AI provider or reasoning effort should invalidate New Tab requests/caches and immediately rerun visible suggestions.'

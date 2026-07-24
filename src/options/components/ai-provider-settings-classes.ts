@@ -129,7 +129,7 @@ export const AI_PROVIDER_ADVANCED_CLASS =
   'mt-1 border-t border-ds-border-subtle pt-4'
 
 export const AI_PROVIDER_ADVANCED_TRIGGER_CLASS =
-  'ai-provider-advanced-trigger flex w-full cursor-pointer items-center justify-between gap-3 rounded-ds-sm px-1.5 py-1 text-[13px] font-semibold text-ds-text-muted transition-colors after:size-2 after:rotate-45 after:border-b after:border-r after:border-ds-text-secondary after:transition-transform data-[panel-open]:after:rotate-[225deg] hover:bg-ds-hover focus-visible:bg-ds-hover focus-visible:outline-none'
+  'ai-provider-advanced-trigger flex min-h-8 w-fit max-w-full cursor-pointer items-center justify-start gap-3 rounded-ds-sm px-2 py-1 text-[13px] font-semibold text-ds-text-muted transition-colors after:size-2 after:rotate-45 after:border-b after:border-r after:border-ds-text-secondary after:transition-transform data-[panel-open]:after:rotate-[225deg] hover:bg-ds-hover hover:text-ds-text-primary focus-visible:bg-ds-hover focus-visible:text-ds-text-primary focus-visible:outline-none'
 
 export const AI_PROVIDER_ADVANCED_PANEL_CLASS = 'mt-4 overflow-hidden'
 

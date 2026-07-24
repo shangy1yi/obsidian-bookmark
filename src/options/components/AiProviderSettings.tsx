@@ -327,6 +327,7 @@ export function AiProviderSettings({
                 busy={state.testingConnection}
                 label={state.testLabel}
                 reserveLabels={AI_PROVIDER_TEST_LABELS}
+                showLoader={false}
               />
             </Button>
             {state.showSaveSettingsButton ? (
@@ -396,6 +397,7 @@ function AiProviderModelToolsContent({
                 busy={modelTools.fetchingModels}
                 label={modelTools.fetchLabel}
                 reserveLabels={AI_PROVIDER_FETCH_LABELS}
+                showLoader={false}
               />
             </Button>
           </div>

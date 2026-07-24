@@ -66,7 +66,7 @@ export const OPTION_RUN_ACTION_BUTTON_CLASS =
   'max-[860px]:w-full'
 
 export const OPTION_ROW_CLASS = [
-  'curator-motion-row grid min-h-[66px] grid-cols-[minmax(0,1fr)_auto] items-center gap-[18px] p-[14px_16px]',
+  'grid min-h-[66px] grid-cols-[minmax(0,1fr)_auto] items-center gap-[18px] p-[14px_16px]',
   'border-ds-border-subtle bg-transparent',
   'max-[1180px]:grid-cols-1 max-[1180px]:items-start',
   'max-[760px]:gap-3 max-[760px]:p-4'

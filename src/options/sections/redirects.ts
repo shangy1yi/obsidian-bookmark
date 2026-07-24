@@ -1,7 +1,6 @@
 import { STORAGE_KEYS } from '../../shared/constants.js'
 import { setLocalStorage } from '../../shared/storage.js'
-import { getBookmarkTree, updateBookmark } from '../../shared/bookmarks-api.js'
-import { buildBookmarkCatalogSnapshot } from '../../shared/bookmark-catalog.js'
+import { getBookmarkById, updateBookmark } from '../../shared/bookmarks-api.js'
 import { createAutoBackupBeforeDangerousOperation } from '../../shared/backup.js'
 import { displayUrl } from '../../shared/text.js'
 import {
@@ -107,7 +106,10 @@ export function synchronizeRedirectResults() {
 function getCachedRedirectResults() {
   return managerState.redirectCache.results.flatMap((flatMapValue, flatMapIndex, flatMapArray) => { const mappedResult = ((cachedResult) => {
       const latestBookmark = availabilityState.bookmarkMap.get(String(cachedResult.id))
-      if (!latestBookmark) {
+      if (
+        !latestBookmark ||
+        String(latestBookmark.url || '') !== String(cachedResult.url || '')
+      ) {
         return null
       }
 
@@ -160,7 +162,7 @@ export async function persistRedirectCacheSnapshot(callbacks, {
     : callbacks.getCurrentAvailabilityScopeMeta()
 } = {}) {
   const scopeMeta = normalizeHistoryRunScope(scope)
-  managerState.redirectCache = {
+  const nextRedirectCache = {
     savedAt: Number(savedAt) || 0,
     scope: scopeMeta,
     results: availabilityState.redirectResults.flatMap((combineValue, combineIndex, combineArray) => { if (!((result) => {
@@ -180,7 +182,56 @@ export async function persistRedirectCacheSnapshot(callbacks, {
       }))(combineValue); return [combinedResult] })
   }
 
-  await saveRedirectCache()
+  await saveRedirectCache(nextRedirectCache)
+  managerState.redirectCache = nextRedirectCache
+}
+
+export async function mergeRetestedRedirectCache(
+  retestedResults,
+  { savedAt = managerState.redirectCache.savedAt || Date.now() } = {}
+) {
+  const normalizedScope = normalizeHistoryRunScope(managerState.redirectCache.scope)
+  const testedIds = new Set(
+    (Array.isArray(retestedResults) ? retestedResults : [])
+      .map((result) => String(result?.id || '').trim())
+      .filter(Boolean)
+  )
+  const retainedResults = managerState.redirectCache.results.filter((result) => {
+    return !testedIds.has(String(result.id))
+  })
+  const redirectedResults = normalizeRedirectCacheResults(
+    (Array.isArray(retestedResults) ? retestedResults : []).filter((result) => {
+      return (
+        result?.status === 'redirected' &&
+        isResultInsideScope(result, normalizedScope) &&
+        isRedirectedNavigation(result.url, result.finalUrl || result.url)
+      )
+    })
+  )
+  const mergedById = new Map(
+    [...retainedResults, ...redirectedResults].map((result) => [String(result.id), result])
+  )
+  const nextRedirectCache = {
+    savedAt: Number(savedAt) || Date.now(),
+    scope: normalizedScope,
+    results: [...mergedById.values()]
+  }
+
+  await saveRedirectCache(nextRedirectCache)
+  managerState.redirectCache = nextRedirectCache
+}
+
+function isResultInsideScope(result, scope): boolean {
+  if (scope.type !== 'folder' || !scope.folderId) {
+    return true
+  }
+
+  const folderId = String(scope.folderId)
+  return (
+    String(result?.parentId || '') === folderId ||
+    (Array.isArray(result?.ancestorIds) &&
+      result.ancestorIds.some((ancestorId) => String(ancestorId) === folderId))
+  )
 }
 
 export function removeRedirectIdsFromState(bookmarkIds) {
@@ -335,10 +386,20 @@ export async function deleteSelectedRedirects(callbacks) {
     return
   }
 
-  const targetIds = [...managerState.selectedRedirectIds]
+  const selectedIds = [...managerState.selectedRedirectIds]
+  const targetResults = getRedirectSectionState(callbacks).results.filter((result) => {
+    return selectedIds.includes(String(result.id))
+  })
+  const deleteCandidates = targetResults.map((result) => ({
+    id: String(result.id),
+    expectedUrl: String(result.url || '')
+  }))
+  if (!deleteCandidates.length) {
+    return
+  }
   const confirmed = callbacks.confirm
     ? await callbacks.confirm({
-        title: `删除 ${targetIds.length} 条重定向书签？`,
+        title: `删除 ${deleteCandidates.length} 条重定向书签？`,
         copy: '这些书签会从 Chrome 书签中移除并进入回收站。重定向缓存中的对应结果也会被清理。',
         confirmLabel: '删除并移入回收站',
         label: '移入回收站',
@@ -349,7 +410,7 @@ export async function deleteSelectedRedirects(callbacks) {
     return
   }
 
-  await deleteBookmarksToRecycle(targetIds, '重定向书签批量删除', callbacks.recycleCallbacks)
+  await deleteBookmarksToRecycle(deleteCandidates, '重定向书签批量删除', callbacks.recycleCallbacks)
   clearRedirectSelection(callbacks)
 }
 
@@ -359,10 +420,13 @@ export async function deleteAllRedirects(callbacks) {
     return
   }
 
-  const targetIds = results.map((result) => result.id)
+  const deleteCandidates = results.map((result) => ({
+    id: String(result.id),
+    expectedUrl: String(result.url || '')
+  }))
   const confirmed = callbacks.confirm
     ? await callbacks.confirm({
-        title: `删除本区全部 ${targetIds.length} 条重定向书签？`,
+        title: `删除本区全部 ${deleteCandidates.length} 条重定向书签？`,
         copy: '这些书签会从 Chrome 书签中移除并进入回收站。此操作只影响当前重定向更新区。',
         confirmLabel: '删除本区并移入回收站',
         label: '移入回收站',
@@ -373,17 +437,22 @@ export async function deleteAllRedirects(callbacks) {
     return
   }
 
-  await deleteBookmarksToRecycle(targetIds, '重定向书签整区删除', callbacks.recycleCallbacks)
+  await deleteBookmarksToRecycle(deleteCandidates, '重定向书签整区删除', callbacks.recycleCallbacks)
   clearRedirectSelection(callbacks)
 }
 
 async function updateRedirectEntries(bookmarkIds, callbacks) {
+  const releaseMutationLock = await callbacks.claimAvailabilityMutationLock?.()
+  if (!releaseMutationLock) {
+    return
+  }
   const redirectSection = getRedirectSectionState(callbacks)
   const targetResults = redirectSection.results.filter((result) => {
     return bookmarkIds.includes(String(result.id))
   })
 
   if (!targetResults.length) {
+    releaseMutationLock()
     return
   }
 
@@ -394,49 +463,65 @@ async function updateRedirectEntries(bookmarkIds, callbacks) {
   const updatedIds = []
   const skippedEntries = []
   let updateError = null
+  const reconciliationWarnings = []
 
   try {
-    const [, latestBookmarkMap] = await Promise.all([
-      createAutoBackupBeforeDangerousOperation({
-        kind: 'redirect-url-update',
-        source: 'options',
-        reason: `批量更新 ${targetResults.length} 条重定向 URL`,
-        targetBookmarkIds: targetResults.map((result) => String(result.id)),
-        estimatedChangeCount: targetResults.length
-      }),
-      getLatestBookmarkMap()
-    ])
-    await updateRedirectResultsSequentially(targetResults, latestBookmarkMap, skippedEntries, updatedIds)
+    await createAutoBackupBeforeDangerousOperation({
+      kind: 'redirect-url-update',
+      source: 'options',
+      reason: `批量更新 ${targetResults.length} 条重定向 URL`,
+      targetBookmarkIds: targetResults.map((result) => String(result.id)),
+      estimatedChangeCount: targetResults.length
+    })
+    await updateRedirectResultsSequentially(targetResults, skippedEntries, updatedIds)
   } catch (error) {
     updateError = error
   } finally {
-    availabilityState.deleting = false
-
     if (updatedIds.length) {
       removeRedirectIdsFromState(updatedIds)
-      await callbacks.hydrateAvailabilityCatalog({ preserveResults: true })
-      await saveRedirectCache()
+      try {
+        await callbacks.hydrateAvailabilityCatalog({ preserveResults: true })
+      } catch (error) {
+        reconciliationWarnings.push(
+          error instanceof Error ? `目录刷新失败：${error.message}` : '目录刷新失败'
+        )
+      }
+      try {
+        await saveRedirectCache()
+      } catch (error) {
+        reconciliationWarnings.push(
+          error instanceof Error ? `缓存保存失败：${error.message}` : '缓存保存失败'
+        )
+      }
     }
 
-    if (updateError) {
-      availabilityState.lastError =
-        updateError instanceof Error
-          ? `批量更新重定向过程中断，已更新 ${updatedIds.length} 条：${updateError.message}`
-          : `批量更新重定向过程中断，已更新 ${updatedIds.length} 条。`
-    } else if (updatedIds.length) {
-      const skippedCopy = skippedEntries.length
-        ? ` ${skippedEntries.length} 条因当前 URL 与检测时原 URL 不一致或书签已不存在而跳过。`
-        : ''
-      availabilityState.lastError = `已将 ${updatedIds.length} 条重定向书签更新为最终 URL。${skippedCopy}`.trim()
-    } else if (skippedEntries.length) {
-      availabilityState.lastError = `${skippedEntries.length} 条重定向结果已跳过：${skippedEntries[0].reason}`
-    }
+    try {
+      if (updateError) {
+        availabilityState.lastError =
+          updateError instanceof Error
+            ? `批量更新重定向过程中断，已更新 ${updatedIds.length} 条：${updateError.message}`
+            : `批量更新重定向过程中断，已更新 ${updatedIds.length} 条。`
+      } else if (updatedIds.length) {
+        const skippedCopy = skippedEntries.length
+          ? ` ${skippedEntries.length} 条因当前 URL 与检测时原 URL 不一致或书签已不存在而跳过。`
+          : ''
+        availabilityState.lastError = `已将 ${updatedIds.length} 条重定向书签更新为最终 URL。${skippedCopy}`.trim()
+      } else if (skippedEntries.length) {
+        availabilityState.lastError = `${skippedEntries.length} 条重定向结果已跳过：${skippedEntries[0].reason}`
+      }
 
-    callbacks.renderAvailabilitySection()
+      if (reconciliationWarnings.length) {
+        availabilityState.lastError = `${availabilityState.lastError || `已更新 ${updatedIds.length} 条书签。`} 但本地状态同步未完全成功：${reconciliationWarnings.join('；')}。`
+      }
+    } finally {
+      availabilityState.deleting = false
+      releaseMutationLock()
+      callbacks.renderAvailabilitySection()
+    }
   }
 }
 
-function updateRedirectResultsSequentially(targetResults, latestBookmarkMap, skippedEntries, updatedIds) {
+function updateRedirectResultsSequentially(targetResults, skippedEntries, updatedIds) {
   return targetResults.reduce((chain, result) => {
     return chain.then(async () => {
       const finalUrl = String(result.finalUrl || '').trim()
@@ -448,7 +533,7 @@ function updateRedirectResultsSequentially(targetResults, latestBookmarkMap, ski
         return
       }
 
-      const latestBookmark = latestBookmarkMap.get(String(result.id))
+      const latestBookmark = await getBookmarkById(String(result.id))
       if (!latestBookmark?.url) {
         skippedEntries.push({
           id: result.id,
@@ -469,13 +554,6 @@ function updateRedirectResultsSequentially(targetResults, latestBookmarkMap, ski
       updatedIds.push(result.id)
     })
   }, Promise.resolve())
-}
-
-async function getLatestBookmarkMap() {
-  const tree = await getBookmarkTree()
-  const rootNode = Array.isArray(tree) ? tree[0] : tree
-  const bookmarks = buildBookmarkCatalogSnapshot({ rootNode }).extracted.bookmarks
-  return new Map(bookmarks.map((bookmark) => [String(bookmark.id), bookmark]))
 }
 
 function getRedirectPageResults(results) {

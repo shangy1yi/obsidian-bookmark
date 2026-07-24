@@ -3,6 +3,7 @@
   "name": "Curator",
   "description": "本地优先的 Chrome 书签搜索、整理、清理与新标签页扩展。",
   "version": "1.5.2",
+  "minimum_chrome_version": "149",
   "icons": {
     "16": "src/assets/icon16.png",
     "32": "src/assets/icon32.png",
@@ -13,6 +14,8 @@
     "activeTab",
     "alarms",
     "bookmarks",
+    "declarativeNetRequest",
+    "dns",
     "favicon",
     "notifications",
     "storage",

@@ -11,6 +11,7 @@ export interface AiAnalysisProgressState {
   busy: boolean
   progressCopy: string
   progressLabel: string
+  progressMax: number
   progressValue: number
 }
 
@@ -34,9 +35,6 @@ export interface AiAnalysisDecisionMetricsState {
   suggested: string
   manualReview: string
   unchanged: string
-  highConfidence: string
-  mediumConfidence: string
-  lowConfidence: string
   failed: string
 }
 
@@ -60,7 +58,6 @@ export interface AiAnalysisResultsHeaderState {
 
 export interface AiAnalysisResultsFilterState {
   clearDisabled: boolean
-  confidence: string
   query: string
   status: string
 }
@@ -91,6 +88,7 @@ const defaultProgressState: AiAnalysisProgressState = {
   busy: false,
   progressCopy: '先读取网页内容，再分批生成建议。',
   progressLabel: '未开始',
+  progressMax: 1,
   progressValue: 0
 }
 
@@ -114,9 +112,6 @@ const defaultDecisionMetricsState: AiAnalysisDecisionMetricsState = {
   suggested: '0',
   manualReview: '0',
   unchanged: '0',
-  highConfidence: '0',
-  mediumConfidence: '0',
-  lowConfidence: '0',
   failed: '0'
 }
 
@@ -140,7 +135,6 @@ const defaultResultsHeaderState: AiAnalysisResultsHeaderState = {
 
 const defaultResultsFilterState: AiAnalysisResultsFilterState = {
   clearDisabled: true,
-  confidence: 'all',
   query: '',
   status: 'all'
 }

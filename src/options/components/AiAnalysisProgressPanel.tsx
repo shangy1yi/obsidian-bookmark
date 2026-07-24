@@ -8,8 +8,8 @@ import {
 import { OPTION_VALUE_CLASS } from './option-layout-classes.js'
 
 const OPTIONS_PROGRESS_TRACK_CLASS =
-  'mt-[14px] h-[7px] rounded-ds-sm border border-ds-border-subtle bg-ds-surface-2'
-const OPTIONS_PROGRESS_BAR_CLASS = 'rounded-ds-sm bg-ds-accent-hover'
+  'mt-[14px] h-2 rounded-full bg-ds-surface-2 ring-1 ring-inset ring-ds-border-subtle'
+const OPTIONS_PROGRESS_BAR_CLASS = 'rounded-full bg-ds-accent-hover'
 const AI_ANALYSIS_DECISION_PANEL_CLASS =
   'mt-[18px] border-ds-border-subtle bg-ds-surface-1'
 const AI_ANALYSIS_PROGRESS_COPY_CLASS =
@@ -47,6 +47,10 @@ export function AiAnalysisProgressPanel({ children }: { children: ReactNode }) {
       title={title}
       description={description}
       progress={state.progressValue}
+      progressAriaLabel="书签智能分析进度"
+      progressMax={state.progressMax}
+      progressDivisions={state.progressMax}
+      progressValueText={state.progressLabel}
       progressClassName={OPTIONS_PROGRESS_TRACK_CLASS}
       progressIndicatorClassName={OPTIONS_PROGRESS_BAR_CLASS}
       statusNode={statusNode}

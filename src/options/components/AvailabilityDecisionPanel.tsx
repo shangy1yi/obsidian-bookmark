@@ -28,11 +28,23 @@ const AVAILABILITY_PROGRESS_COPY_CLASS =
 
 export function AvailabilityDecisionPanel({ children }: { children: ReactNode }) {
   const state = useAvailabilityProgress()
-  const hasRunSignal = state.busy || state.durationLabel !== '未开始' || state.progressValue > 0
+  const hasMeaningfulStatus = Boolean(
+    state.statusCopy &&
+    state.statusCopy !== '仅检测适合外部访问的 http/https 书签；敏感地址会自动跳过。'
+  )
+  const hasRunSignal =
+    state.busy ||
+    state.durationLabel !== '未开始' ||
+    state.progressValue > 0 ||
+    hasMeaningfulStatus
   const emptyEntered = useMotionEntrance(!hasRunSignal)
 
   return (
-    <div className={AVAILABILITY_DECISION_PANEL_CLASS} aria-label="可用性检测决策概览">
+    <div
+      className={AVAILABILITY_DECISION_PANEL_CLASS}
+      aria-busy={state.busy}
+      aria-label="可用性检测决策概览"
+    >
       <div className={AVAILABILITY_DECISION_HEADER_CLASS}>
         <div className={AVAILABILITY_DECISION_HEADER_COPY_CLASS}>
           <strong className={AVAILABILITY_DECISION_TITLE_CLASS}>检测概览</strong>
@@ -54,13 +66,28 @@ export function AvailabilityDecisionPanel({ children }: { children: ReactNode })
               </strong>
             </div>
             <div>
-              <div className={AVAILABILITY_PROGRESS_TRACK_CLASS} aria-hidden="true">
+              <div
+                className={AVAILABILITY_PROGRESS_TRACK_CLASS}
+                aria-label="可用性检测进度"
+                aria-valuemax={100}
+                aria-valuemin={0}
+                aria-valuenow={Math.max(0, Math.min(state.progressValue, 100))}
+                role="progressbar"
+              >
                 <span
+                  aria-hidden="true"
                   className={AVAILABILITY_PROGRESS_BAR_CLASS}
                   style={{ transform: `scaleX(${Math.max(0, Math.min(state.progressValue, 100)) / 100})` }}
                 />
               </div>
-              <p className={AVAILABILITY_PROGRESS_COPY_CLASS}>{state.statusCopy}</p>
+              <p
+                className={AVAILABILITY_PROGRESS_COPY_CLASS}
+                aria-atomic="true"
+                aria-live="polite"
+                role="status"
+              >
+                {state.statusCopy}
+              </p>
             </div>
           </div>
           {children}

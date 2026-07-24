@@ -19,8 +19,15 @@ assert(
   !/transition:\s*[\s\S]*\bwidth\b/.test(indicatorRule) &&
     !/transition:\s*[\s\S]*\bheight\b/.test(indicatorRule) &&
     !/will-change:\s*[^;]*\bwidth\b/.test(indicatorRule) &&
-    !/will-change:\s*[^;]*\bheight\b/.test(indicatorRule),
+    !/will-change:\s*[^;]*\bheight\b/.test(indicatorRule) &&
+    /transform\s+var\(--ds-motion-feedback\)\s+var\(--ease-smooth-out\)/.test(indicatorRule),
   'Active result indicator size should follow active-row resize directly instead of double-easing width or height.'
+)
+
+const hiddenIndicatorRule = getCssRule('.popup-active-result-indicator:not([data-visible="true"])')
+assert(
+  !/\btransform\b/.test(hiddenIndicatorRule),
+  'A hidden indicator should snap to its measured destination before fading in.'
 )
 
 const activeButtonRule = getCssRule('.popup-list-button[data-active="true"]')
@@ -29,10 +36,9 @@ assert(
   'Active row background should come from the moving indicator layer, not the row button.'
 )
 
-const keyboardIndicatorRule = getCssRule('#popup-app-shell[data-keyboard-nav="true"] .popup-active-result-indicator')
 assert(
-  /transform\s+1ms\s+var\(--popup-keyboard-selection-ease\)/.test(keyboardIndicatorRule),
-  'Repeated keyboard navigation should snap indicator position instead of easing behind the active row.'
+  !css.includes('#popup-app-shell[data-keyboard-nav="true"] .popup-active-result-indicator'),
+  'Keyboard navigation should reuse the same short, interruptible indicator translation as pointer input.'
 )
 
 assert(

@@ -57,6 +57,28 @@ export async function replaceCuratorDataStore<T extends object>(
   })
 }
 
+export async function replaceCuratorDataStoreWithMeta<T extends object>(
+  storeName: CuratorDataStoreName,
+  records: T[],
+  meta: CuratorDataStoreMeta
+): Promise<void> {
+  const keyPath = STORE_KEY_PATHS[storeName]
+  await runCuratorDataMultiStoreTransaction(
+    [storeName, CURATOR_DATA_STORES.metadata],
+    (stores) => {
+      const dataStore = stores[storeName]
+      dataStore.clear()
+      for (const record of records) {
+        const source = record as Record<string, unknown>
+        if (record && String(source[keyPath] || '').trim()) {
+          dataStore.put(record)
+        }
+      }
+      stores[CURATOR_DATA_STORES.metadata].put(meta)
+    }
+  )
+}
+
 export async function applyCuratorDataStoreDelta<T extends object>(
   storeName: CuratorDataStoreName,
   upserts: T[],
@@ -77,6 +99,34 @@ export async function applyCuratorDataStoreDelta<T extends object>(
       }
     }
   })
+}
+
+export async function applyCuratorDataStoreDeltaWithMeta<T extends object>(
+  storeName: CuratorDataStoreName,
+  upserts: T[],
+  deletedKeys: string[],
+  meta: CuratorDataStoreMeta
+): Promise<void> {
+  const keyPath = STORE_KEY_PATHS[storeName]
+  await runCuratorDataMultiStoreTransaction(
+    [storeName, CURATOR_DATA_STORES.metadata],
+    (stores) => {
+      const dataStore = stores[storeName]
+      for (const record of upserts) {
+        const source = record as Record<string, unknown>
+        if (record && String(source[keyPath] || '').trim()) {
+          dataStore.put(record)
+        }
+      }
+      for (const key of deletedKeys) {
+        const normalizedKey = String(key || '').trim()
+        if (normalizedKey) {
+          dataStore.delete(normalizedKey)
+        }
+      }
+      stores[CURATOR_DATA_STORES.metadata].put(meta)
+    }
+  )
 }
 
 export async function clearCuratorDataStore(storeName: CuratorDataStoreName): Promise<void> {
@@ -162,6 +212,37 @@ function runCuratorDataTransaction(
       try {
         run(store)
       } catch (error) {
+        reject(error)
+        return
+      }
+      transaction.addEventListener('complete', () => resolve())
+      transaction.addEventListener('error', () => {
+        reject(transaction.error || new Error('数据仓库写入失败。'))
+      })
+      transaction.addEventListener('abort', () => {
+        reject(transaction.error || new Error('数据仓库写入中断。'))
+      })
+    })
+  )
+}
+
+function runCuratorDataMultiStoreTransaction(
+  storeNames: CuratorDataStoreName[],
+  run: (stores: Record<CuratorDataStoreName, IDBObjectStore>) => void
+): Promise<void> {
+  return openCuratorDataDb().then((db) =>
+    new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(storeNames, 'readwrite')
+      const stores = Object.fromEntries(
+        storeNames.map((storeName) => [
+          storeName,
+          transaction.objectStore(storeName)
+        ])
+      ) as Record<CuratorDataStoreName, IDBObjectStore>
+      try {
+        run(stores)
+      } catch (error) {
+        transaction.abort()
         reject(error)
         return
       }

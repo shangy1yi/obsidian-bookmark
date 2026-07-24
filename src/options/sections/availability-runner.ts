@@ -3,6 +3,7 @@ import {
   NAVIGATION_RETRY_TIMEOUT_MS,
   NAVIGATION_TIMEOUT_MS
 } from '../shared-options/constants.js'
+import { AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT } from '../../shared/messages.js'
 import { FETCH_TIMEOUT_MS } from './classifier.js'
 
 export type AvailabilitySpeedProfileName = 'balanced'
@@ -61,13 +62,30 @@ interface AvailabilityRunLease {
   release: () => void
 }
 
+export type AvailabilityRunnerWait = (
+  ms: number,
+  signal?: AbortSignal | null
+) => Promise<void>
+
+export interface AvailabilityCooldownWaitOptions {
+  signal?: AbortSignal | null
+  shouldContinue?: () => boolean | Promise<boolean>
+  wait?: AvailabilityRunnerWait
+  onWait?: (snapshot: AvailabilityRunnerSnapshot) => void
+}
+
 export interface AvailabilityRunScheduler {
   getProfile: () => AvailabilitySpeedProfile
   getConcurrency: () => number
   getTimeoutPolicy: (_url?: unknown) => AvailabilityTimeoutPolicy
+  getCooldownDelay: (url: unknown) => number
   getAcquireDelay: (url: unknown) => number
   tryAcquire: (url: unknown) => AvailabilityRunLease | null
   recordOutcome: (url: unknown, outcome?: AvailabilityRunOutcome | null) => void
+  waitForCooldown: (
+    url: unknown,
+    options?: AvailabilityCooldownWaitOptions
+  ) => Promise<boolean>
   getSnapshot: () => AvailabilityRunnerSnapshot
 }
 
@@ -124,7 +142,12 @@ export function normalizeAvailabilityRunnerUserSettings(
     : {}
 
   return {
-    concurrency: clampInteger(source.concurrency, 1, 6, BALANCED_PROFILE.concurrency),
+    concurrency: clampInteger(
+      source.concurrency,
+      1,
+      AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT,
+      BALANCED_PROFILE.concurrency
+    ),
     navigationTimeoutMs: clampInteger(
       source.navigationTimeoutMs,
       5000,
@@ -165,7 +188,12 @@ function normalizeAvailabilitySpeedProfile(
   return {
     name: source.name === 'balanced' ? source.name : 'balanced',
     label: String(source.label || BALANCED_PROFILE.label),
-    concurrency: clampInteger(source.concurrency, 1, 6, BALANCED_PROFILE.concurrency),
+    concurrency: clampInteger(
+      source.concurrency,
+      1,
+      AVAILABILITY_NAVIGATION_CONCURRENCY_LIMIT,
+      BALANCED_PROFILE.concurrency
+    ),
     domainConcurrency: clampInteger(source.domainConcurrency, 1, 3, BALANCED_PROFILE.domainConcurrency),
     navigationTimeoutMs: clampInteger(source.navigationTimeoutMs, 5000, 120000, BALANCED_PROFILE.navigationTimeoutMs),
     retryNavigationTimeoutMs: clampInteger(
@@ -215,6 +243,11 @@ export function createAvailabilityRunScheduler(
       return profile.pollIntervalMs
     }
 
+    return getCooldownDelay(url)
+  }
+
+  function getCooldownDelay(url: unknown): number {
+    const state = getOrCreateDomainState(url)
     return Math.max(0, state.cooldownUntil - now())
   }
 
@@ -302,6 +335,40 @@ export function createAvailabilityRunScheduler(
     }
   }
 
+  async function waitForCooldown(
+    url: unknown,
+    {
+      signal = null,
+      shouldContinue,
+      wait = waitForAvailabilityRunnerDelay,
+      onWait
+    }: AvailabilityCooldownWaitOptions = {}
+  ): Promise<boolean> {
+    while (true) {
+      if (signal?.aborted) {
+        return false
+      }
+      if (shouldContinue && !(await shouldContinue())) {
+        return false
+      }
+
+      const delayMs = getCooldownDelay(url)
+      if (delayMs <= 0) {
+        return true
+      }
+
+      onWait?.(getSnapshot())
+      try {
+        await wait(delayMs, signal)
+      } catch (error) {
+        if (signal?.aborted || isAbortError(error)) {
+          return false
+        }
+        throw error
+      }
+    }
+  }
+
   return {
     getProfile: () => profile,
     getConcurrency: () => profile.concurrency,
@@ -310,9 +377,11 @@ export function createAvailabilityRunScheduler(
       retryNavigationTimeoutMs: profile.retryNavigationTimeoutMs,
       probeTimeoutMs: profile.probeTimeoutMs
     }),
+    getCooldownDelay,
     getAcquireDelay,
     tryAcquire,
     recordOutcome,
+    waitForCooldown,
     getSnapshot
   }
 }
@@ -332,29 +401,29 @@ export async function runAvailabilityQueue<TItem>({
   const workerCount = Math.min(scheduler.getConcurrency(), pendingEntries.length)
 
   async function worker(): Promise<void> {
-    if (!pendingEntries.length) {
-      return
-    }
-    if (shouldContinue && !(await shouldContinue())) {
-      return
-    }
+    while (pendingEntries.length) {
+      if (shouldContinue && !(await shouldContinue())) {
+        return
+      }
 
-    const nextEntry = takeNextQueueEntry(pendingEntries, scheduler, getUrl, shouldSkip)
-    if (!nextEntry) {
-      onWait?.(scheduler.getSnapshot())
-      await wait(getNextQueueDelay(pendingEntries, scheduler, getUrl))
-      await worker()
-      return
-    }
+      const nextEntry = takeNextQueueEntry(pendingEntries, scheduler, getUrl, shouldSkip)
+      if (!nextEntry) {
+        if (!pendingEntries.length) {
+          return
+        }
+        onWait?.(scheduler.getSnapshot())
+        await wait(getNextQueueDelay(pendingEntries, scheduler, getUrl))
+        continue
+      }
 
-    const { item, index, lease } = nextEntry
-    try {
-      await processItem(item, { index, scheduler })
-    } finally {
-      lease.release()
-      onItemSettled?.(item, index)
+      const { item, index, lease } = nextEntry
+      try {
+        await processItem(item, { index, scheduler })
+      } finally {
+        lease.release()
+        onItemSettled?.(item, index)
+      }
     }
-    await worker()
   }
 
   await Promise.all(Array.from({ length: workerCount }, () => worker()))
@@ -463,8 +532,44 @@ function formatSeconds(ms: number): string {
   return `${Math.max(1, Math.round(ms / 1000))}s`
 }
 
-function waitForAvailabilityRunnerDelay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, Math.max(1, Math.round(ms)))
+function waitForAvailabilityRunnerDelay(
+  ms: number,
+  signal: AbortSignal | null = null
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(createAbortError())
+      return
+    }
+
+    const timeoutId = setTimeout(() => {
+      signal?.removeEventListener('abort', handleAbort)
+      resolve()
+    }, Math.max(1, Math.round(ms)))
+    const handleAbort = () => {
+      clearTimeout(timeoutId)
+      signal?.removeEventListener('abort', handleAbort)
+      reject(createAbortError())
+    }
+    signal?.addEventListener('abort', handleAbort, { once: true })
   })
+}
+
+function isAbortError(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'name' in error &&
+    error.name === 'AbortError'
+  )
+}
+
+function createAbortError(): Error | DOMException {
+  if (typeof DOMException === 'function') {
+    return new DOMException('操作已取消。', 'AbortError')
+  }
+
+  const error = new Error('操作已取消。')
+  error.name = 'AbortError'
+  return error
 }
