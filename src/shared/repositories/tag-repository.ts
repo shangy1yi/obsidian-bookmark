@@ -115,15 +115,81 @@ export async function updateBookmarkTagIndexInRepository(
     const delta = diffBookmarkTagIndexes(current, nextIndex)
     if (delta.replaceAll) {
       await replaceBookmarkTagIndexInIndexedDb(nextIndex)
+      await compactBookmarkTagIndexLocalStorage(nextIndex, transaction).catch(() => {})
     } else {
-      await applyCuratorDataStoreDeltaWithMeta(
+      const committedMeta = await applyCuratorDataStoreDeltaWithMeta(
         CURATOR_DATA_STORES.bookmarkTags,
         delta.upserts,
         delta.deletedIds,
         buildBookmarkTagRepositoryMeta(nextIndex)
       )
+      await compactBookmarkTagIndexLocalStorageWithMeta(committedMeta, transaction).catch(() => {})
     }
-    await compactBookmarkTagIndexLocalStorage(nextIndex, transaction).catch(() => {})
+  } catch {
+    await writeBookmarkTagIndexToLocalStorage(nextIndex, transaction)
+  }
+  return nextIndex
+}
+
+export async function applyBookmarkTagRecordsDeltaInRepository(
+  current: BookmarkTagIndex,
+  {
+    upserts,
+    deletedIds = [],
+    updatedAt = Date.now()
+  }: {
+    upserts: BookmarkTagRecord[]
+    deletedIds?: string[]
+    updatedAt?: number
+  },
+  transaction?: LocalStorageTransaction
+): Promise<BookmarkTagIndex> {
+  const { normalizeIndex, normalizeRecord } = requireBookmarkTagRepositoryNormalizers()
+  const normalizedCurrent = normalizeIndex(current)
+  const normalizedUpserts = dedupeBookmarkTagRecords(
+    upserts.flatMap((record) => {
+      const normalized = normalizeRecord(record)
+      return normalized ? [normalized] : []
+    })
+  )
+  const upsertIds = new Set(normalizedUpserts.map((record) => record.bookmarkId))
+  const normalizedDeletedIds = Array.from(new Set(
+    deletedIds
+      .map((id) => String(id || '').trim())
+      .filter((id) => id && !upsertIds.has(id))
+  ))
+  if (!normalizedUpserts.length && !normalizedDeletedIds.length) {
+    return normalizedCurrent
+  }
+  const nextRecords = { ...normalizedCurrent.records }
+  for (const id of normalizedDeletedIds) {
+    delete nextRecords[id]
+  }
+  for (const record of normalizedUpserts) {
+    nextRecords[record.bookmarkId] = record
+  }
+  const nextIndex = normalizeIndex({
+    version: 1,
+    updatedAt: Math.max(
+      Number(updatedAt) || 0,
+      (Number(normalizedCurrent.updatedAt) || 0) + 1
+    ),
+    records: nextRecords
+  })
+
+  if (!isCuratorDataDbAvailable()) {
+    await writeBookmarkTagIndexToLocalStorage(nextIndex, transaction)
+    return nextIndex
+  }
+
+  try {
+    const committedMeta = await applyCuratorDataStoreDeltaWithMeta(
+      CURATOR_DATA_STORES.bookmarkTags,
+      normalizedUpserts,
+      normalizedDeletedIds,
+      buildBookmarkTagRepositoryMeta(nextIndex)
+    )
+    await compactBookmarkTagIndexLocalStorageWithMeta(committedMeta, transaction).catch(() => {})
   } catch {
     await writeBookmarkTagIndexToLocalStorage(nextIndex, transaction)
   }
@@ -214,14 +280,27 @@ async function compactBookmarkTagIndexLocalStorage(
   index: BookmarkTagIndex,
   transaction?: LocalStorageTransaction
 ): Promise<void> {
+  await compactBookmarkTagIndexLocalStorageWithMeta(
+    buildBookmarkTagRepositoryMeta(index),
+    transaction
+  )
+}
+
+async function compactBookmarkTagIndexLocalStorageWithMeta(
+  meta: {
+    updatedAt: number
+    recordCount: number
+  },
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   await setLocalStorage({
     [STORAGE_KEYS.bookmarkTagIndex]: {
       version: 1,
-      updatedAt: Number(index.updatedAt) || 0,
+      updatedAt: Number(meta.updatedAt) || 0,
       records: {},
       migratedTo: 'indexedDB',
       repository: BOOKMARK_TAG_REPOSITORY_META_KEY,
-      recordCount: Object.keys(index.records || {}).length,
+      recordCount: Number(meta.recordCount) || 0,
       compactedAt: Date.now()
     }
   }, { transaction })
@@ -290,6 +369,14 @@ function areBookmarkTagRecordsEquivalent(
     left.source === right.source &&
     left.tags.length === right.tags.length &&
     left.manualTags?.length === right.manualTags?.length
+}
+
+function dedupeBookmarkTagRecords(records: BookmarkTagRecord[]): BookmarkTagRecord[] {
+  const recordsByBookmarkId = new Map<string, BookmarkTagRecord>()
+  for (const record of records) {
+    recordsByBookmarkId.set(record.bookmarkId, record)
+  }
+  return Array.from(recordsByBookmarkId.values())
 }
 
 function requireBookmarkTagRepositoryNormalizers(): BookmarkTagRepositoryNormalizers {

@@ -45,6 +45,7 @@ import {
   upsertBookmarkTagFromAnalysis
 } from '../shared/bookmark-tags.js'
 import {
+  AiRuntimeError,
   buildAiFolderCandidates,
   requestStructuredAiOutput,
   toAiFolderCandidatePayload,
@@ -193,6 +194,15 @@ interface AutoAnalyzeQueueEntry {
   lastError: string
 }
 
+type AutoAnalyzeEnqueueResult =
+  | { accepted: true; replacedExisting: boolean }
+  | { accepted: false; reason: 'queue-full'; error: string }
+
+interface AutoAnalyzeFailureDisposition {
+  attempts: number
+  willRetry: boolean
+}
+
 interface AutoAnalyzeTreeContext {
   rootNode: chrome.bookmarks.BookmarkTreeNode | null
   extracted: ReturnType<typeof extractBookmarkData>
@@ -255,6 +265,9 @@ const AUTO_CLASSIFY_SUPPRESS_MS = 10000
 const SUPPRESSED_AUTO_BOOKMARK_URL_LIMIT = 80
 const AUTO_CLASSIFY_DELAY_MS = 900
 const AUTO_CLASSIFY_FOLDER_LIMIT = 260
+const AUTO_CLASSIFY_MUTATION_MIN_CONFIDENCE = 0.72
+const AUTO_CLASSIFY_MUTATION_MIN_CONTENT_LENGTH = 420
+const AUTO_PAGE_RESPONSE_MAX_BYTES = 3 * 1024 * 1024
 const AUTO_ANALYZE_QUEUE_ALARM = 'curator-auto-analyze-queue'
 const AUTO_ANALYZE_STATUS_CLEAR_ALARM = 'curator-auto-analyze-status-clear'
 const COMMAND_FEEDBACK_BADGE_CLEAR_ALARM = 'curator-command-feedback-badge-clear'
@@ -263,6 +276,7 @@ const AUTO_ANALYZE_QUEUE_LIMIT = 50
 const AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS = 3
 const AUTO_ANALYZE_QUEUE_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const AUTO_ANALYZE_QUEUE_RETRY_MS = 45000
+const AUTO_ANALYZE_QUEUE_WATCHDOG_MS = 30000
 const COMMAND_OPEN_SEARCH = 'curator-open-search'
 const COMMAND_OPEN_SMART_CLASSIFIER = 'curator-open-smart-classifier'
 const COMMAND_TOGGLE_AUTO_ANALYZE = 'curator-toggle-auto-analyze'
@@ -386,12 +400,18 @@ chrome.notifications?.onButtonClicked.addListener((notificationId, buttonIndex) 
 
 chrome.runtime.onInstalled.addListener(() => {
   void removeLocalStorage('curatorBookmarkDashboardFaviconCache').catch(() => {})
+  resumeAutoAnalyzeQueue()
+})
+
+chrome.runtime.onStartup.addListener(() => {
+  resumeAutoAnalyzeQueue()
 })
 
 restoreAutoAnalyzeStatusBadge().catch((error) => {
   console.warn('[Curator] 自动分析状态徽标恢复失败', error)
 })
 scheduleAutoAnalyzeQueueProcessing(0)
+scheduleAutoAnalyzeQueueAlarm(AUTO_ANALYZE_QUEUE_WATCHDOG_MS)
 let backupRestoreRecoveryError: Error | null = null
 const backupRestoreRecoveryReady = runBackupRestoreRecovery().catch(() => {})
 
@@ -609,9 +629,34 @@ async function runBackupRestoreRecovery(): Promise<void> {
 function withAvailabilityRestoreMutationLock<T>(
   task: () => Promise<T>
 ): Promise<T> {
+  return withAvailabilityMutationLock(task, {
+    unavailableMessage: '当前浏览器无法锁定可用性数据，已取消恢复。',
+    busyMessage: '可用性数据正在被其他页面使用，已取消恢复。'
+  })
+}
+
+function withAvailabilityAutoAnalysisMutationLock<T>(
+  task: () => Promise<T>
+): Promise<T> {
+  return withAvailabilityMutationLock(task, {
+    unavailableMessage: '当前浏览器无法锁定书签数据，已延后自动分析。',
+    busyMessage: '另一个 Curator 页面正在分析或修改书签，已延后自动分析。'
+  })
+}
+
+function withAvailabilityMutationLock<T>(
+  task: () => Promise<T>,
+  {
+    unavailableMessage,
+    busyMessage
+  }: {
+    unavailableMessage: string
+    busyMessage: string
+  }
+): Promise<T> {
   const lockManager = globalThis.navigator?.locks
   if (!lockManager) {
-    throw new Error('当前浏览器无法锁定可用性数据，已取消恢复。')
+    throw new Error(unavailableMessage)
   }
 
   return lockManager.request(
@@ -622,7 +667,7 @@ function withAvailabilityRestoreMutationLock<T>(
     },
     async (lock) => {
       if (!lock) {
-        const error = new Error('可用性数据正在被其他页面使用，已取消恢复。')
+        const error = new Error(busyMessage)
         Object.assign(error, { code: 'availability-busy' })
         throw error
       }
@@ -756,11 +801,39 @@ async function captureCurrentTabToInbox(sourceCommand: string): Promise<void> {
     loadAutoAnalyzeSettings()
   ])
   if (hasUsableAiSettings(autoSettings)) {
-    await enqueueAutoAnalyzeBookmark({
+    const enqueueResult = await enqueueAutoAnalyzeBookmark({
       bookmarkId,
       url,
       title
     })
+    if (enqueueResult.accepted === false) {
+      await Promise.all([
+        updateInboxItem(bookmarkId, {
+          status: 'failed',
+          lastError: enqueueResult.error
+        }).catch(() => {}),
+        persistAutoAnalyzeStatus({
+          status: 'failed',
+          bookmarkId,
+          url,
+          title,
+          error: enqueueResult.error,
+          attempts: 0,
+          maxAttempts: 0,
+          createdAt: now,
+          detail: '已保存到 Inbox / 待整理，但自动分析队列已满，本次未加入队列。'
+        }).catch((error) => {
+          console.warn('[Curator] Inbox 自动分析队列已满状态写入失败', error)
+        }),
+        showTransientCommandBadge('!', '#5f3432'),
+        showInboxNotification({
+          notificationId: `${INBOX_CAPTURE_NOTIFICATION_PREFIX}${bookmarkId}`,
+          title: '已保存，自动分析未排队',
+          message: enqueueResult.error
+        })
+      ])
+      return
+    }
     scheduleAutoAnalyzeQueueProcessing(AUTO_CLASSIFY_DELAY_MS)
     scheduleAutoAnalyzeQueueAlarm(AUTO_CLASSIFY_DELAY_MS)
     await Promise.all([
@@ -942,6 +1015,7 @@ function scheduleCommandFeedbackBadgeClear(): void {
 }
 
 chrome.bookmarks.onCreated.addListener((bookmarkId, node) => {
+  invalidateAutoAnalyzeTreeContext()
   if (!node.url || !/^https?:\/\//i.test(node.url)) {
     return
   }
@@ -950,12 +1024,21 @@ chrome.bookmarks.onCreated.addListener((bookmarkId, node) => {
 })
 
 chrome.bookmarks.onRemoved.addListener((bookmarkId) => {
+  invalidateAutoAnalyzeTreeContext()
   removeBookmarkTagRecord(bookmarkId).catch((error) => {
     console.warn('[Curator] 标签记录清理失败', error)
   })
   removeContentSnapshotForBookmark(bookmarkId).catch((error) => {
     console.warn('[Curator] 网页快照清理失败', error)
   })
+})
+
+chrome.bookmarks.onChanged.addListener(() => {
+  invalidateAutoAnalyzeTreeContext()
+})
+
+chrome.bookmarks.onMoved.addListener(() => {
+  invalidateAutoAnalyzeTreeContext()
 })
 
 chrome.webNavigation.onCommitted.addListener((details) => {
@@ -1102,11 +1185,33 @@ async function handleBookmarkCreatedForAutoAnalysis(
     return
   }
 
-  await enqueueAutoAnalyzeBookmark({
+  const enqueueResult = await enqueueAutoAnalyzeBookmark({
     bookmarkId,
     url: initialUrl,
     title: String(node.title || '').trim()
   })
+  if (enqueueResult.accepted === false) {
+    await Promise.all([
+      updateInboxItem(bookmarkId, {
+        status: 'failed',
+        lastError: enqueueResult.error
+      }).catch(() => {}),
+      persistAutoAnalyzeStatus({
+        status: 'failed',
+        bookmarkId,
+        url: initialUrl,
+        title: String(node.title || '').trim() || '新增书签',
+        error: enqueueResult.error,
+        attempts: 0,
+        maxAttempts: 0,
+        createdAt: Date.now(),
+        detail: '自动分析队列已满，本书签未加入队列。'
+      }).catch((error) => {
+        console.warn('[Curator] 自动分析队列已满状态写入失败', error)
+      })
+    ])
+    return
+  }
   await persistAutoAnalyzeStatus({
     status: 'queued',
     bookmarkId,
@@ -1125,6 +1230,7 @@ async function handleBookmarkCreatedForAutoAnalysis(
 
 async function processAutoAnalyzeQueue(): Promise<void> {
   if (autoAnalyzeQueueProcessing) {
+    scheduleAutoAnalyzeQueueAlarm(AUTO_ANALYZE_QUEUE_WATCHDOG_MS)
     return
   }
 
@@ -1149,6 +1255,7 @@ async function processNextAutoAnalyzeQueueEntry(): Promise<void> {
     return
   }
 
+  scheduleAutoAnalyzeQueueAlarm(AUTO_ANALYZE_QUEUE_WATCHDOG_MS)
   autoClassifyInFlight.add(entry.bookmarkId)
 
   try {
@@ -1169,13 +1276,19 @@ async function processNextAutoAnalyzeQueueEntry(): Promise<void> {
       .then(() => removeAutoAnalyzeQueueEntry(entry.bookmarkId))
   } catch (error) {
     const message = getErrorMessage(error)
+    const retryable = isRetryableAutoAnalyzeError(error)
     console.warn('[Curator] 自动分析书签失败', {
       bookmarkId: entry.bookmarkId,
       url: entry.url,
-      error: message
+      error: message,
+      retryable
     })
+    const failureDisposition = await markAutoAnalyzeQueueEntryFailed(
+      entry.bookmarkId,
+      message,
+      { retryable }
+    )
     await Promise.all([
-      markAutoAnalyzeQueueEntryFailed(entry.bookmarkId, message),
       updateInboxItem(entry.bookmarkId, {
         status: 'failed',
         lastError: message
@@ -1188,12 +1301,16 @@ async function processNextAutoAnalyzeQueueEntry(): Promise<void> {
         url: entry.url,
         title: entry.title || '新增书签',
         error: message,
-        attempts: Number(entry.attempts || 0) + 1,
-        maxAttempts: AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS,
+        attempts: failureDisposition.attempts,
+        maxAttempts: failureDisposition.willRetry
+          ? AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS
+          : failureDisposition.attempts,
         createdAt: entry.createdAt,
-        detail: Number(entry.attempts || 0) + 1 < AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS
+        detail: failureDisposition.willRetry
           ? '自动分析失败，已安排稍后重试。'
-          : '自动分析失败，请检查 AI 设置或稍后再试。'
+          : retryable
+            ? '自动分析重试仍然失败，请稍后手动重试。'
+            : '自动分析遇到不可重试的错误，已停止；请根据上方错误检查 AI 设置。'
       }).catch((statusError) => {
         console.warn('[Curator] 自动分析失败状态写入失败', statusError)
       })
@@ -1252,7 +1369,10 @@ async function runAutoAnalysisForBookmark(
   if (shouldUploadToAi) {
     const providerOrigin = getOriginPermissionPattern(settings.baseUrl)
     if (!providerOrigin || !(await containsHostPermission(providerOrigin))) {
-      throw new Error('缺少 AI 服务地址访问权限，请在设置页重新测试连接或保存自动分析设置。')
+      throw new AiRuntimeError(
+        'permission',
+        '缺少 AI 服务地址访问权限，请在设置页重新测试连接或保存自动分析设置。'
+      )
     }
   }
 
@@ -1274,7 +1394,15 @@ async function runAutoAnalysisForBookmark(
   }
 
   const extracted = treeContext.extracted
-  const bookmarkRecord = extracted.bookmarkMap.get(bookmarkId) || buildAutoBookmarkRecord(bookmark)
+  const cachedBookmarkRecord = extracted.bookmarkMap.get(bookmarkId)
+  const bookmarkRecord = {
+    ...cachedBookmarkRecord,
+    ...buildAutoBookmarkRecord(bookmark),
+    path: cachedBookmarkRecord?.path ||
+      extracted.folderMap.get(String(bookmark.parentId || ''))?.path ||
+      '',
+    ancestorIds: cachedBookmarkRecord?.ancestorIds || []
+  }
   const pageContext = await buildAutoPageContext(bookmarkRecord, {
     ...settings,
     allowRemoteParsing: shouldUploadToAi && settings.allowRemoteParsing
@@ -1310,11 +1438,42 @@ async function runAutoAnalysisForBookmark(
     folders: extracted.folders
   })
   const recommendation = chooseAutoFolderRecommendation(aiResult, extracted.folders, bookmarkRecord)
+  return withAvailabilityAutoAnalysisMutationLock(async () => {
+    let latestBookmark = await getBookmarkById(bookmarkId)
+    if (!latestBookmark?.url) {
+      await persistAutoAnalyzeStatus({
+        status: 'failed',
+        bookmarkId,
+        url: bookmark.url,
+        title: bookmarkRecord.title || entry.title || '新增书签',
+        error: 'AI 返回结果前书签已被删除，未保存结果或执行自动整理。',
+        createdAt: entry.createdAt,
+        detail: '书签已不存在，自动分析已停止。'
+      })
+      return
+    }
+
+  const mutationConflict = getAutoBookmarkMutationConflict(bookmark, latestBookmark)
+  if (mutationConflict) {
+    await completeAutoAnalysisWithMutationConflict({
+      aiResult,
+      bookmarkRecord,
+      entry,
+      inboxItem,
+      latestBookmark,
+      mutationConflict,
+      pageContext,
+      recommendation,
+      requestSettings
+    })
+    return
+  }
+
   if (!recommendation) {
     await persistAutoBookmarkTagAnalysis({
       bookmarkId,
-      title: bookmarkRecord.title || entry.title || '新增书签',
-      url: bookmark.url,
+      title: latestBookmark.title || bookmarkRecord.title || entry.title || '新增书签',
+      url: latestBookmark.url,
       path: bookmarkRecord.path || extracted.folderMap.get(String(bookmark.parentId || ''))?.path || '',
       aiResult,
       pageContext,
@@ -1330,7 +1489,7 @@ async function runAutoAnalysisForBookmark(
       })
       await maybeNotifyInboxClassified({
         bookmarkId,
-        title: bookmarkRecord.title || entry.title || '新增书签',
+        title: latestBookmark.title || bookmarkRecord.title || entry.title || '新增书签',
         folderPath: DEFAULT_INBOX_FOLDER_TITLE,
         moved: false,
         message: 'AI 已生成标签，未找到合适文件夹，已保留在 Inbox。'
@@ -1339,8 +1498,8 @@ async function runAutoAnalysisForBookmark(
     await persistAutoAnalyzeStatus({
       status: 'completed',
       bookmarkId,
-      url: bookmark.url,
-      title: bookmarkRecord.title || entry.title || '新增书签',
+      url: latestBookmark.url,
+      title: latestBookmark.title || bookmarkRecord.title || entry.title || '新增书签',
       folderPath: bookmarkRecord.path || extracted.folderMap.get(String(bookmark.parentId || ''))?.path || '',
       confidence: aiResult.confidence,
       createdAt: entry.createdAt,
@@ -1349,14 +1508,86 @@ async function runAutoAnalysisForBookmark(
     return
   }
 
+  if (recommendation.kind === 'existing') {
+    const freshTreeContext = await buildAutoAnalyzeTreeContext()
+    const currentTargetFolder = freshTreeContext.extracted.folderMap.get(
+      String(recommendation.folderId)
+    )
+    const targetFolderChanged =
+      !currentTargetFolder ||
+      String(currentTargetFolder.title || '') !== String(recommendation.title || '') ||
+      normalizeFolderPathForMatch(currentTargetFolder.path || currentTargetFolder.title) !==
+        normalizeFolderPathForMatch(recommendation.path || recommendation.title)
+    if (targetFolderChanged) {
+      await completeAutoAnalysisWithMutationConflict({
+        aiResult,
+        bookmarkRecord,
+        entry,
+        inboxItem,
+        latestBookmark,
+        mutationConflict: '推荐文件夹在分析期间已被重命名、移动或删除。',
+        pageContext,
+        recommendation: null,
+        requestSettings
+      })
+      return
+    }
+  }
+
   const inboxSettings = inboxItem ? await loadInboxSettings() : null
   const inboxMinConfidence = inboxSettings?.minAutoMoveConfidence ?? INBOX_AUTO_MOVE_MIN_CONFIDENCE
-  const shouldAutoMoveRecommendation = !inboxItem ||
-    (
+  const nonInboxMutationBlockReason = inboxItem
+    ? ''
+    : getNonInboxAutoMutationBlockReason(aiResult, recommendation, pageContext)
+  const canMutateNonInboxBookmark = !nonInboxMutationBlockReason
+  const shouldAutoMoveRecommendation = inboxItem
+    ? (
       Boolean(inboxSettings?.autoMoveToRecommendedFolder) &&
       !inboxSettings?.tagOnlyNoAutoMove &&
       recommendation.confidence >= inboxMinConfidence
     )
+    : canMutateNonInboxBookmark
+  const shouldAutoRename = Boolean(inboxItem) || canMutateNonInboxBookmark
+  const preMutationFolderPath = await getBookmarkFolderPath(
+    String(latestBookmark.parentId || '')
+  )
+  await persistAutoBookmarkTagAnalysis({
+    bookmarkId,
+    title: latestBookmark.title || bookmarkRecord.title || entry.title || '新增书签',
+    url: latestBookmark.url,
+    path: preMutationFolderPath,
+    aiResult,
+    pageContext,
+    settings: requestSettings
+  })
+
+  let mutationReadyBookmark = await getBookmarkById(bookmarkId)
+  if (!mutationReadyBookmark?.url) {
+    throw new AiRuntimeError(
+      'configuration',
+      '分析结果已保存，但书签在自动整理前被删除，未执行移动或改名。'
+    )
+  }
+  const preMutationConflict = getAutoBookmarkMutationConflict(
+    bookmark,
+    mutationReadyBookmark
+  )
+  if (preMutationConflict) {
+    await completeAutoAnalysisWithMutationConflict({
+      aiResult,
+      bookmarkRecord,
+      entry,
+      inboxItem,
+      latestBookmark: mutationReadyBookmark,
+      mutationConflict: preMutationConflict,
+      pageContext,
+      recommendation,
+      requestSettings
+    })
+    return
+  }
+  latestBookmark = mutationReadyBookmark
+
   const folderId = shouldAutoMoveRecommendation
     ? recommendation.kind === 'new'
       ? await ensureBookmarkFolderPath(recommendation.path)
@@ -1368,18 +1599,32 @@ async function runAutoAnalysisForBookmark(
     throw new Error('AI 已返回推荐文件夹，但无法解析目标文件夹。')
   }
 
-  const latestBookmark = await getBookmarkById(bookmarkId)
-  if (!latestBookmark?.url || normalizeAutoUrl(latestBookmark.url) !== normalizeAutoUrl(bookmark.url)) {
-    await persistAutoAnalyzeStatus({
-      status: 'completed',
-      bookmarkId,
-      url: bookmark.url,
-      title: bookmarkRecord.title || entry.title || '新增书签',
-      createdAt: entry.createdAt,
-      detail: '自动分析结果已保存，书签内容已被更新。'
+  mutationReadyBookmark = await getBookmarkById(bookmarkId)
+  if (!mutationReadyBookmark?.url) {
+    throw new AiRuntimeError(
+      'configuration',
+      '分析结果已保存，但书签在目录准备期间被删除，未执行移动或改名。'
+    )
+  }
+  const postFolderConflict = getAutoBookmarkMutationConflict(
+    bookmark,
+    mutationReadyBookmark
+  )
+  if (postFolderConflict) {
+    await completeAutoAnalysisWithMutationConflict({
+      aiResult,
+      bookmarkRecord,
+      entry,
+      inboxItem,
+      latestBookmark: mutationReadyBookmark,
+      mutationConflict: postFolderConflict,
+      pageContext,
+      recommendation,
+      requestSettings
     })
     return
   }
+  latestBookmark = mutationReadyBookmark
 
   const originalParentId = String(latestBookmark.parentId || bookmark.parentId || '')
   const moved = shouldAutoMoveRecommendation && originalParentId !== folderId
@@ -1391,26 +1636,74 @@ async function runAutoAnalysisForBookmark(
 
   const suggestedTitle = cleanAutoTitle(aiResult.title, currentBookmark.title || bookmarkRecord.title)
   let finalBookmarkTitle = currentBookmark.title || bookmarkRecord.title
-  if (suggestedTitle && normalizeText(suggestedTitle) !== normalizeText(finalBookmarkTitle)) {
-    try {
-      const updatedBookmark = await updateBookmarkNode(bookmarkId, { title: suggestedTitle })
-      finalBookmarkTitle = updatedBookmark.title || suggestedTitle
-    } catch (error) {
-      console.warn('[Curator] 自动分析书签改名失败', error)
+  let mutationWarning = ''
+  if (
+    shouldAutoRename &&
+    suggestedTitle &&
+    normalizeText(suggestedTitle) !== normalizeText(finalBookmarkTitle)
+  ) {
+    const renameReadyBookmark = await getBookmarkById(bookmarkId)
+    if (!renameReadyBookmark?.url) {
+      throw new AiRuntimeError(
+        'configuration',
+        '书签在自动改名前被删除，已停止后续修改。'
+      )
+    }
+    const expectedAfterMove = {
+      ...bookmark,
+      parentId: currentBookmark.parentId
+    }
+    const renameConflict = getAutoBookmarkMutationConflict(
+      expectedAfterMove,
+      renameReadyBookmark
+    )
+    if (renameConflict) {
+      currentBookmark = renameReadyBookmark
+      finalBookmarkTitle = renameReadyBookmark.title || finalBookmarkTitle
+      mutationWarning = `${renameConflict} 已跳过自动改名。`
+    } else {
+      try {
+        const updatedBookmark = await updateBookmarkNode(bookmarkId, { title: suggestedTitle })
+        currentBookmark = updatedBookmark
+        finalBookmarkTitle = updatedBookmark.title || suggestedTitle
+      } catch (error) {
+        mutationWarning = `自动改名失败：${getErrorMessage(error)}`
+        console.warn('[Curator] 自动分析书签改名失败', error)
+      }
     }
   }
 
-  persistAutoBookmarkTagAnalysis({
-    bookmarkId,
-    title: finalBookmarkTitle,
-    url: bookmark.url,
-    path: recommendation.path || recommendation.title,
-    aiResult,
-    pageContext,
-    settings: requestSettings
-  }).catch((error) => {
-    console.warn('[Curator] 自动分析标签写入失败', error)
-  })
+  const liveFinalFolderPath = await getBookmarkFolderPath(
+    String(currentBookmark.parentId || originalParentId)
+  )
+  const finalFolderPath = liveFinalFolderPath || (moved ? '' : preMutationFolderPath)
+  let tagMetadataRefreshError = liveFinalFolderPath
+    ? ''
+    : '无法读取书签当前文件夹路径，标签中的路径元数据可能需要稍后刷新。'
+  if (
+    finalBookmarkTitle !== (latestBookmark.title || bookmarkRecord.title) ||
+    finalFolderPath !== preMutationFolderPath ||
+    normalizeAutoUrl(currentBookmark.url || '') !== normalizeAutoUrl(latestBookmark.url || '')
+  ) {
+    await persistAutoBookmarkTagAnalysis({
+      bookmarkId,
+      title: finalBookmarkTitle,
+      url: currentBookmark.url || latestBookmark.url,
+      path: finalFolderPath,
+      aiResult,
+      pageContext,
+      settings: requestSettings
+    }).catch((error) => {
+      tagMetadataRefreshError = [
+        tagMetadataRefreshError,
+        `标签元数据刷新失败：${getErrorMessage(error)}`
+      ].filter(Boolean).join(' ')
+      console.warn('[Curator] 自动分析标签元数据刷新失败', error)
+    })
+  }
+  const completionWarning = [mutationWarning, tagMetadataRefreshError]
+    .filter(Boolean)
+    .join(' ')
 
   if (inboxItem) {
     await updateInboxItem(bookmarkId, {
@@ -1422,11 +1715,14 @@ async function runAutoAnalysisForBookmark(
       recommendedFolderId: folderId || recommendation.folderId,
       recommendedFolderPath: recommendation.path || recommendation.title,
       confidence: recommendation.confidence,
-      lastError: shouldAutoMoveRecommendation
-        ? ''
-        : inboxSettings?.tagOnlyNoAutoMove
-          ? '已按设置只生成标签，未自动移动。'
-          : 'AI 置信度较低，已保留在 Inbox。'
+      lastError: completionWarning ||
+        (
+          shouldAutoMoveRecommendation
+            ? ''
+            : inboxSettings?.tagOnlyNoAutoMove
+              ? '已按设置只生成标签，未自动移动。'
+              : 'AI 置信度较低，已保留在 Inbox。'
+        )
     }).catch((error) => {
       console.warn('[Curator] Inbox 状态更新失败', error)
     })
@@ -1446,14 +1742,17 @@ async function runAutoAnalysisForBookmark(
       bookmarkId,
       title: finalBookmarkTitle,
       folderPath: moved
-        ? recommendation.path || recommendation.title
+        ? finalFolderPath || '推荐文件夹'
         : DEFAULT_INBOX_FOLDER_TITLE,
       moved,
-      message: moved
-        ? `已归类到 ${recommendation.path || recommendation.title}`
-        : inboxSettings?.tagOnlyNoAutoMove
-          ? '已生成标签和摘要，按设置保留在 Inbox。'
-          : '置信度较低，已生成标签并保留在 Inbox。'
+      message: [
+        moved
+          ? `已归类到 ${recommendation.path || recommendation.title}`
+          : inboxSettings?.tagOnlyNoAutoMove
+            ? '已生成标签和摘要，按设置保留在 Inbox。'
+            : '置信度较低，已生成标签并保留在 Inbox。',
+        completionWarning
+      ].filter(Boolean).join(' ')
     })
   }
 
@@ -1462,9 +1761,9 @@ async function runAutoAnalysisForBookmark(
     createdAt: Date.now(),
     bookmarkId,
     title: finalBookmarkTitle,
-    url: bookmark.url,
+    url: currentBookmark.url || latestBookmark.url,
     originalFolderPath: bookmarkRecord.path || extracted.folderMap.get(originalParentId)?.path || '',
-    targetFolderPath: recommendation.path || recommendation.title,
+    targetFolderPath: finalFolderPath,
     targetFolderId: folderId,
     recommendationKind: recommendation.kind,
     moved,
@@ -1479,16 +1778,86 @@ async function runAutoAnalysisForBookmark(
   await persistAutoAnalyzeStatus({
     status: 'completed',
     bookmarkId,
-    url: bookmark.url,
+    url: currentBookmark.url || latestBookmark.url,
     title: finalBookmarkTitle,
-    folderPath: recommendation.path || recommendation.title,
+    folderPath: finalFolderPath,
     confidence: recommendation.confidence,
     createdAt: entry.createdAt,
-    detail: moved
+    detail: [
+      moved
       ? '自动分析结果已保存，书签已移动到推荐文件夹。'
-      : '自动分析结果已保存，书签已保留在合适位置。'
+      : nonInboxMutationBlockReason
+        ? `自动分析结果已保存；${nonInboxMutationBlockReason}，未自动移动或改名。`
+        : '自动分析结果已保存，书签已保留在合适位置。',
+      completionWarning
+    ].filter(Boolean).join(' ')
   }).catch((error) => {
     console.warn('[Curator] 自动分析状态写入失败', error)
+  })
+  })
+}
+
+async function completeAutoAnalysisWithMutationConflict({
+  aiResult,
+  bookmarkRecord,
+  entry,
+  inboxItem,
+  latestBookmark,
+  mutationConflict,
+  pageContext,
+  recommendation,
+  requestSettings
+}: {
+  aiResult: AutoClassifyResult
+  bookmarkRecord: BookmarkRecord
+  entry: AutoAnalyzeQueueEntry
+  inboxItem: Awaited<ReturnType<typeof findInboxItemByBookmarkId>>
+  latestBookmark: chrome.bookmarks.BookmarkTreeNode
+  mutationConflict: string
+  pageContext: PageContentContext
+  recommendation: AutoFolderRecommendation | null
+  requestSettings: AiNamingSettings
+}): Promise<void> {
+  const bookmarkId = entry.bookmarkId
+  const currentFolderPath = await getBookmarkFolderPath(
+    String(latestBookmark.parentId || '')
+  )
+  await persistAutoBookmarkTagAnalysis({
+    bookmarkId,
+    title: latestBookmark.title || bookmarkRecord.title || entry.title || '新增书签',
+    url: String(latestBookmark.url || entry.url),
+    path: currentFolderPath,
+    aiResult,
+    pageContext,
+    settings: requestSettings
+  })
+  if (inboxItem) {
+    await updateInboxItem(bookmarkId, {
+      status: 'needs-review',
+      recommendedFolderId: recommendation?.folderId || '',
+      recommendedFolderPath: recommendation?.path || recommendation?.title || '',
+      confidence: recommendation?.confidence ?? aiResult.confidence,
+      lastError: mutationConflict
+    }).catch((error) => {
+      console.warn('[Curator] Inbox 变更冲突状态写入失败', error)
+    })
+    await maybeNotifyInboxClassified({
+      bookmarkId,
+      title: latestBookmark.title || bookmarkRecord.title || entry.title || '新增书签',
+      folderPath: DEFAULT_INBOX_FOLDER_TITLE,
+      moved: false,
+      message: `${mutationConflict} 已保存标签，未自动移动或改名。`
+    })
+  }
+  await persistAutoAnalyzeStatus({
+    status: 'completed',
+    bookmarkId,
+    url: String(latestBookmark.url || entry.url),
+    title: latestBookmark.title || bookmarkRecord.title || entry.title || '新增书签',
+    folderPath: currentFolderPath,
+    confidence: recommendation?.confidence ?? aiResult.confidence,
+    createdAt: entry.createdAt,
+    detail: `${mutationConflict} 分析标签已保存，未自动移动或改名。`
   })
 }
 
@@ -1504,6 +1873,11 @@ function scheduleAutoAnalyzeQueueProcessing(delayMs = 0): void {
       scheduleAutoAnalyzeQueueAlarm(AUTO_ANALYZE_QUEUE_RETRY_MS)
     })
   }, Math.max(0, delayMs))
+}
+
+function resumeAutoAnalyzeQueue(): void {
+  scheduleAutoAnalyzeQueueProcessing(0)
+  scheduleAutoAnalyzeQueueAlarm(AUTO_ANALYZE_QUEUE_WATCHDOG_MS)
 }
 
 function scheduleNextAutoAnalyzeQueueWake(queue: AutoAnalyzeQueueEntry[]): void {
@@ -1580,8 +1954,9 @@ async function enqueueAutoAnalyzeBookmark({
   bookmarkId: string
   url: string
   title: string
-}): Promise<void> {
+}): Promise<AutoAnalyzeEnqueueResult> {
   const now = Date.now()
+  let result: AutoAnalyzeEnqueueResult | null = null
   await updateAutoAnalyzeQueue((entries) => {
     const nextEntry: AutoAnalyzeQueueEntry = {
       bookmarkId,
@@ -1592,11 +1967,27 @@ async function enqueueAutoAnalyzeBookmark({
       nextRunAt: now + AUTO_CLASSIFY_DELAY_MS,
       lastError: ''
     }
-    return [
-      nextEntry,
-      ...entries.filter((entry) => entry.bookmarkId !== bookmarkId)
-    ].slice(0, AUTO_ANALYZE_QUEUE_LIMIT)
+    const existingIndex = entries.findIndex((entry) => entry.bookmarkId === bookmarkId)
+    if (existingIndex >= 0) {
+      result = { accepted: true, replacedExisting: true }
+      return entries.map((entry, index) => index === existingIndex ? nextEntry : entry)
+    }
+    if (entries.length >= AUTO_ANALYZE_QUEUE_LIMIT) {
+      result = {
+        accepted: false,
+        reason: 'queue-full',
+        error: `自动分析队列已满（最多 ${AUTO_ANALYZE_QUEUE_LIMIT} 个），本书签未入队；请等待当前任务完成后重试。`
+      }
+      return entries
+    }
+
+    result = { accepted: true, replacedExisting: false }
+    return [...entries, nextEntry]
   })
+  if (!result) {
+    throw new Error('自动分析队列更新未返回入队结果。')
+  }
+  return result
 }
 
 async function persistAutoBookmarkTagAnalysis({
@@ -1764,24 +2155,66 @@ async function undoLastInboxAutoMove(): Promise<InboxUndoLastMoveResult> {
   }
 }
 
-async function markAutoAnalyzeQueueEntryFailed(bookmarkId: string, lastError: string): Promise<void> {
-  const now = Date.now()
-  const nextQueue = await updateAutoAnalyzeQueue((entries) => {
-    return entries.flatMap((combineValue, combineIndex, combineArray) => { const combinedResult = ((entry) => {
-        if (entry.bookmarkId !== bookmarkId) {
-          return entry
-        }
+function isRetryableAutoAnalyzeError(error: unknown): boolean {
+  if (!(error instanceof AiRuntimeError)) {
+    // IndexedDB/Chrome API 等未知运行时失败可能是短暂状态，保留有限重试。
+    return true
+  }
 
-        const attempts = Number(entry.attempts || 0) + 1
-        return {
-          ...entry,
-          attempts,
-          lastError,
-          nextRunAt: now + AUTO_ANALYZE_QUEUE_RETRY_MS * attempts
-        }
-      })(combineValue); return ((entry) => entry.attempts < AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS)(combinedResult) ? [combinedResult] : [] })
+  if (error.kind === 'configuration' || error.kind === 'permission') {
+    return false
+  }
+  if (error.kind === 'network') {
+    return error.retryable
+  }
+  if (error.kind === 'abort') {
+    return /超时/.test(error.message)
+  }
+  if (error.kind !== 'provider') {
+    return false
+  }
+
+  const status = Number(error.status) || 0
+  if ([401, 403, 404].includes(status)) {
+    return false
+  }
+  if ([400, 415, 422].includes(status) && !error.retryable) {
+    return false
+  }
+  return error.retryable
+}
+
+async function markAutoAnalyzeQueueEntryFailed(
+  bookmarkId: string,
+  lastError: string,
+  { retryable }: { retryable: boolean }
+): Promise<AutoAnalyzeFailureDisposition> {
+  const now = Date.now()
+  let disposition: AutoAnalyzeFailureDisposition = {
+    attempts: 1,
+    willRetry: false
+  }
+  const nextQueue = await updateAutoAnalyzeQueue((entries) => {
+    return entries.flatMap((entry) => {
+      if (entry.bookmarkId !== bookmarkId) {
+        return [entry]
+      }
+
+      const attempts = Number(entry.attempts || 0) + 1
+      const willRetry = retryable && attempts < AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS
+      disposition = { attempts, willRetry }
+      return willRetry
+        ? [{
+            ...entry,
+            attempts,
+            lastError,
+            nextRunAt: now + AUTO_ANALYZE_QUEUE_RETRY_MS * attempts
+          }]
+        : []
+    })
   })
   scheduleNextAutoAnalyzeQueueWake(nextQueue)
+  return disposition
 }
 
 async function removeAutoAnalyzeQueueEntry(bookmarkId: string): Promise<void> {
@@ -1818,8 +2251,8 @@ function updateAutoAnalyzeQueue(
 
       const task = autoAnalyzeQueueWriteQueue.then(async () => {
         try {
-          let entries = await loadAutoAnalyzeQueue()
           const now = Date.now()
+          let entries = pruneAutoAnalyzeQueue(await loadAutoAnalyzeQueue(), now)
           for (const update of batch) {
             try {
               entries = pruneAutoAnalyzeQueue(update.updater(entries), now)
@@ -1887,8 +2320,7 @@ function normalizeAutoAnalyzeQueue(rawQueue: unknown): AutoAnalyzeQueueEntry[] {
         lastError: cleanText(entry?.lastError || '')
       } as AutoAnalyzeQueueEntry
     })(flatMapValue); return mappedResult ? [mappedResult] : [] })
-    .sort((left, right) => Number(left?.nextRunAt || 0) - Number(right?.nextRunAt || 0))
-    .slice(0, AUTO_ANALYZE_QUEUE_LIMIT) as AutoAnalyzeQueueEntry[]
+    .sort((left, right) => Number(left?.nextRunAt || 0) - Number(right?.nextRunAt || 0)) as AutoAnalyzeQueueEntry[]
 }
 
 function pruneAutoAnalyzeQueue(entries: AutoAnalyzeQueueEntry[], now = Date.now()): AutoAnalyzeQueueEntry[] {
@@ -1902,7 +2334,6 @@ function pruneAutoAnalyzeQueue(entries: AutoAnalyzeQueueEntry[], now = Date.now(
         Number(entry.attempts || 0) < AUTO_ANALYZE_QUEUE_MAX_ATTEMPTS
       )
     })
-    .slice(0, AUTO_ANALYZE_QUEUE_LIMIT)
 }
 
 async function loadAutoAnalyzeSettings(): Promise<AiNamingSettings> {
@@ -1931,7 +2362,10 @@ async function loadCurrentAutoAnalyzeRequestSettings({
 
     const providerOrigin = getOriginPermissionPattern(settings.baseUrl)
     if (!providerOrigin || !(await containsHostPermission(providerOrigin))) {
-      throw new Error('缺少 AI 服务地址访问权限，请在设置页重新测试连接或保存自动分析设置。')
+      throw new AiRuntimeError(
+        'permission',
+        '缺少 AI 服务地址访问权限，请在设置页重新测试连接或保存自动分析设置。'
+      )
     }
     if (generation === aiProviderSettingsGeneration) {
       return settings
@@ -1983,7 +2417,7 @@ async function buildAutoPageContext(
     )
   } else {
     try {
-      const response = await fetchWithAutoTimeout(bookmark.url, {
+      const { response, text: html } = await fetchAutoTextWithTimeout(bookmark.url, {
         method: 'GET',
         cache: 'no-store',
         credentials: 'omit',
@@ -1994,7 +2428,6 @@ async function buildAutoPageContext(
       const contentType = String(response.headers.get('content-type') || '').toLowerCase()
 
       if (contentType.includes('text/html')) {
-        const html = await response.text()
         context = buildAutoPageContentFromHtml(html, {
           url: finalUrl,
           currentTitle: bookmark.title,
@@ -2145,7 +2578,7 @@ async function fetchAutoRemotePageContext(
     throw new Error('远程解析 URL 无效。')
   }
 
-  const response = await fetchWithAutoTimeout(readerUrl, {
+  const { response, text } = await fetchAutoTextWithTimeout(readerUrl, {
     method: 'GET',
     cache: 'no-store',
     credentials: 'omit',
@@ -2160,7 +2593,6 @@ async function fetchAutoRemotePageContext(
     throw new Error(`Jina Reader 返回 HTTP ${response.status}。`)
   }
 
-  const text = await response.text()
   return buildRemotePageContentFromText(text, {
     url: fallbackContext.finalUrl || url,
     currentTitle: fallbackContext.title
@@ -2298,6 +2730,52 @@ function chooseAutoFolderRecommendation(
   }
 
   return null
+}
+
+function getAutoBookmarkMutationConflict(
+  analyzedBookmark: chrome.bookmarks.BookmarkTreeNode,
+  latestBookmark: chrome.bookmarks.BookmarkTreeNode
+): string {
+  const changedFields: string[] = []
+  if (String(latestBookmark.url || '').trim() !== String(analyzedBookmark.url || '').trim()) {
+    changedFields.push('网址')
+  }
+  if (String(latestBookmark.title || '') !== String(analyzedBookmark.title || '')) {
+    changedFields.push('标题')
+  }
+  if (String(latestBookmark.parentId || '') !== String(analyzedBookmark.parentId || '')) {
+    changedFields.push('所在文件夹')
+  }
+  return changedFields.length
+    ? `分析期间书签的${changedFields.join('、')}已被修改。`
+    : ''
+}
+
+function getNonInboxAutoMutationBlockReason(
+  aiResult: AutoClassifyResult,
+  recommendation: AutoFolderRecommendation,
+  pageContext: PageContentContext
+): string {
+  if (
+    aiResult.confidence < AUTO_CLASSIFY_MUTATION_MIN_CONFIDENCE ||
+    recommendation.confidence < AUTO_CLASSIFY_MUTATION_MIN_CONFIDENCE
+  ) {
+    return `AI 或文件夹建议置信度低于 ${Math.round(AUTO_CLASSIFY_MUTATION_MIN_CONFIDENCE * 100)}%`
+  }
+
+  const extractionStatus = String(pageContext.extractionStatus || '')
+  const contentLength = Math.max(
+    Number(pageContext.contentLength) || 0,
+    String(pageContext.mainText || '').length
+  )
+  const hasReliableExtraction =
+    ['ok', 'remote', 'combined'].includes(extractionStatus) &&
+    contentLength >= AUTO_CLASSIFY_MUTATION_MIN_CONTENT_LENGTH
+  if (!hasReliableExtraction) {
+    return '网页正文抽取质量不足'
+  }
+
+  return ''
 }
 
 function findBestExistingFolder(
@@ -2763,22 +3241,104 @@ function setActionBadgeBackgroundColor(color: string): Promise<void> {
   })
 }
 
-function fetchWithAutoTimeout(
+async function fetchAutoTextWithTimeout(
   url: string,
   options: RequestInit = {},
-  timeoutMs = AI_NAMING_DEFAULT_TIMEOUT_MS
-): Promise<Response> {
+  timeoutMs = AI_NAMING_DEFAULT_TIMEOUT_MS,
+  maxBytes = AUTO_PAGE_RESPONSE_MAX_BYTES
+): Promise<{ response: Response; text: string }> {
   const controller = new AbortController()
+  let timedOut = false
   const timeoutId = self.setTimeout(() => {
+    timedOut = true
     controller.abort()
   }, Math.max(1000, Number(timeoutMs) || AI_NAMING_DEFAULT_TIMEOUT_MS))
 
-  return fetch(url, {
-    ...options,
-    signal: controller.signal
-  }).finally(() => {
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    })
+    const text = await readAutoResponseTextWithLimit(
+      response,
+      maxBytes,
+      controller.signal
+    )
+    return { response, text }
+  } catch (error) {
+    if (timedOut && isAutoAbortError(error)) {
+      throw new Error(
+        `请求在 ${Math.max(1, Math.round((Number(timeoutMs) || AI_NAMING_DEFAULT_TIMEOUT_MS) / 1000))} 秒内未完成。`
+      )
+    }
+    throw error
+  } finally {
     clearTimeout(timeoutId)
-  })
+  }
+}
+
+async function readAutoResponseTextWithLimit(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal
+): Promise<string> {
+  const normalizedMaxBytes = Math.max(
+    1024,
+    Number(maxBytes) || AUTO_PAGE_RESPONSE_MAX_BYTES
+  )
+  const declaredBytes = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declaredBytes) && declaredBytes > normalizedMaxBytes) {
+    await response.body?.cancel().catch(() => {})
+    throw new Error(
+      `响应正文超过 ${Math.max(1, Math.round(normalizedMaxBytes / (1024 * 1024)))} MiB 限制。`
+    )
+  }
+
+  if (!response.body?.getReader) {
+    const text = await response.text()
+    if (new TextEncoder().encode(text).byteLength > normalizedMaxBytes) {
+      throw new Error(
+        `响应正文超过 ${Math.max(1, Math.round(normalizedMaxBytes / (1024 * 1024)))} MiB 限制。`
+      )
+    }
+    return text
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let bytesRead = 0
+  let text = ''
+  try {
+    while (true) {
+      if (signal.aborted) {
+        throw new DOMException('Aborted', 'AbortError')
+      }
+      const { done, value } = await reader.read()
+      if (done) {
+        break
+      }
+      bytesRead += value.byteLength
+      if (bytesRead > normalizedMaxBytes) {
+        await reader.cancel().catch(() => {})
+        throw new Error(
+          `响应正文超过 ${Math.max(1, Math.round(normalizedMaxBytes / (1024 * 1024)))} MiB 限制。`
+        )
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+    return text + decoder.decode()
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function isAutoAbortError(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'name' in error &&
+    error.name === 'AbortError'
+  )
 }
 
 function normalizeAutoConfidence(value: unknown): number {

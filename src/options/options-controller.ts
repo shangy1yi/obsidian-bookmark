@@ -14,6 +14,7 @@ import {
   setLocalStorage
 } from '../shared/storage.js'
 import {
+  getBookmarkById,
   getBookmarkTree,
   moveBookmark,
   updateBookmark,
@@ -34,7 +35,7 @@ import {
   normalizeBookmarkTags,
   normalizeBookmarkTagIndex,
   saveBookmarkTagIndex,
-  upsertBookmarkTagFromAnalysis
+  upsertBookmarkTagsFromAnalysis
 } from '../shared/bookmark-tags.js'
 import {
   normalizeInboxSettings,
@@ -83,6 +84,7 @@ import {
   type AiFailureCircuit,
   type AiFailureCircuitDecision
 } from '../shared/ai-failure-circuit.js'
+import { createAiAnalysisRunSessionCoordinator } from './sections/ai-analysis-run-session.js'
 import {
   getAiProviderAuthHeaders,
   getAiProviderBaseUrlIssue,
@@ -138,7 +140,7 @@ import {
   loadContentSnapshotIndex,
   normalizeContentSnapshotIndex,
   normalizeContentSnapshotSettings,
-  saveContentSnapshotFromContext,
+  saveContentSnapshotsFromContexts,
   saveContentSnapshotSettings
 } from '../shared/content-snapshots.js'
 import {
@@ -335,17 +337,28 @@ let activeSectionKey = ''
 let availabilityRenderFrame = 0
 let availabilityDurationTimer = 0
 let aiNamingDurationTimer = 0
+let aiAnalysisCheckpointSaveHandle = 0
+let pendingAiAnalysisCheckpoint: any = null
+let aiAnalysisCheckpointHydrated = false
 let availabilityPauseResolvers: Array<() => void> = []
 let availabilitySettingsDraft: AvailabilitySettingsDraft | null = null
 let availabilitySettingsDraftRevision = 0
 let availabilityCatalogRefreshPending = false
 let availabilityDeleteModalSnapshot: Array<{ id: string; expectedUrl: string }> = []
 const availabilityRunSessions = createAvailabilityRunSessionCoordinator()
+const aiAnalysisRunSessions = createAiAnalysisRunSessionCoordinator()
 const availabilityGlobalRunLocks = createAvailabilityGlobalRunLockCoordinator({
   lockManager:
     typeof navigator !== 'undefined' && navigator.locks
       ? navigator.locks as any
       : null
+})
+const aiAnalysisGlobalRunLocks = createAvailabilityGlobalRunLockCoordinator({
+  lockManager:
+    typeof navigator !== 'undefined' && navigator.locks
+      ? navigator.locks as any
+      : null,
+  lockName: 'curator:ai-analysis-run'
 })
 let largeRepositoryHydrationStarted = false
 const AVAILABILITY_FILTERS = new Set([
@@ -469,6 +482,7 @@ async function startOptionsController(): Promise<void> {
   }
   optionsControllerStarted = true
   window.addEventListener('pagehide', cancelAvailabilityRunOnPageHide)
+  window.addEventListener('pagehide', cancelAiAnalysisRunOnPageHide)
 
   const initialSectionKey = normalizeSectionKey(getCurrentSectionKey())
   if (initialSectionKey !== getCurrentSectionKey()) {
@@ -492,7 +506,11 @@ export function handleOptionsWindowSectionChange(_event?: Event): void {
 
 let bookmarkChangeRefreshHandle = 0
 export function handleOptionsBookmarkTreeChanged(): void {
-  if (hasActiveAvailabilityRunSession()) {
+  if (
+    hasActiveAvailabilityRunSession() ||
+    hasActiveAiAnalysisRunSession() ||
+    aiNamingState.applying
+  ) {
     availabilityCatalogRefreshPending = true
     if (bookmarkChangeRefreshHandle) {
       window.clearTimeout(bookmarkChangeRefreshHandle)
@@ -526,6 +544,7 @@ async function hydratePersistentState() {
       STORAGE_KEYS.availabilitySettings,
       STORAGE_KEYS.recycleBin,
       STORAGE_KEYS.aiProviderSettings,
+      STORAGE_KEYS.aiAnalysisCheckpoint,
       STORAGE_KEYS.folderCleanupState,
       STORAGE_KEYS.inboxSettings,
       STORAGE_KEYS.contentSnapshotSettings,
@@ -539,6 +558,9 @@ async function hydratePersistentState() {
     availabilityState.settings = normalizeAvailabilityRunnerUserSettings(stored[STORAGE_KEYS.availabilitySettings])
     managerState.recycleBin = normalizeRecycleBin(stored[STORAGE_KEYS.recycleBin])
     aiNamingManagerState.settings = normalizeAiNamingSettings(stored[STORAGE_KEYS.aiProviderSettings])
+    pendingAiAnalysisCheckpoint = normalizeAiAnalysisCheckpoint(
+      stored[STORAGE_KEYS.aiAnalysisCheckpoint]
+    )
     hydrateAiRejectedSuggestions(stored[STORAGE_KEYS.aiRejectedSuggestions])
     contentSnapshotState.settings = normalizeContentSnapshotSettings(stored[STORAGE_KEYS.contentSnapshotSettings])
     contentSnapshotState.index = normalizeContentSnapshotIndex(null)
@@ -612,6 +634,145 @@ async function saveAiNamingSettings(settings = aiNamingManagerState.settings) {
   await setLocalStorage({
     [STORAGE_KEYS.aiProviderSettings]: serializeAiNamingSettings(aiNamingManagerState.settings)
   })
+}
+
+function normalizeAiAnalysisCheckpoint(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+  const source = value as Record<string, any>
+  const allowedOutcomes = new Set(['running', 'completed', 'failed', 'stopped'])
+  const results = Array.isArray(source.results)
+    ? source.results.slice(0, 2000).flatMap((result) => {
+        if (!result || typeof result !== 'object' || !String(result.id || '').trim()) {
+          return []
+        }
+        return [{
+          ...result,
+          id: String(result.id),
+          tags: normalizeBookmarkTags(result.tags),
+          topics: normalizeAiResultTextList(result.topics, 8, 48),
+          aliases: normalizeAiResultTextList(result.aliases, 20, 40),
+          extractionWarnings: normalizeAiResultTextList(result.extractionWarnings, 4, 180),
+          ancestorIds: Array.isArray(result.ancestorIds)
+            ? result.ancestorIds.map((id) => String(id))
+            : []
+        }]
+      })
+    : []
+
+  return {
+    version: 1,
+    updatedAt: Math.max(0, Number(source.updatedAt) || 0),
+    startedAt: Math.max(0, Number(source.startedAt) || 0),
+    scopeFolderId: String(source.scopeFolderId || ''),
+    totalBookmarks: Math.max(0, Number(source.totalBookmarks) || 0),
+    completedBookmarkIds: Array.isArray(source.completedBookmarkIds)
+      ? source.completedBookmarkIds
+          .flatMap((id) => {
+            const normalizedId = String(id)
+            return normalizedId ? [normalizedId] : []
+          })
+          .slice(0, 2000)
+      : [],
+    outcome: allowedOutcomes.has(source.outcome) ? source.outcome : 'stopped',
+    results
+  }
+}
+
+async function persistAiAnalysisCheckpoint({
+  outcome = hasActiveAiAnalysisRunSession()
+    ? 'running'
+    : aiNamingState.lastRunOutcome || 'stopped'
+} = {}): Promise<void> {
+  const checkpoint = {
+    version: 1,
+    updatedAt: Date.now(),
+    startedAt: Math.max(0, Number(aiNamingState.runStartedAt) || 0),
+    scopeFolderId: String(aiNamingState.scopeFolderId || ''),
+    totalBookmarks: Math.max(
+      0,
+      Number(aiNamingState.runTotalBookmarks || aiNamingState.eligibleBookmarks) || 0
+    ),
+    completedBookmarkIds: [...aiNamingState.completedBookmarkIds],
+    outcome,
+    results: aiNamingState.results
+  }
+  pendingAiAnalysisCheckpoint = normalizeAiAnalysisCheckpoint(checkpoint)
+  await setLocalStorage({
+    [STORAGE_KEYS.aiAnalysisCheckpoint]: checkpoint
+  })
+}
+
+function scheduleAiAnalysisCheckpointSave(): void {
+  if (!hasActiveAiAnalysisRunSession() || aiAnalysisCheckpointSaveHandle) {
+    return
+  }
+  aiAnalysisCheckpointSaveHandle = window.setTimeout(() => {
+    aiAnalysisCheckpointSaveHandle = 0
+    void persistAiAnalysisCheckpoint().catch((error) => {
+      console.warn('Curator: 智能分析检查点保存失败。', error)
+    })
+  }, 180)
+}
+
+function restoreAiAnalysisCheckpointIfNeeded(): void {
+  if (aiAnalysisCheckpointHydrated) {
+    return
+  }
+  aiAnalysisCheckpointHydrated = true
+  const checkpoint = pendingAiAnalysisCheckpoint
+  pendingAiAnalysisCheckpoint = null
+  if (!checkpoint) {
+    return
+  }
+  if (checkpoint.scopeFolderId !== String(aiNamingState.scopeFolderId || '')) {
+    if (
+      checkpoint.scopeFolderId &&
+      availabilityState.folderMap.has(checkpoint.scopeFolderId)
+    ) {
+      aiNamingState.scopeFolderId = checkpoint.scopeFolderId
+      syncAiNamingCatalog({ preserveResults: false })
+    } else {
+      return
+    }
+  }
+
+  const bookmarkById = new Map(
+    aiNamingState.bookmarks.map((bookmark) => [String(bookmark.id), bookmark])
+  )
+  const results = checkpoint.results.filter((result) => {
+    const bookmark = bookmarkById.get(String(result.id))
+    return (
+      bookmark &&
+      normalizeUrl(bookmark.url) === normalizeUrl(result.url) &&
+      String(bookmark.title || '') === String(result.currentTitle || '')
+    )
+  })
+  if (!results.length) {
+    return
+  }
+
+  const restoredIds = new Set(results.map((result) => String(result.id)))
+  aiNamingState.results = results
+  aiNamingState.completedBookmarkIds = new Set(
+    checkpoint.completedBookmarkIds.filter((id) => restoredIds.has(String(id)))
+  )
+  aiNamingState.checkedBookmarks = aiNamingState.completedBookmarkIds.size
+  aiNamingState.runTotalBookmarks = Math.max(
+    aiNamingState.checkedBookmarks,
+    Math.min(checkpoint.totalBookmarks, aiNamingState.eligibleBookmarks)
+  )
+  aiNamingState.runStartedAt = checkpoint.startedAt
+  aiNamingState.lastCompletedAt = checkpoint.updatedAt
+  aiNamingState.lastRunOutcome =
+    checkpoint.outcome === 'running' ? 'stopped' : checkpoint.outcome
+  aiNamingState.lastError = checkpoint.outcome === 'running'
+    ? `上次页面关闭时分析被中断，已恢复 ${results.length} 条已保存结果。`
+    : ''
+  aiNamingState.selectedResultIds = new Set()
+  sortAiNamingResults()
+  recalculateAiNamingSummary()
 }
 
 function syncPageSection() {
@@ -975,9 +1136,14 @@ function getSelectedNewTabFolderIds(rawFolderSettings?: unknown): string[] {
 async function hydrateAvailabilityCatalog({
   preserveResults = false,
   analyzeFolderCleanup = true,
-  preserveLastError = false
+  preserveLastError = false,
+  allowDuringAiApply = false
 } = {}) {
-  if (hasActiveAvailabilityRunSession()) {
+  if (
+    hasActiveAvailabilityRunSession() ||
+    hasActiveAiAnalysisRunSession() ||
+    (aiNamingState.applying && !allowDuringAiApply)
+  ) {
     availabilityCatalogRefreshPending = true
     return
   }
@@ -1012,6 +1178,7 @@ async function hydrateAvailabilityCatalog({
     })
     applyAvailabilityScope({ preserveResults })
     syncAiNamingCatalog({ preserveResults })
+    restoreAiAnalysisCheckpointIfNeeded()
   } catch (error) {
     availabilityState.allBookmarks = []
     availabilityState.allFolders = []
@@ -1207,6 +1374,7 @@ function markAiNamingBookmarkCompleted(bookmarkId: unknown) {
   aiNamingState.completedBookmarkIds.add(normalizedBookmarkId)
   aiNamingState.checkedBookmarks = aiNamingState.completedBookmarkIds.size
   recalculateAiNamingSummary()
+  scheduleAiAnalysisCheckpointSave()
   scheduleAvailabilityRender()
 }
 
@@ -2411,9 +2579,18 @@ function updateAvailabilityRunnerStatus(scheduler: AvailabilityRunScheduler | nu
     : formatAvailabilityRunnerStatus(createAvailabilityScheduler().getSnapshot())
 }
 
-async function fetchWithRequestTimeout(url, options: RequestInit = {}, timeoutMs = AI_NAMING_DEFAULT_TIMEOUT_MS) {
+const AI_PAGE_RESPONSE_MAX_BYTES = 3 * 1024 * 1024
+const AI_AUXILIARY_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
+
+async function fetchTextWithRequestTimeout(
+  url,
+  options: RequestInit = {},
+  timeoutMs = AI_NAMING_DEFAULT_TIMEOUT_MS,
+  maxBytes = AI_AUXILIARY_RESPONSE_MAX_BYTES
+) {
   const controller = new AbortController()
   const externalSignal = options.signal
+  let timedOut = false
   const abortCurrentFetch = () => {
     controller.abort()
   }
@@ -2425,17 +2602,86 @@ async function fetchWithRequestTimeout(url, options: RequestInit = {}, timeoutMs
   }
 
   const timeoutId = window.setTimeout(() => {
+    timedOut = true
     controller.abort()
   }, Math.max(1000, Number(timeoutMs) || AI_NAMING_DEFAULT_TIMEOUT_MS))
 
   try {
-    return await fetch(url, {
+    const response = await fetch(url, {
       ...options,
       signal: controller.signal
     })
+    const text = await readResponseTextWithLimit(response, maxBytes, controller.signal)
+    return { response, text }
+  } catch (error) {
+    if (timedOut && isAbortError(error)) {
+      throw new Error(
+        `请求在 ${Math.max(1, Math.round((Number(timeoutMs) || AI_NAMING_DEFAULT_TIMEOUT_MS) / 1000))} 秒内未完成。`
+      )
+    }
+    throw error
   } finally {
     clearTimeout(timeoutId)
     externalSignal?.removeEventListener('abort', abortCurrentFetch)
+  }
+}
+
+async function readResponseTextWithLimit(
+  response: Response,
+  maxBytes: number,
+  signal?: AbortSignal | null
+): Promise<string> {
+  const normalizedMaxBytes = Math.max(1024, Number(maxBytes) || AI_AUXILIARY_RESPONSE_MAX_BYTES)
+  const declaredBytes = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declaredBytes) && declaredBytes > normalizedMaxBytes) {
+    await response.body?.cancel().catch(() => {})
+    throw new Error(`响应正文超过 ${formatResponseSizeLimit(normalizedMaxBytes)} 限制。`)
+  }
+
+  if (!response.body?.getReader) {
+    const text = await response.text()
+    if (new TextEncoder().encode(text).byteLength > normalizedMaxBytes) {
+      throw new Error(`响应正文超过 ${formatResponseSizeLimit(normalizedMaxBytes)} 限制。`)
+    }
+    return text
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let bytesRead = 0
+  let text = ''
+  try {
+    while (true) {
+      throwIfAborted(signal)
+      const { done, value } = await reader.read()
+      if (done) {
+        break
+      }
+      bytesRead += value.byteLength
+      if (bytesRead > normalizedMaxBytes) {
+        await reader.cancel().catch(() => {})
+        throw new Error(`响应正文超过 ${formatResponseSizeLimit(normalizedMaxBytes)} 限制。`)
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+    return text + decoder.decode()
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+function formatResponseSizeLimit(bytes: number): string {
+  return `${Math.max(1, Math.round(bytes / (1024 * 1024)))} MiB`
+}
+
+function parseJsonResponseText(text: string): unknown | null {
+  if (!text.trim()) {
+    return null
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
   }
 }
 
@@ -2993,6 +3239,19 @@ function cancelAvailabilityRunOnPageHide(): void {
   releaseAvailabilityPauseResolvers()
 }
 
+function cancelAiAnalysisRunOnPageHide(): void {
+  const activeSession = aiAnalysisRunSessions.getActive()
+  if (!activeSession) {
+    return
+  }
+
+  aiAnalysisRunSessions.transition(activeSession.id, 'stopping')
+  aiNamingState.stopRequested = true
+  aiNamingState.abortController?.abort()
+  releaseAiNamingPauseResolvers()
+  void persistAiAnalysisCheckpoint({ outcome: 'stopped' }).catch(() => {})
+}
+
 async function saveAvailabilitySettingsFromDraft() {
   if (isAvailabilitySettingsDisabled()) {
     return
@@ -3290,6 +3549,18 @@ export function handleAiProviderSettingsAction(detail: AiProviderSettingsActionD
     return
   }
 
+  const settingsLocked =
+    hasActiveAiAnalysisRunSession() ||
+    aiNamingState.applying ||
+    aiNamingState.testingConnection
+  if (
+    settingsLocked &&
+    detail.action !== 'toggle-api-key' &&
+    detail.action !== 'attention'
+  ) {
+    return
+  }
+
   if (detail.action === 'save') {
     void saveAiNamingSettingsFromState()
     return
@@ -3355,9 +3626,15 @@ export function handleAiProviderSettingsAction(detail: AiProviderSettingsActionD
 
   const previousSettings = syncAiNamingSettingsDraftFromState()
   const clearReasoningCapabilities = detail.field === 'baseUrl'
+  const nextValue = String(detail.value ?? '')
+  const providerOriginChanged =
+    detail.field === 'baseUrl' &&
+    getOriginPermissionPattern(previousSettings.baseUrl) !==
+      getOriginPermissionPattern(nextValue)
   aiNamingManagerState.settings = normalizeAiNamingSettings({
     ...previousSettings,
-    [detail.field]: String(detail.value ?? ''),
+    [detail.field]: nextValue,
+    apiKey: providerOriginChanged ? '' : previousSettings.apiKey,
     reasoningCapabilities: clearReasoningCapabilities
       ? {}
       : previousSettings.reasoningCapabilities
@@ -3657,18 +3934,24 @@ async function saveAiNamingSettingsFromState({ validateRequired = true } = {}) {
       validateAiNamingSettings(settings)
     }
     if (settings.autoAnalyzeBookmarks) {
-      const providerGranted = await ensureAiNamingProviderPermission({
-        interactive: true,
-        baseUrl: settings.baseUrl
-      })
-      if (!providerGranted) {
-        throw new Error('未授予 AI 服务地址访问权限，无法开启自动分析。')
+      const origins = getAiNamingPermissionOriginsForBookmarks([], settings)
+      aiNamingState.requestingPermission = true
+      renderAvailabilitySection()
+      let permissionsGranted = false
+      try {
+        permissionsGranted = await requestPermissions({ origins })
+      } finally {
+        aiNamingState.requestingPermission = false
+      }
+      if (!permissionsGranted) {
+        throw new Error(
+          settings.allowRemoteParsing
+            ? '未授予 AI 服务或 Jina Reader 访问权限，无法开启自动分析。'
+            : '未授予 AI 服务地址访问权限，无法开启自动分析。'
+        )
       }
       if (settings.allowRemoteParsing) {
-        const jinaGranted = await ensureJinaReaderPermission({ interactive: true })
-        if (!jinaGranted) {
-          throw new Error('未授予 Jina Reader 访问权限，无法开启远程解析自动分析。')
-        }
+        aiNamingState.remoteParserPermissionGranted = true
       }
     }
     await saveAiNamingSettings(settings)
@@ -4714,6 +4997,10 @@ function renderAiProviderSettings(
     reasoningCapability,
     reasoningContext
   )
+  const fieldsDisabled =
+    hasActiveAiAnalysisRunSession() ||
+    aiNamingState.applying ||
+    aiNamingState.testingConnection
   publishAiProviderSettings({
     apiKey: settings.apiKey,
     apiKeyPlaceholder: settings.apiKey ? maskAiApiKey(settings.apiKey) : '未保存 API Key',
@@ -4728,10 +5015,13 @@ function renderAiProviderSettings(
     connectivityTone: connectivityMeta.tone,
     connectivityVisible: connectivityMeta.visible,
     customModels: settings.customModels,
+    fieldsDisabled,
     hasRequiredConfig,
     modelTools: buildAiProviderModelToolsState(settings),
     modelToolsDisabled: aiNamingState.running || aiNamingState.applying || aiNamingState.testingConnection,
-    noticeText: aiNamingState.settingsDirty
+    noticeText: fieldsDisabled
+      ? '智能分析运行期间设置已锁定，结束后可继续修改。'
+      : aiNamingState.settingsDirty
       ? '有未保存改动，保存后会用于所有 AI 功能。'
       : hasRequiredConfig
         ? '配置已保存，可继续获取模型或测试连接。'
@@ -4911,7 +5201,7 @@ async function handleFetchAiModels() {
 
   try {
     const url = getAiModelsEndpoint(settings)
-    const response = await fetchWithRequestTimeout(
+    const { response, text } = await fetchTextWithRequestTimeout(
       url,
       {
         method: 'GET',
@@ -4920,16 +5210,17 @@ async function handleFetchAiModels() {
           Accept: 'application/json'
         }
       },
-      settings.timeoutMs
+      settings.timeoutMs,
+      AI_AUXILIARY_RESPONSE_MAX_BYTES
     )
 
     if (!response.ok) {
-      const text = await response.text().catch(() => '')
-      const detail = text ? `：${text.slice(0, 200)}` : ''
-      throw new Error(`HTTP ${response.status}${detail}`)
+      throw new Error(
+        extractAiErrorMessage(parseJsonResponseText(text), response.status, text)
+      )
     }
 
-    const payload = await response.json().catch(() => null)
+    const payload = parseJsonResponseText(text)
     const ids = extractFetchedModelIds(payload)
     if (!ids.length) {
       throw new Error('接口未返回任何模型 ID。')
@@ -5490,7 +5781,7 @@ export function handleAiAnalysisResultAction(detail: AiAnalysisResultActionDetai
     return
   }
 
-  if (aiNamingState.running || aiNamingState.applying) {
+  if (hasActiveAiAnalysisRunSession() || aiNamingState.applying) {
     return
   }
 
@@ -5570,6 +5861,7 @@ async function rejectAiNamingResult(bookmarkId: string): Promise<void> {
   aiNamingState.lastError = `已拒绝“${targetResult.suggestedTitle || targetResult.currentTitle || '未命名书签'}”的建议，后续不会重复展示同一建议。`
   recalculateAiNamingSummary()
   renderAvailabilitySection()
+  void persistAiAnalysisCheckpoint().catch(() => {})
 
   try {
     await saveAiRejectedSuggestions()
@@ -5580,38 +5872,163 @@ async function rejectAiNamingResult(bookmarkId: string): Promise<void> {
 }
 
 async function handleAiNamingAction() {
-  if (availabilityState.catalogLoading || aiNamingState.running || aiNamingState.applying) {
+  if (
+    availabilityState.catalogLoading ||
+    hasActiveAvailabilityRunSession() ||
+    hasActiveAiAnalysisRunSession() ||
+    aiNamingState.applying
+  ) {
     return
   }
 
+  let sessionId = ''
   try {
-    const settings = syncAiNamingSettingsDraftFromState()
+    const settings = createAiNamingRunSettingsSnapshot(syncAiNamingSettingsDraftFromState())
     validateAiNamingSettings(settings)
-    await saveAiNamingSettings(settings)
-    aiNamingState.settingsDirty = false
-
     if (!aiNamingState.bookmarks.length) {
       throw new Error('当前范围内没有可处理的 http/https 书签。')
     }
 
-    const permissionGranted = await ensureAiNamingPermissionsForRun({ interactive: true })
-    if (!permissionGranted) {
-      throw new Error('未授予网页抓取或 AI 服务访问权限，无法运行书签智能分析。')
+    const bookmarks = aiNamingState.bookmarks.map((bookmark) => ({
+      ...bookmark,
+      ancestorIds: Array.isArray(bookmark.ancestorIds) ? bookmark.ancestorIds.slice() : []
+    }))
+    const folders = availabilityState.allFolders.map((folder) => ({ ...folder }))
+    sessionId = beginAiAnalysisRunSession(bookmarks.length)
+    if (!sessionId) {
+      return
     }
 
-    await runAiNamingSuggestions()
+    await runAiNamingSuggestions({
+      bookmarks,
+      folders,
+      sessionId,
+      settings
+    })
   } catch (error) {
-    aiNamingState.lastError =
-      error instanceof Error ? error.message : '书签智能分析失败，请稍后重试。'
-    renderAvailabilitySection()
+    if (!sessionId || aiAnalysisRunSessions.isOwner(sessionId)) {
+      aiNamingState.lastError =
+        error instanceof Error ? error.message : '书签智能分析失败，请稍后重试。'
+      renderAvailabilitySection()
+    }
+    if (sessionId) {
+      await finishAiAnalysisRunSession(sessionId, { persistCheckpoint: false })
+    }
+  }
+}
+
+function createAiNamingRunSettingsSnapshot(settings = aiNamingManagerState.settings) {
+  return normalizeAiNamingSettings(serializeAiNamingSettings(settings))
+}
+
+function beginAiAnalysisRunSession(_totalBookmarks: number): string {
+  const session = aiAnalysisRunSessions.claim()
+  if (!session) {
+    return ''
+  }
+
+  const controller = new AbortController()
+  aiNamingState.running = true
+  aiNamingState.stopRequested = false
+  aiNamingState.paused = false
+  aiNamingState.abortController = controller
+  renderAvailabilitySection()
+  return session.id
+}
+
+function initializeAiAnalysisRunState(totalBookmarks: number, startedAt: number): void {
+  resetAiNamingRunState()
+  aiNamingState.runStartedAt = startedAt
+  aiNamingState.eligibleBookmarks = Math.max(0, Number(totalBookmarks) || 0)
+  aiNamingState.runTotalBookmarks = aiNamingState.eligibleBookmarks
+  renderAvailabilitySection()
+}
+
+function hasActiveAiAnalysisRunSession(): boolean {
+  return Boolean(aiAnalysisRunSessions.getActive())
+}
+
+async function acquireGlobalAiAnalysisRunLocks(sessionId: string): Promise<boolean> {
+  const aiLockAcquired = await aiAnalysisGlobalRunLocks.acquire(sessionId)
+  if (
+    !aiLockAcquired ||
+    !aiAnalysisRunSessions.isOwner(sessionId) ||
+    aiNamingState.stopRequested
+  ) {
+    if (aiLockAcquired) {
+      aiAnalysisGlobalRunLocks.release(sessionId)
+    }
+    return false
+  }
+
+  const catalogLockId = `ai-catalog-${sessionId}`
+  const catalogLockAcquired = await availabilityGlobalRunLocks.acquire(catalogLockId)
+  if (
+    !catalogLockAcquired ||
+    !aiAnalysisRunSessions.isOwner(sessionId) ||
+    aiNamingState.stopRequested
+  ) {
+    if (catalogLockAcquired) {
+      availabilityGlobalRunLocks.release(catalogLockId)
+    }
+    aiAnalysisGlobalRunLocks.release(sessionId)
+    return false
+  }
+
+  return true
+}
+
+async function finishAiAnalysisRunSession(
+  sessionId: string,
+  { persistCheckpoint = true } = {}
+): Promise<void> {
+  if (!aiAnalysisRunSessions.isOwner(sessionId)) {
+    return
+  }
+
+  if (aiAnalysisCheckpointSaveHandle) {
+    window.clearTimeout(aiAnalysisCheckpointSaveHandle)
+    aiAnalysisCheckpointSaveHandle = 0
+  }
+  if (persistCheckpoint) {
+    await persistAiAnalysisCheckpoint({
+      outcome: aiNamingState.lastRunOutcome || (aiNamingState.stopRequested ? 'stopped' : 'failed')
+    }).catch((error) => {
+      console.warn('Curator: 智能分析最终检查点保存失败。', error)
+    })
+  }
+  aiNamingState.abortController?.abort()
+  aiNamingState.running = false
+  aiNamingState.stopRequested = false
+  aiNamingState.paused = false
+  aiNamingState.requestingPermission = false
+  aiNamingState.abortController = null
+  releaseAiNamingPauseResolvers()
+  aiAnalysisRunSessions.release(sessionId)
+  aiAnalysisGlobalRunLocks.release(sessionId)
+  availabilityGlobalRunLocks.release(`ai-catalog-${sessionId}`)
+  recalculateAiNamingSummary()
+  renderAvailabilitySection()
+
+  if (availabilityCatalogRefreshPending && !hasActiveAvailabilityRunSession()) {
+    availabilityCatalogRefreshPending = false
+    await hydrateAvailabilityCatalog({
+      preserveResults: true,
+      analyzeFolderCleanup: false,
+      preserveLastError: true
+    }).catch((error) => {
+      console.warn('Curator: 智能分析结束后的书签目录重新加载失败。', error)
+    })
   }
 }
 
 function requestAiNamingStop() {
-  if (!aiNamingState.running || aiNamingState.stopRequested) {
+  const activeSession = aiAnalysisRunSessions.getActive()
+  if (!activeSession || activeSession.phase === 'finalizing' || aiNamingState.stopRequested) {
     return
   }
 
+  aiAnalysisRunSessions.transition(activeSession.id, 'stopping')
   aiNamingState.stopRequested = true
   aiNamingState.paused = false
   aiNamingState.abortController?.abort()
@@ -5620,7 +6037,13 @@ function requestAiNamingStop() {
 }
 
 function toggleAiNamingPause() {
-  if (!aiNamingState.running || aiNamingState.stopRequested || aiNamingState.applying) {
+  const activeSession = aiAnalysisRunSessions.getActive()
+  if (
+    !aiNamingState.running ||
+    activeSession?.phase !== 'running' ||
+    aiNamingState.stopRequested ||
+    aiNamingState.applying
+  ) {
     return
   }
 
@@ -5632,15 +6055,18 @@ function toggleAiNamingPause() {
   renderAvailabilitySection()
 }
 
-async function waitForAiNamingRun() {
+async function waitForAiNamingRun(sessionId: string) {
+  if (!aiAnalysisRunSessions.isOwner(sessionId)) {
+    return false
+  }
   if (!aiNamingState.paused || aiNamingState.stopRequested) {
-    return !aiNamingState.stopRequested
+    return !aiNamingState.stopRequested && aiAnalysisRunSessions.isOwner(sessionId)
   }
 
   await new Promise((resolve) => {
     aiNamingState.pauseResolvers.push(resolve)
   })
-  return waitForAiNamingRun()
+  return waitForAiNamingRun(sessionId)
 }
 
 function releaseAiNamingPauseResolvers() {
@@ -5652,41 +6078,40 @@ function releaseAiNamingPauseResolvers() {
   })
 }
 
-async function ensureAiNamingPermissionsForRun({ interactive = true } = {}) {
-  const permissionOrigins = getAiNamingPermissionOrigins()
+async function ensureAiNamingPermissionsForRun({
+  interactive = true,
+  bookmarks = aiNamingState.bookmarks,
+  settings = aiNamingManagerState.settings
+} = {}) {
+  const permissionOrigins = getAiNamingPermissionOriginsForBookmarks(bookmarks, settings)
   if (!permissionOrigins.length) {
     aiNamingState.permissionGranted = false
     return false
   }
 
-  try {
-    if (await containsPermissions({ origins: permissionOrigins })) {
-      aiNamingState.permissionGranted = true
-      return true
-    }
-  } catch (error) {
-    aiNamingState.permissionGranted = false
-  }
-
-  if (!interactive) {
-    return false
-  }
-
-  aiNamingState.requestingPermission = true
-  renderAvailabilitySection()
-
-  try {
-    aiNamingState.permissionGranted = await requestPermissions({
-      origins: permissionOrigins
-    })
-    return aiNamingState.permissionGranted
-  } catch (error) {
-    aiNamingState.permissionGranted = false
-    return false
-  } finally {
-    aiNamingState.requestingPermission = false
+  if (interactive) {
+    aiNamingState.requestingPermission = true
     renderAvailabilitySection()
+    try {
+      aiNamingState.permissionGranted = await requestPermissions({
+        origins: permissionOrigins
+      })
+      return aiNamingState.permissionGranted
+    } catch {
+      aiNamingState.permissionGranted = false
+      return false
+    } finally {
+      aiNamingState.requestingPermission = false
+      renderAvailabilitySection()
+    }
   }
+
+  try {
+    aiNamingState.permissionGranted = await containsPermissions({ origins: permissionOrigins })
+  } catch {
+    aiNamingState.permissionGranted = false
+  }
+  return aiNamingState.permissionGranted
 }
 
 async function ensureAiNamingProviderPermission({ interactive = true, baseUrl = aiNamingManagerState.settings.baseUrl } = {}) {
@@ -5695,52 +6120,43 @@ async function ensureAiNamingProviderPermission({ interactive = true, baseUrl = 
     return false
   }
 
-  try {
-    if (await containsPermissions({ origins: [providerOrigin] })) {
-      return true
-    }
-  } catch (error) {
-  }
-
-  if (!interactive) {
-    return false
-  }
-
-  aiNamingState.requestingPermission = true
-  renderAvailabilitySection()
-
-  try {
-    return await requestPermissions({
-      origins: [providerOrigin]
-    })
-  } catch (error) {
-    return false
-  } finally {
-    aiNamingState.requestingPermission = false
+  if (interactive) {
+    aiNamingState.requestingPermission = true
     renderAvailabilitySection()
+    try {
+      return await requestPermissions({
+        origins: [providerOrigin]
+      })
+    } catch {
+      return false
+    } finally {
+      aiNamingState.requestingPermission = false
+      renderAvailabilitySection()
+    }
+  }
+
+  try {
+    return await containsPermissions({ origins: [providerOrigin] })
+  } catch {
+    return false
   }
 }
 
 async function ensureJinaReaderPermission({ interactive = true } = {}) {
-  if (await hasJinaReaderPermission()) {
-    aiNamingState.remoteParserPermissionGranted = true
-    return true
+  if (interactive) {
+    try {
+      aiNamingState.remoteParserPermissionGranted = await requestPermissions({
+        origins: [AI_NAMING_JINA_READER_ORIGIN]
+      })
+      return aiNamingState.remoteParserPermissionGranted
+    } catch {
+      aiNamingState.remoteParserPermissionGranted = false
+      return false
+    }
   }
 
-  if (!interactive) {
-    aiNamingState.remoteParserPermissionGranted = false
-    return false
-  }
-
-  try {
-    aiNamingState.remoteParserPermissionGranted = await requestPermissions({
-      origins: [AI_NAMING_JINA_READER_ORIGIN]
-    })
-    return aiNamingState.remoteParserPermissionGranted
-  } catch (error) {
-    aiNamingState.remoteParserPermissionGranted = false
-    return false
-  }
+  aiNamingState.remoteParserPermissionGranted = await hasJinaReaderPermission()
+  return aiNamingState.remoteParserPermissionGranted
 }
 
 async function hasJinaReaderPermission() {
@@ -5754,22 +6170,22 @@ async function hasJinaReaderPermission() {
 }
 
 function getAiNamingPermissionOrigins() {
-  return getAiNamingPermissionOriginsForBookmarks(aiNamingState.bookmarks)
+  return getAiNamingPermissionOriginsForBookmarks(
+    aiNamingState.bookmarks,
+    aiNamingManagerState.settings
+  )
 }
 
-function getAiNamingPermissionOriginsForBookmarks(bookmarks = []) {
-  const origins = new Set(
-    bookmarks
-      .flatMap((bookmark) => {
-        const origin = getOriginPermissionPattern(bookmark.url)
-        return origin ? [origin] : []
-      })
-  )
-  const providerOrigin = getOriginPermissionPattern(aiNamingManagerState.settings.baseUrl)
+function getAiNamingPermissionOriginsForBookmarks(
+  bookmarks = [],
+  settings = aiNamingManagerState.settings
+) {
+  const origins = new Set(collectRequestOrigins(bookmarks))
+  const providerOrigin = getOriginPermissionPattern(settings.baseUrl)
   if (providerOrigin) {
     origins.add(providerOrigin)
   }
-  if (aiNamingManagerState.settings.allowRemoteParsing) {
+  if (settings.allowRemoteParsing) {
     origins.add(AI_NAMING_JINA_READER_ORIGIN)
   }
   return [...origins]
@@ -5782,31 +6198,27 @@ async function ensureAiNamingPermissionsForBookmarks(bookmarks = [], { interacti
     return false
   }
 
-  try {
-    if (await containsPermissions({ origins })) {
-      aiNamingState.permissionGranted = true
-      return true
-    }
-  } catch (error) {
-    aiNamingState.permissionGranted = false
-  }
-
-  if (!interactive) {
-    return false
-  }
-
-  aiNamingState.requestingPermission = true
-  renderAvailabilitySection()
-  try {
-    aiNamingState.permissionGranted = await requestPermissions({ origins })
-    return aiNamingState.permissionGranted
-  } catch (error) {
-    aiNamingState.permissionGranted = false
-    return false
-  } finally {
-    aiNamingState.requestingPermission = false
+  if (interactive) {
+    aiNamingState.requestingPermission = true
     renderAvailabilitySection()
+    try {
+      aiNamingState.permissionGranted = await requestPermissions({ origins })
+      return aiNamingState.permissionGranted
+    } catch {
+      aiNamingState.permissionGranted = false
+      return false
+    } finally {
+      aiNamingState.requestingPermission = false
+      renderAvailabilitySection()
+    }
   }
+
+  try {
+    aiNamingState.permissionGranted = await containsPermissions({ origins })
+  } catch {
+    aiNamingState.permissionGranted = false
+  }
+  return aiNamingState.permissionGranted
 }
 
 function getAiNamingProviderPermissionOrigin(baseUrl = aiNamingManagerState.settings.baseUrl) {
@@ -5822,6 +6234,9 @@ async function handleAiScopeChange(nextScopeFolderId) {
 }
 
 async function applySelectedAiNamingResults() {
+  if (hasActiveAiAnalysisRunSession() || aiNamingState.applying) {
+    return
+  }
   const selectedResults = getSelectedAiNamingResults()
   if (!selectedResults.length) {
     return
@@ -5837,6 +6252,16 @@ async function applySelectedAiNamingResults() {
   if (!confirmed) {
     return
   }
+  if (hasActiveAiAnalysisRunSession() || aiNamingState.applying) {
+    aiNamingState.lastError = '分析结果已发生变化，请在本轮分析结束后重新选择。'
+    renderAvailabilitySection()
+    return
+  }
+  if (!areAiNamingResultSnapshotsCurrent(selectedResults)) {
+    aiNamingState.lastError = '确认期间分析建议已更新，请重新检查并选择。'
+    renderAvailabilitySection()
+    return
+  }
 
   aiNamingState.pendingMoveSelection = false
   aiNamingState.pendingMoveResultIds.clear()
@@ -5844,7 +6269,7 @@ async function applySelectedAiNamingResults() {
 }
 
 async function handleMoveSelectedAiNamingResults() {
-  if (aiNamingState.running || aiNamingState.applying) {
+  if (hasActiveAiAnalysisRunSession() || aiNamingState.applying) {
     return
   }
 
@@ -5875,8 +6300,36 @@ async function handleMoveSelectedAiNamingResults() {
     renderAvailabilitySection()
     return
   }
+  if (!areAiNamingResultSnapshotsCurrent(selectedMovableResults)) {
+    aiNamingState.pendingMoveSelection = false
+    aiNamingState.lastError = '确认期间推荐文件夹已更新，请重新检查并选择。'
+    renderAvailabilitySection()
+    return
+  }
 
   await moveAiNamingResultsToSuggestedFolders(selectedMovableResults.map((result) => result.id))
+}
+
+function areAiNamingResultSnapshotsCurrent(expectedResults): boolean {
+  const currentById = new Map(
+    aiNamingState.results.map((result) => [String(result.id), result])
+  )
+  return expectedResults.every((expected) => {
+    const current = currentById.get(String(expected.id))
+    return current && getAiNamingResultRevision(current) === getAiNamingResultRevision(expected)
+  })
+}
+
+function getAiNamingResultRevision(result): string {
+  return JSON.stringify([
+    String(result?.id || ''),
+    String(result?.status || ''),
+    String(result?.currentTitle || ''),
+    String(result?.suggestedTitle || ''),
+    String(result?.url || ''),
+    String(result?.parentId || ''),
+    result?.folderDecision || null
+  ])
 }
 
 async function moveAiNamingResultsToSuggestedFolders(bookmarkIds) {
@@ -5899,6 +6352,15 @@ async function moveAiNamingResultsToSuggestedFolders(bookmarkIds) {
   const movedIds = []
   const moveErrors = []
   const folderCache = new Map()
+  const releaseMutationLock = await claimAvailabilityMutationLock()
+  if (!releaseMutationLock) {
+    aiNamingState.applying = false
+    aiNamingState.pendingMoveSelection = false
+    aiNamingState.pendingMoveResultIds.clear()
+    aiNamingState.lastError = '另一个 Curator 页面正在分析或修改书签，请稍后重试。'
+    renderAvailabilitySection()
+    return
+  }
 
   try {
     await createAutoBackupBeforeDangerousOperation({
@@ -5911,8 +6373,13 @@ async function moveAiNamingResultsToSuggestedFolders(bookmarkIds) {
 
     await runSequentially(targetResults, async (result) => {
       try {
+        await requireCurrentAiNamingBookmark(result)
         const targetFolderId = await resolveAiSuggestedFolderId(result, folderCache)
-        if (!targetFolderId || String(targetFolderId) === String(result.parentId || '')) {
+        const latestBookmark = await requireCurrentAiNamingBookmark(result)
+        if (
+          !targetFolderId ||
+          String(targetFolderId) === String(latestBookmark.parentId || '')
+        ) {
           return
         }
 
@@ -5925,12 +6392,20 @@ async function moveAiNamingResultsToSuggestedFolders(bookmarkIds) {
       }
     })
   } finally {
-    aiNamingState.applying = false
+    releaseMutationLock()
     aiNamingState.pendingMoveSelection = false
     aiNamingState.pendingMoveResultIds.clear()
 
-    if (movedIds.length) {
-      await hydrateAvailabilityCatalog({ preserveResults: true })
+    if (movedIds.length || availabilityCatalogRefreshPending) {
+      availabilityCatalogRefreshPending = false
+      await hydrateAvailabilityCatalog({
+        preserveResults: true,
+        allowDuringAiApply: true
+      }).catch((error) => {
+        moveErrors.push(
+          `目录刷新：${error instanceof Error ? error.message : '未知错误'}`
+        )
+      })
     }
 
     if (moveErrors.length) {
@@ -5944,6 +6419,9 @@ async function moveAiNamingResultsToSuggestedFolders(bookmarkIds) {
       aiNamingState.lastError = '所选书签已位于推荐文件夹。'
     }
 
+    await persistAiAnalysisCheckpoint().catch(() => {})
+    aiNamingState.applying = false
+    await flushPendingAvailabilityCatalogRefreshAfterAiApply(moveErrors)
     renderAvailabilitySection()
   }
 }
@@ -5984,7 +6462,14 @@ async function applyAiNamingResultsByIds(bookmarkIds) {
   renderAvailabilitySection()
 
   const appliedIds = []
-  let applyError = null
+  const applyErrors = []
+  const releaseMutationLock = await claimAvailabilityMutationLock()
+  if (!releaseMutationLock) {
+    aiNamingState.applying = false
+    aiNamingState.lastError = '另一个 Curator 页面正在分析或修改书签，请稍后重试。'
+    renderAvailabilitySection()
+    return
+  }
 
   try {
     await createAutoBackupBeforeDangerousOperation({
@@ -5996,15 +6481,22 @@ async function applyAiNamingResultsByIds(bookmarkIds) {
     })
 
     await runSequentially(targetResults, async (result) => {
-      await updateBookmark(result.id, {
-        title: result.suggestedTitle
-      })
-      appliedIds.push(String(result.id))
+      try {
+        await requireCurrentAiNamingBookmark(result)
+        await updateBookmark(result.id, {
+          title: result.suggestedTitle
+        })
+        appliedIds.push(String(result.id))
+      } catch (error) {
+        const title = result.currentTitle || result.url || result.id
+        const message = error instanceof Error ? error.message : '未知错误'
+        applyErrors.push(`${title}：${message}`)
+      }
     })
   } catch (error) {
-    applyError = error
+    applyErrors.push(error instanceof Error ? error.message : '批量应用失败。')
   } finally {
-    aiNamingState.applying = false
+    releaseMutationLock()
 
     if (appliedIds.length) {
       const appliedIdSet = new Set(appliedIds)
@@ -6015,20 +6507,68 @@ async function applyAiNamingResultsByIds(bookmarkIds) {
         [...aiNamingState.selectedResultIds].filter((id) => !appliedIdSet.has(String(id)))
       )
       recalculateAiNamingSummary()
-      await hydrateAvailabilityCatalog({ preserveResults: true })
     }
 
-    if (applyError) {
-      aiNamingState.lastError =
-        applyError instanceof Error
-          ? `应用建议过程中断，已应用 ${appliedIds.length} 条：${applyError.message}`
-          : `应用建议过程中断，已应用 ${appliedIds.length} 条。`
+    if (appliedIds.length || availabilityCatalogRefreshPending) {
+      availabilityCatalogRefreshPending = false
+      await hydrateAvailabilityCatalog({
+        preserveResults: true,
+        allowDuringAiApply: true
+      }).catch((error) => {
+        applyErrors.push(
+          `目录刷新：${error instanceof Error ? error.message : '未知错误'}`
+        )
+      })
+    }
+
+    if (applyErrors.length) {
+      aiNamingState.lastError = appliedIds.length
+        ? `已应用 ${appliedIds.length} 条，${applyErrors.length} 条未应用：${applyErrors[0]}`
+        : `应用命名建议失败：${applyErrors[0]}`
     } else if (appliedIds.length) {
       aiNamingState.lastError = `已应用 ${appliedIds.length} 条书签命名建议。`
     }
 
+    await persistAiAnalysisCheckpoint().catch(() => {})
+    aiNamingState.applying = false
+    await flushPendingAvailabilityCatalogRefreshAfterAiApply(applyErrors)
     renderAvailabilitySection()
   }
+}
+
+async function flushPendingAvailabilityCatalogRefreshAfterAiApply(
+  errors: string[]
+): Promise<void> {
+  if (!availabilityCatalogRefreshPending) {
+    return
+  }
+
+  availabilityCatalogRefreshPending = false
+  await hydrateAvailabilityCatalog({
+    preserveResults: true,
+    analyzeFolderCleanup: false,
+    preserveLastError: true
+  }).catch((error) => {
+    errors.push(`目录刷新：${error instanceof Error ? error.message : '未知错误'}`)
+  })
+}
+
+async function requireCurrentAiNamingBookmark(result) {
+  const bookmarkId = String(result?.id || '').trim()
+  const latestBookmark = bookmarkId ? await getBookmarkById(bookmarkId) : null
+  if (!latestBookmark?.url) {
+    throw new Error('书签已被删除，已跳过这条建议。')
+  }
+  if (normalizeUrl(latestBookmark.url) !== normalizeUrl(result.url)) {
+    throw new Error('书签网址已变化，已跳过过期建议。')
+  }
+  if (String(latestBookmark.title || '') !== String(result.currentTitle || '')) {
+    throw new Error('书签标题已变化，已跳过过期建议。')
+  }
+  if (String(latestBookmark.parentId || '') !== String(result.parentId || '')) {
+    throw new Error('书签所在文件夹已变化，已跳过过期建议。')
+  }
+  return latestBookmark
 }
 
 function validateAiNamingSettings(settings) {
@@ -6287,25 +6827,77 @@ function getAiExtractionLabel(status, source = '') {
   return `URL 推断${sourceLabel}`
 }
 
-async function runAiNamingSuggestions() {
+async function runAiNamingSuggestions({
+  bookmarks,
+  folders,
+  sessionId,
+  settings
+}) {
   const runStartedAt = Date.now()
-  const controller = new AbortController()
+  let runInitialized = false
+  const controller = aiNamingState.abortController
+  if (!controller || !aiAnalysisRunSessions.isOwner(sessionId)) {
+    return
+  }
   const failureCircuit = createAiFailureCircuit(2)
-  aiNamingState.running = true
-  aiNamingState.stopRequested = false
-  aiNamingState.paused = false
-  aiNamingState.abortController = controller
-  resetAiNamingRunState()
-  aiNamingState.runStartedAt = runStartedAt
-  aiNamingState.eligibleBookmarks = aiNamingState.bookmarks.length
-  aiNamingState.runTotalBookmarks = aiNamingState.bookmarks.length
-  renderAvailabilitySection()
 
   try {
-    const settings = aiNamingManagerState.settings
-    const bookmarks = aiNamingState.bookmarks.slice()
-    await runAiNamingSuggestionChunks(bookmarks, settings, controller, failureCircuit)
+    const permissionGranted = await ensureAiNamingPermissionsForRun({
+      interactive: true,
+      bookmarks,
+      settings
+    })
+    if (!aiAnalysisRunSessions.isOwner(sessionId)) {
+      return
+    }
+    if (!permissionGranted) {
+      throw new Error('未授予网页抓取或 AI 服务访问权限，无法运行书签智能分析。')
+    }
+    if (!aiNamingState.stopRequested) {
+      const locksAcquired = await acquireGlobalAiAnalysisRunLocks(sessionId)
+      if (!locksAcquired && !aiNamingState.stopRequested) {
+        throw new Error(
+          navigator.locks
+            ? '另一个 Curator 页面正在分析或修改书签，请等待其完成后重试。'
+            : '当前浏览器不支持安全的跨页面分析锁，已取消本次分析。'
+        )
+      }
+    }
 
+    if (!aiNamingState.stopRequested) {
+      aiAnalysisRunSessions.transition(sessionId, 'validating')
+      await saveAiNamingSettings(settings)
+      aiNamingState.settingsDirty = false
+      await requestAiNamingConnectivityTest(settings, {
+        signal: controller.signal
+      })
+      if (!aiNamingState.stopRequested && aiAnalysisRunSessions.isOwner(sessionId)) {
+        initializeAiAnalysisRunState(bookmarks.length, runStartedAt)
+        runInitialized = true
+        await persistAiAnalysisCheckpoint({ outcome: 'running' }).catch((error) => {
+          console.warn('Curator: 智能分析初始检查点保存失败。', error)
+        })
+      }
+    }
+
+    if (!aiNamingState.stopRequested) {
+      if (!aiAnalysisRunSessions.transition(sessionId, 'running')) {
+        return
+      }
+      await runAiNamingSuggestionChunks(
+        bookmarks,
+        settings,
+        controller,
+        failureCircuit,
+        sessionId,
+        folders
+      )
+    }
+
+    if (!runInitialized) {
+      aiNamingState.lastError = '已取消本次书签智能分析，上一轮结果保持不变。'
+      return
+    }
     aiNamingState.lastCompletedAt = Date.now()
     recalculateAiNamingSummary()
     if (aiNamingState.stopRequested || controller.signal.aborted) {
@@ -6322,12 +6914,27 @@ async function runAiNamingSuggestions() {
       console.warn('[Curator] 书签智能分析完成通知发送失败', error)
     })
   } catch (error) {
+    if (!aiAnalysisRunSessions.isOwner(sessionId)) {
+      return
+    }
+    if (!runInitialized) {
+      aiNamingState.lastError = aiNamingState.stopRequested || isAbortError(error)
+        ? '已取消本次书签智能分析，上一轮结果保持不变。'
+        : error instanceof Error
+          ? error.message
+          : '书签智能分析预检失败，请稍后重试。'
+      renderAvailabilitySection()
+      return
+    }
     aiNamingState.lastCompletedAt = Date.now()
-    aiNamingState.lastRunOutcome = 'failed'
-    aiNamingState.lastError = normalizeAiNamingRunFailure(error)
+    const stopped = aiNamingState.stopRequested || isAbortError(error)
+    aiNamingState.lastRunOutcome = stopped ? 'stopped' : 'failed'
+    aiNamingState.lastError = stopped
+      ? `已手动停止，本轮保留 ${aiNamingState.results.length} 条已生成结果。`
+      : normalizeAiNamingRunFailure(error)
     recalculateAiNamingSummary()
     notifyAiNamingRunFinished({
-      outcome: 'failed',
+      outcome: aiNamingState.lastRunOutcome,
       errorMessage: aiNamingState.lastError,
       startedAt: runStartedAt,
       completedAt: aiNamingState.lastCompletedAt
@@ -6335,15 +6942,12 @@ async function runAiNamingSuggestions() {
       console.warn('[Curator] 书签智能分析失败通知发送失败', notificationError)
     })
   } finally {
-    aiNamingState.running = false
-    aiNamingState.stopRequested = false
-    aiNamingState.paused = false
-    if (aiNamingState.abortController === controller) {
-      aiNamingState.abortController = null
+    if (aiAnalysisRunSessions.isOwner(sessionId)) {
+      aiAnalysisRunSessions.transition(sessionId, 'finalizing')
     }
-    releaseAiNamingPauseResolvers()
-    recalculateAiNamingSummary()
-    renderAvailabilitySection()
+    await finishAiAnalysisRunSession(sessionId, {
+      persistCheckpoint: runInitialized
+    })
   }
 }
 
@@ -6352,19 +6956,27 @@ async function runAiNamingSuggestionChunks(
   settings,
   controller,
   failureCircuit: AiFailureCircuit,
+  sessionId: string,
+  folders,
   start = 0
 ) {
-  if (start >= bookmarks.length || aiNamingState.stopRequested) {
+  if (
+    start >= bookmarks.length ||
+    aiNamingState.stopRequested ||
+    !aiAnalysisRunSessions.isOwner(sessionId)
+  ) {
     return
   }
 
-  const chunk = bookmarks.slice(start, start + settings.batchSize)
-  const preparedChunk = await waitForAiNamingRun().then((ready) => {
+  const chunkSize = start === 0 ? 1 : settings.batchSize
+  const chunk = bookmarks.slice(start, start + chunkSize)
+  const nextStart = start + chunk.length
+  const preparedChunk = await waitForAiNamingRun(sessionId).then((ready) => {
     if (!ready) {
       return null
     }
-    return prepareAiNamingChunk(chunk, settings, controller).then((result) => {
-      return waitForAiNamingRun().then((aiNamingRunStillActive) => ({
+    return prepareAiNamingChunk(chunk, settings, controller, sessionId, folders).then((result) => {
+      return waitForAiNamingRun(sessionId).then((aiNamingRunStillActive) => ({
         ...result,
         aiNamingRunStillActive
       }))
@@ -6379,7 +6991,9 @@ async function runAiNamingSuggestionChunks(
     if (retryCandidates.length && !aiNamingState.stopRequested) {
       await retryAiNamingBookmarks(retryCandidates, settings, {
         controller,
-        failureCircuit
+        failureCircuit,
+        folders,
+        sessionId
       })
     }
     await runAiNamingSuggestionChunks(
@@ -6387,24 +7001,30 @@ async function runAiNamingSuggestionChunks(
       settings,
       controller,
       failureCircuit,
-      start + settings.batchSize
+      sessionId,
+      folders,
+      nextStart
     )
     return
   }
 
+  const requestDeadlineAtMs = Date.now() + settings.timeoutMs
   try {
     const aiResponseItems = await requestAiNamingBatch(preparedItems, {
-      signal: controller.signal
+      deadlineAtMs: requestDeadlineAtMs,
+      signal: controller.signal,
+      settings
     })
     const aiNamingRequestStillActive = !aiNamingState.stopRequested && !controller.signal.aborted
     if (!aiNamingRequestStillActive) {
       return
     }
-    recordAiGenerationSuccess(failureCircuit)
     const failedPreparedItems = await mergeAiNamingBatchResults(preparedItems, aiResponseItems, settings)
+    recordAiGenerationSuccess(failureCircuit)
     retryCandidates.push(...failedPreparedItems.map((preparedItem) => {
       return {
         bookmark: preparedItem.bookmark,
+        deadlineAtMs: requestDeadlineAtMs,
         preparedItem,
         initialError: new Error('AI 返回中缺少该书签的命名结果。')
       }
@@ -6412,6 +7032,9 @@ async function runAiNamingSuggestionChunks(
   } catch (error) {
     if (aiNamingState.stopRequested || controller.signal.aborted) {
       return
+    }
+    if (isAiNamingPersistenceFailure(error)) {
+      throw error
     }
     const failureDecision = recordAiGenerationFailure(failureCircuit, error)
     if (failureDecision.shouldStop) {
@@ -6425,6 +7048,7 @@ async function runAiNamingSuggestionChunks(
     retryCandidates.push(...preparedItems.map((preparedItem) => {
       return {
         bookmark: preparedItem.bookmark,
+        deadlineAtMs: requestDeadlineAtMs,
         preparedItem,
         initialError: error
       }
@@ -6434,7 +7058,9 @@ async function runAiNamingSuggestionChunks(
   if (retryCandidates.length && !aiNamingState.stopRequested) {
     await retryAiNamingBookmarks(retryCandidates, settings, {
       controller,
-      failureCircuit
+      failureCircuit,
+      folders,
+      sessionId
     })
   }
 
@@ -6445,11 +7071,13 @@ async function runAiNamingSuggestionChunks(
     settings,
     controller,
     failureCircuit,
-    start + settings.batchSize
+    sessionId,
+    folders,
+    nextStart
   )
 }
 
-async function prepareAiNamingChunk(chunk, settings, controller) {
+async function prepareAiNamingChunk(chunk, settings, controller, sessionId, folders) {
   const preparedItems: any[] = []
   const retryCandidates: any[] = []
   let shouldStopPreparing = false
@@ -6458,7 +7086,7 @@ async function prepareAiNamingChunk(chunk, settings, controller) {
     if (shouldStopPreparing) {
       return
     }
-    if (!(await waitForAiNamingRun())) {
+    if (!(await waitForAiNamingRun(sessionId))) {
       shouldStopPreparing = true
       return
     }
@@ -6470,6 +7098,8 @@ async function prepareAiNamingChunk(chunk, settings, controller) {
 
     try {
       preparedItems.push(await buildAiNamingPreparedItem(bookmark, settings.timeoutMs, {
+        folders,
+        settings,
         signal: controller.signal
       }))
       throwIfAborted(controller.signal)
@@ -6481,6 +7111,7 @@ async function prepareAiNamingChunk(chunk, settings, controller) {
     }
   })
 
+  await saveContentSnapshotsForAiPreparedItems(preparedItems)
   return { preparedItems, retryCandidates }
 }
 
@@ -6600,19 +7231,22 @@ function formatElapsedTime(elapsedMs: number): string {
 
 async function retryAiNamingBookmarks(
   retryCandidates: any[],
-  settings = aiNamingManagerState.settings,
+  settings: ReturnType<typeof normalizeAiNamingSettings> =
+    normalizeAiNamingSettings(aiNamingManagerState.settings),
   options: {
     controller: AbortController
     failureCircuit: AiFailureCircuit
+    folders: any[]
+    sessionId: string
   }
 ) {
-  const { controller, failureCircuit } = options
+  const { controller, failureCircuit, folders, sessionId } = options
   let shouldStopRetry = false
   await runSequentially(retryCandidates, async (candidate) => {
     if (shouldStopRetry) {
       return
     }
-    if (!(await waitForAiNamingRun())) {
+    if (!(await waitForAiNamingRun(sessionId))) {
       shouldStopRetry = true
       return
     }
@@ -6628,8 +7262,13 @@ async function retryAiNamingBookmarks(
         preparedItem = await buildAiNamingPreparedItem(
           candidate.bookmark,
           settings.timeoutMs,
-          { signal: controller.signal }
+          {
+            folders,
+            settings,
+            signal: controller.signal
+          }
         )
+        await saveContentSnapshotsForAiPreparedItems([preparedItem])
         throwIfAborted(controller.signal)
       } catch (retryError) {
         if (aiNamingState.stopRequested || controller.signal.aborted) {
@@ -6647,8 +7286,15 @@ async function retryAiNamingBookmarks(
     }
 
     try {
+      const requestDeadlineAtMs =
+        Number(candidate.deadlineAtMs) || Date.now() + settings.timeoutMs
+      if (requestDeadlineAtMs <= Date.now()) {
+        throw candidate.initialError
+      }
       const aiResponseItems = await requestAiNamingBatch([preparedItem], {
-        signal: controller.signal
+        deadlineAtMs: requestDeadlineAtMs,
+        signal: controller.signal,
+        settings
       })
       const modelItem = aiResponseItems.find((item) => {
         return String(item.bookmarkId) === String(candidate.bookmark.id)
@@ -6656,12 +7302,15 @@ async function retryAiNamingBookmarks(
       if (!modelItem) {
         throw new Error('AI 返回中缺少该书签的命名结果。')
       }
-      recordAiGenerationSuccess(failureCircuit)
       await commitAiNamingResult(candidate.bookmark, modelItem, settings, preparedItem)
+      recordAiGenerationSuccess(failureCircuit)
     } catch (retryError) {
       if (aiNamingState.stopRequested || controller.signal.aborted) {
         shouldStopRetry = true
         return
+      }
+      if (isAiNamingPersistenceFailure(retryError)) {
+        throw retryError
       }
       upsertAiNamingResult(
         buildAiNamingRetriedFailureResult(candidate.bookmark, candidate.initialError, retryError)
@@ -6703,10 +7352,29 @@ function createAiNamingRunFailure(
 
 function normalizeAiNamingRunFailure(error: unknown): string {
   const message = getAiNamingFailureMessage(error)
-  if (error instanceof Error && error.name === 'AiNamingRunFailureError') {
+  if (
+    error instanceof Error &&
+    (
+      error.name === 'AiNamingRunFailureError' ||
+      error.name === 'AiNamingPersistenceFailureError'
+    )
+  ) {
     return message
   }
   return `书签智能分析已停止：${message}`
+}
+
+function createAiNamingPersistenceFailure(error: unknown): Error {
+  const detail = error instanceof Error ? error.message : '标签数据写入失败。'
+  const failure = new Error(
+    `书签智能分析已停止：AI 已返回结果，但本地标签数据保存失败：${detail} 请检查浏览器存储空间或站点数据权限后重试。`
+  )
+  failure.name = 'AiNamingPersistenceFailureError'
+  return failure
+}
+
+function isAiNamingPersistenceFailure(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AiNamingPersistenceFailureError'
 }
 
 function getAiNamingFailureAction(error: unknown): string {
@@ -6727,19 +7395,11 @@ function getAiNamingFailureAction(error: unknown): string {
 }
 
 async function commitAiNamingResult(bookmark, modelItem, settings = aiNamingManagerState.settings, preparedItem = null) {
-  const nextResult = buildAiNamingResultFromModelItem(bookmark, modelItem, preparedItem)
-  upsertAiNamingResult(nextResult)
-  await persistAiNamingTagRecord(bookmark, nextResult, settings, preparedItem)
-
-  if (
-    nextResult.status === 'suggested' &&
-    modelItem.confidence === 'high' &&
-    settings.autoSelectHighConfidence
-  ) {
-    aiNamingState.selectedResultIds.add(String(bookmark.id))
-  }
-
-  markAiNamingBookmarkCompleted(bookmark.id)
+  await commitAiNamingResults([{
+    bookmark,
+    modelItem,
+    preparedItem
+  }], settings)
 }
 
 function buildAiNamingResultFromModelItem(bookmark, modelItem, preparedItem = null) {
@@ -6783,15 +7443,58 @@ function buildAiNamingResultFromModelItem(bookmark, modelItem, preparedItem = nu
   }
 }
 
-async function persistAiNamingTagRecord(
-  bookmark,
-  result,
-  settings = aiNamingManagerState.settings,
-  preparedItem = null,
-  options: { rethrow?: boolean } = {}
-) {
+async function commitAiNamingResults(entries, settings = aiNamingManagerState.settings) {
+  const committedEntries = entries.map((entry) => ({
+    ...entry,
+    result: buildAiNamingResultFromModelItem(
+      entry.bookmark,
+      entry.modelItem,
+      entry.preparedItem
+    )
+  }))
+
   try {
-    const record = await upsertBookmarkTagFromAnalysis({
+    await persistAiNamingTagRecords(committedEntries, settings)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '标签数据写入失败。'
+    aiNamingState.tagDataStatus = message
+    committedEntries.forEach(({ bookmark, result }) => {
+      upsertAiNamingResult({
+        ...result,
+        status: 'failed',
+        confidence: 'none',
+        confidenceScore: null,
+        reason: `AI 已返回分析结果，但本地标签数据保存失败：${message}`
+      })
+      aiNamingState.selectedResultIds.delete(String(bookmark.id))
+      markAiNamingBookmarkCompleted(bookmark.id)
+    })
+    renderAiNamingSection()
+    throw createAiNamingPersistenceFailure(error)
+  }
+
+  committedEntries.forEach(({ bookmark, modelItem, result }) => {
+    upsertAiNamingResult(result)
+    if (
+      result.status === 'suggested' &&
+      modelItem.confidence === 'high' &&
+      settings.autoSelectHighConfidence
+    ) {
+      aiNamingState.selectedResultIds.add(String(bookmark.id))
+    }
+    markAiNamingBookmarkCompleted(bookmark.id)
+  })
+}
+
+async function persistAiNamingTagRecords(
+  entries,
+  settings = aiNamingManagerState.settings
+) {
+  const records = await upsertBookmarkTagsFromAnalysis(entries.map(({
+    bookmark,
+    result,
+    preparedItem
+  }) => ({
       bookmark: {
         id: bookmark.id,
         title: result.suggestedTitle || bookmark.title,
@@ -6818,27 +7521,20 @@ async function persistAiNamingTagRecord(
         source: String(preparedItem?.pageContext?.extraction?.source || result.extractionSource || ''),
         warnings: Array.isArray(result.extractionWarnings) ? result.extractionWarnings : []
       }
+    })))
+  if (records.length) {
+    aiNamingState.tagIndex = normalizeBookmarkTagIndex({
+      ...aiNamingState.tagIndex,
+      updatedAt: Date.now(),
+      records: {
+        ...aiNamingState.tagIndex.records,
+        ...Object.fromEntries(records.map((record) => [record.bookmarkId, record]))
+      }
     })
-    if (record) {
-      aiNamingState.tagIndex = normalizeBookmarkTagIndex({
-        ...aiNamingState.tagIndex,
-        updatedAt: Date.now(),
-        records: {
-          ...aiNamingState.tagIndex.records,
-          [record.bookmarkId]: record
-        }
-      })
-      renderBookmarkTagDataCard()
-    }
-    return record
-  } catch (error) {
-    aiNamingState.tagDataStatus = error instanceof Error ? error.message : '标签数据写入失败。'
-    renderAiNamingSection()
-    if (options.rethrow) {
-      throw error
-    }
-    return null
+    aiNamingState.tagDataStatus = ''
+    renderBookmarkTagDataCard()
   }
+  return records
 }
 
 function buildAiNamingRetriedFailureResult(bookmark, initialError, retryError) {
@@ -6857,9 +7553,12 @@ function getAiNamingFailureMessage(error) {
   return error instanceof Error ? error.message : '生成建议失败。'
 }
 
-function buildAiFolderCandidates(bookmark): AiFolderCandidate[] {
+function buildAiFolderCandidates(
+  bookmark,
+  folders = availabilityState.allFolders
+): AiFolderCandidate[] {
   return buildRuntimeAiFolderCandidates(
-    availabilityState.allFolders,
+    folders,
     {
       currentFolderPath: bookmark?.path,
       limit: 80
@@ -6867,12 +7566,20 @@ function buildAiFolderCandidates(bookmark): AiFolderCandidate[] {
   )
 }
 
-async function buildAiNamingPreparedItem(bookmark, timeoutMs, options: { signal?: AbortSignal | null } = {}) {
+async function buildAiNamingPreparedItem(
+  bookmark,
+  timeoutMs,
+  options: {
+    signal?: AbortSignal | null
+    folders?: any[]
+    settings?: ReturnType<typeof normalizeAiNamingSettings>
+  } = {}
+) {
   throwIfAborted(options.signal)
   const metadata = await getAiMetadataForBookmark(bookmark, timeoutMs, options)
   throwIfAborted(options.signal)
   const pageContext = buildPageContextForAi(metadata)
-  const folderCandidates = buildAiFolderCandidates(bookmark)
+  const folderCandidates = buildAiFolderCandidates(bookmark, options.folders)
   const preparedItem = {
     bookmark,
     pageMetadata: metadata,
@@ -6889,48 +7596,70 @@ async function buildAiNamingPreparedItem(bookmark, timeoutMs, options: { signal?
       page_context: pageContext
     }
   }
-  await saveContentSnapshotForAiPreparedItem(preparedItem)
   throwIfAborted(options.signal)
   return preparedItem
 }
 
-async function saveContentSnapshotForAiPreparedItem(preparedItem): Promise<void> {
-  if (!contentSnapshotState.settings.enabled || !preparedItem?.bookmark || !preparedItem?.pageMetadata) {
+async function saveContentSnapshotsForAiPreparedItems(preparedItems): Promise<void> {
+  const inputs = preparedItems.flatMap((preparedItem) => {
+    if (
+      !contentSnapshotState.settings.enabled ||
+      !preparedItem?.bookmark ||
+      !preparedItem?.pageMetadata
+    ) {
+      return []
+    }
+    return [{
+      bookmark: preparedItem.bookmark,
+      context: preparedItem.pageMetadata,
+      settings: contentSnapshotState.settings
+    }]
+  })
+  if (!inputs.length) {
     return
   }
 
   try {
-    const record = await saveContentSnapshotFromContext({
-      bookmark: preparedItem.bookmark,
-      context: preparedItem.pageMetadata,
-      settings: contentSnapshotState.settings
-    })
-    if (!record) {
+    const records = await saveContentSnapshotsFromContexts(inputs)
+    if (!records.length) {
       return
     }
 
     contentSnapshotState.index = normalizeContentSnapshotIndex({
       ...contentSnapshotState.index,
-      updatedAt: Math.max(Number(contentSnapshotState.index.updatedAt) || 0, Number(record.extractedAt) || Date.now()),
+      updatedAt: Math.max(
+        Number(contentSnapshotState.index.updatedAt) || 0,
+        ...records.map((record) => Number(record.extractedAt) || Date.now())
+      ),
       records: {
         ...contentSnapshotState.index.records,
-        [record.bookmarkId]: record
+        ...Object.fromEntries(records.map((record) => [record.bookmarkId, record]))
       }
     })
-    contentSnapshotState.aiRunSavedCount += 1
+    contentSnapshotState.aiRunSavedCount += records.length
     contentSnapshotState.statusMessage = ''
     renderContentSnapshotSettings()
   } catch (error) {
-    contentSnapshotState.aiRunFailedCount += 1
-    const title = preparedItem.bookmark?.title || preparedItem.bookmark?.url || preparedItem.bookmark?.id || '未知书签'
+    contentSnapshotState.aiRunFailedCount += inputs.length
+    const firstBookmark = inputs[0]?.bookmark
+    const title = firstBookmark?.title || firstBookmark?.url || firstBookmark?.id || '未知书签'
     const message = error instanceof Error ? error.message : '未知错误'
-    contentSnapshotState.statusMessage = `书签智能分析保存网页内容索引失败：${title}：${message}`
+    contentSnapshotState.statusMessage =
+      `书签智能分析批量保存网页内容索引失败（${inputs.length} 条，首条：${title}）：${message}`
     console.warn('[Curator] 书签智能分析保存网页内容索引失败', error)
     renderContentSnapshotSettings()
   }
 }
 
-async function getAiMetadataForBookmark(bookmark, timeoutMs, options: { signal?: AbortSignal | null } = {}) {
+async function getAiMetadataForBookmark(
+  bookmark,
+  timeoutMs,
+  options: {
+    signal?: AbortSignal | null
+    folders?: any[]
+    settings?: ReturnType<typeof normalizeAiNamingSettings>
+  } = {}
+) {
   let metadata
   try {
     metadata = await fetchBookmarkMetadataForAi(bookmark.url, timeoutMs, bookmark, options)
@@ -6951,7 +7680,11 @@ async function fetchBookmarkMetadataForAi(
   url,
   timeoutMs,
   bookmark = null,
-  options: { signal?: AbortSignal | null } = {}
+  options: {
+    signal?: AbortSignal | null
+    folders?: any[]
+    settings?: ReturnType<typeof normalizeAiNamingSettings>
+  } = {}
 ) {
   let context = null
   const originPattern = getDirectPageFetchOriginPattern(url)
@@ -6967,14 +7700,19 @@ async function fetchBookmarkMetadataForAi(
     )
   } else {
     try {
-      const response = await fetchWithRequestTimeout(url, {
-        method: 'GET',
-        cache: 'no-store',
-        credentials: 'omit',
-        redirect: 'follow',
-        referrerPolicy: 'no-referrer',
-        signal: options.signal
-      }, timeoutMs)
+      const { response, text: html } = await fetchTextWithRequestTimeout(
+        url,
+        {
+          method: 'GET',
+          cache: 'no-store',
+          credentials: 'omit',
+          redirect: 'follow',
+          referrerPolicy: 'no-referrer',
+          signal: options.signal
+        },
+        timeoutMs,
+        AI_PAGE_RESPONSE_MAX_BYTES
+      )
       throwIfAborted(options.signal)
       const finalUrl = String(response.url || url || '')
       const contentType = String(response.headers.get('content-type') || '').toLowerCase()
@@ -6985,7 +7723,6 @@ async function fetchBookmarkMetadataForAi(
           contentType
         })
       } else {
-        const html = await response.text()
         context = extractPageContentFromHtml(html, {
           url: finalUrl,
           currentTitle: bookmark?.title,
@@ -7006,7 +7743,7 @@ async function fetchBookmarkMetadataForAi(
     }
   }
 
-  if (aiNamingManagerState.settings.allowRemoteParsing) {
+  if ((options.settings || aiNamingManagerState.settings).allowRemoteParsing) {
     const canUseRemoteParser = await hasOriginPermission(AI_NAMING_JINA_READER_ORIGIN)
     if (!canUseRemoteParser) {
       return normalizePageContentContext({
@@ -7063,23 +7800,27 @@ async function fetchRemoteBookmarkContentForAi(
   }
 
   try {
-    const response = await fetchWithRequestTimeout(readerUrl, {
-      method: 'GET',
-      cache: 'no-store',
-      credentials: 'omit',
-      redirect: 'follow',
-      referrerPolicy: 'no-referrer',
-      headers: {
-        Accept: 'text/plain, text/markdown;q=0.9, */*;q=0.1'
+    const { response, text } = await fetchTextWithRequestTimeout(
+      readerUrl,
+      {
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'omit',
+        redirect: 'follow',
+        referrerPolicy: 'no-referrer',
+        headers: {
+          Accept: 'text/plain, text/markdown;q=0.9, */*;q=0.1'
+        },
+        signal: options.signal
       },
-      signal: options.signal
-    }, timeoutMs)
+      timeoutMs,
+      AI_PAGE_RESPONSE_MAX_BYTES
+    )
 
     if (!response.ok) {
       throw new Error(`Jina Reader 返回 HTTP ${response.status}。`)
     }
 
-    const text = await response.text()
     recordPrivacyAudit({
       feature: 'jina-reader',
       label: 'Jina Reader 远程解析',
@@ -7109,24 +7850,33 @@ async function fetchRemoteBookmarkContentForAi(
   }
 }
 
-async function requestAiNamingConnectivityTest(settings = aiNamingManagerState.settings) {
+async function requestAiNamingConnectivityTest(
+  settings = aiNamingManagerState.settings,
+  options: { signal?: AbortSignal | null } = {}
+) {
   const endpoint = getResolvedAiProviderEndpoint(settings)
   try {
-    const response = await fetchWithRequestTimeout(endpoint, {
-      method: 'POST',
-      cache: 'no-store',
-      credentials: 'omit',
-      referrerPolicy: 'no-referrer',
-      headers: {
-        'Content-Type': 'application/json',
-        ...getAiProviderAuthHeaders(settings.baseUrl, settings.apiKey)
+    const { response, text } = await fetchTextWithRequestTimeout(
+      endpoint,
+      {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAiProviderAuthHeaders(settings.baseUrl, settings.apiKey)
+        },
+        body: JSON.stringify(buildAiProviderConnectivityRequestBody(settings as AiProviderSettings)),
+        signal: options.signal
       },
-      body: JSON.stringify(buildAiProviderConnectivityRequestBody(settings as AiProviderSettings))
-    }, settings.timeoutMs)
+      settings.timeoutMs,
+      AI_AUXILIARY_RESPONSE_MAX_BYTES
+    )
 
-    const payload = await response.json().catch(() => null)
+    const payload = parseJsonResponseText(text)
     if (!response.ok) {
-      throw new Error(extractAiErrorMessage(payload, response.status))
+      throw new Error(extractAiErrorMessage(payload, response.status, text))
     }
 
     recordPrivacyAudit({
@@ -7163,8 +7913,16 @@ function normalizeAiNamingConnectivityError(error, timeoutMs = aiNamingManagerSt
   return error instanceof Error ? error.message : '连通性测试失败，请稍后重试。'
 }
 
-async function requestAiNamingBatch(preparedItems, options: { signal?: AbortSignal | null } = {}) {
-  const settings = aiNamingManagerState.settings
+async function requestAiNamingBatch(
+  preparedItems,
+  options: {
+    deadlineAtMs?: number
+    settings?: ReturnType<typeof normalizeAiNamingSettings>
+    signal?: AbortSignal | null
+  } = {}
+) {
+  const settings = options.settings ||
+    normalizeAiNamingSettings(aiNamingManagerState.settings)
   const endpoint = getResolvedAiProviderEndpoint(settings)
   const prompt = buildAiNamingPrompt(preparedItems, settings)
   throwIfAborted(options.signal)
@@ -7175,6 +7933,7 @@ async function requestAiNamingBatch(preparedItems, options: { signal?: AbortSign
       schemaName: 'bookmark_naming_batch',
       systemPrompt: prompt.systemPrompt,
       userPrompt: prompt.userPrompt,
+      deadlineAtMs: options.deadlineAtMs,
       signal: options.signal,
       timeoutMs: settings.timeoutMs,
       validate: (payload) => validateAiNamingFolderDecisions(payload, preparedItems)
@@ -7333,8 +8092,9 @@ function normalizeAiNamingResponseItems(payload, preparedItems) {
 async function mergeAiNamingBatchResults(preparedItems: any[], aiResponseItems: any[], settings = aiNamingManagerState.settings) {
   const responseMap = new Map(aiResponseItems.map((item) => [String(item.bookmarkId), item]))
   const failedPreparedItems: any[] = []
+  const committedEntries: any[] = []
 
-  await runSequentially(preparedItems, async (preparedItem) => {
+  preparedItems.forEach((preparedItem) => {
     const bookmark = preparedItem.bookmark
     const modelItem = responseMap.get(String(bookmark.id))
     if (!modelItem) {
@@ -7342,8 +8102,13 @@ async function mergeAiNamingBatchResults(preparedItems: any[], aiResponseItems: 
       return
     }
 
-    await commitAiNamingResult(bookmark, modelItem, settings, preparedItem)
+    committedEntries.push({
+      bookmark,
+      modelItem,
+      preparedItem
+    })
   })
+  await commitAiNamingResults(committedEntries, settings)
 
   sortAiNamingResults()
   return failedPreparedItems
@@ -8763,6 +9528,12 @@ async function ignoreSelectedAvailabilityResults(kind) {
   })
   if (!confirmed) {
     availabilityState.lastError = '已取消新增忽略规则。'
+    renderAvailabilitySection()
+    return
+  }
+  if (hasActiveAiAnalysisRunSession() || aiNamingState.applying) {
+    aiNamingState.pendingMoveSelection = false
+    aiNamingState.lastError = '分析结果已发生变化，请在本轮分析结束后重新选择。'
     renderAvailabilitySection()
     return
   }

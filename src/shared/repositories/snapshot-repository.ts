@@ -1,18 +1,21 @@
 import { STORAGE_KEYS } from '../constants.js'
-import { getLocalStorage, setLocalStorage } from '../storage.js'
+import {
+  getLocalStorage,
+  setLocalStorage,
+  type LocalStorageTransaction
+} from '../storage.js'
 import type {
   ContentSnapshotIndex,
   ContentSnapshotRecord
 } from '../content-snapshot-search.js'
 import {
   CURATOR_DATA_STORES,
-  applyCuratorDataStoreDelta,
+  applyCuratorDataStoreDeltaWithMeta,
   isCuratorDataDbAvailable,
   readCuratorDataStore,
   readCuratorDataStoreMeta,
   resetCuratorDataDbForTest,
-  replaceCuratorDataStore,
-  writeCuratorDataStoreMeta
+  replaceCuratorDataStoreWithMeta
 } from './curator-data-db.js'
 
 const CONTENT_SNAPSHOT_REPOSITORY_META_KEY = 'contentSnapshots'
@@ -31,7 +34,9 @@ export function configureContentSnapshotRepository(normalizerConfig: ContentSnap
   normalizers = normalizerConfig
 }
 
-export async function loadContentSnapshotIndexFromRepository(): Promise<ContentSnapshotIndex> {
+export async function loadContentSnapshotIndexFromRepository(
+  transaction?: LocalStorageTransaction
+): Promise<ContentSnapshotIndex> {
   const { normalizeIndex } = requireContentSnapshotRepositoryNormalizers()
   const idbIndex = await loadContentSnapshotIndexFromIndexedDb().catch(() => null)
   if (idbIndex) {
@@ -43,7 +48,7 @@ export async function loadContentSnapshotIndexFromRepository(): Promise<ContentS
         Number(localIndex.updatedAt) > Number(idbIndex.updatedAt)
       )
     ) {
-      await migrateContentSnapshotIndexToIndexedDb(localIndex).catch(() => {})
+      await migrateContentSnapshotIndexToIndexedDb(localIndex, transaction).catch(() => {})
       return localIndex
     }
     return idbIndex
@@ -51,20 +56,21 @@ export async function loadContentSnapshotIndexFromRepository(): Promise<ContentS
 
   const localIndex = await loadContentSnapshotIndexFromLocalStorage()
   if (Object.keys(localIndex.records).length && isCuratorDataDbAvailable()) {
-    await migrateContentSnapshotIndexToIndexedDb(localIndex).catch(() => {})
+    await migrateContentSnapshotIndexToIndexedDb(localIndex, transaction).catch(() => {})
   }
   return normalizeIndex(localIndex)
 }
 
 export async function updateContentSnapshotIndexInRepository(
-  updater: (index: ContentSnapshotIndex) => ContentSnapshotIndex
+  updater: (index: ContentSnapshotIndex) => ContentSnapshotIndex,
+  transaction?: LocalStorageTransaction
 ): Promise<ContentSnapshotIndex> {
   const { normalizeIndex } = requireContentSnapshotRepositoryNormalizers()
-  const current = await loadContentSnapshotIndexFromRepository()
+  const current = await loadContentSnapshotIndexFromRepository(transaction)
   const nextIndex = normalizeIndex(updater(current))
 
   if (!isCuratorDataDbAvailable()) {
-    await writeContentSnapshotIndexToLocalStorage(nextIndex)
+    await writeContentSnapshotIndexToLocalStorage(nextIndex, transaction)
     return nextIndex
   }
 
@@ -72,17 +78,82 @@ export async function updateContentSnapshotIndexInRepository(
     const delta = diffContentSnapshotIndexes(current, nextIndex)
     if (delta.replaceAll) {
       await replaceContentSnapshotIndexInIndexedDb(nextIndex)
+      await compactContentSnapshotIndexLocalStorage(nextIndex, transaction).catch(() => {})
     } else {
-      await applyCuratorDataStoreDelta(
+      const committedMeta = await applyCuratorDataStoreDeltaWithMeta(
         CURATOR_DATA_STORES.contentSnapshots,
         delta.upserts,
-        delta.deletedIds
+        delta.deletedIds,
+        buildContentSnapshotRepositoryMeta(nextIndex)
       )
-      await writeContentSnapshotRepositoryMeta(nextIndex)
+      await compactContentSnapshotIndexLocalStorageWithMeta(committedMeta, transaction).catch(() => {})
     }
-    await compactContentSnapshotIndexLocalStorage(nextIndex).catch(() => {})
   } catch {
-    await writeContentSnapshotIndexToLocalStorage(nextIndex)
+    await writeContentSnapshotIndexToLocalStorage(nextIndex, transaction)
+  }
+  return nextIndex
+}
+
+export async function applyContentSnapshotRecordsDeltaInRepository(
+  current: ContentSnapshotIndex,
+  {
+    upserts,
+    deletedIds = [],
+    updatedAt = Date.now()
+  }: {
+    upserts: ContentSnapshotRecord[]
+    deletedIds?: string[]
+    updatedAt?: number
+  },
+  transaction?: LocalStorageTransaction
+): Promise<ContentSnapshotIndex> {
+  const { normalizeIndex, normalizeRecord } = requireContentSnapshotRepositoryNormalizers()
+  const normalizedCurrent = normalizeIndex(current)
+  const normalizedUpserts = dedupeContentSnapshotRecords(
+    upserts
+      .map((record) => normalizeRecord(record))
+      .filter((record) => record.bookmarkId && record.snapshotId)
+  )
+  const upsertIds = new Set(normalizedUpserts.map((record) => record.bookmarkId))
+  const normalizedDeletedIds = Array.from(new Set(
+    deletedIds
+      .map((id) => String(id || '').trim())
+      .filter((id) => id && !upsertIds.has(id))
+  ))
+  if (!normalizedUpserts.length && !normalizedDeletedIds.length) {
+    return normalizedCurrent
+  }
+  const nextRecords = { ...normalizedCurrent.records }
+  for (const id of normalizedDeletedIds) {
+    delete nextRecords[id]
+  }
+  for (const record of normalizedUpserts) {
+    nextRecords[record.bookmarkId] = record
+  }
+  const nextIndex = normalizeIndex({
+    version: 1,
+    updatedAt: Math.max(
+      Number(updatedAt) || 0,
+      (Number(normalizedCurrent.updatedAt) || 0) + 1
+    ),
+    records: nextRecords
+  })
+
+  if (!isCuratorDataDbAvailable()) {
+    await writeContentSnapshotIndexToLocalStorage(nextIndex, transaction)
+    return nextIndex
+  }
+
+  try {
+    const committedMeta = await applyCuratorDataStoreDeltaWithMeta(
+      CURATOR_DATA_STORES.contentSnapshots,
+      normalizedUpserts,
+      normalizedDeletedIds,
+      buildContentSnapshotRepositoryMeta(nextIndex)
+    )
+    await compactContentSnapshotIndexLocalStorageWithMeta(committedMeta, transaction).catch(() => {})
+  } catch {
+    await writeContentSnapshotIndexToLocalStorage(nextIndex, transaction)
   }
   return nextIndex
 }
@@ -127,48 +198,70 @@ async function loadContentSnapshotIndexFromLocalStorage(): Promise<ContentSnapsh
   return normalizeIndex(stored[STORAGE_KEYS.contentSnapshotIndex])
 }
 
-async function migrateContentSnapshotIndexToIndexedDb(index: ContentSnapshotIndex): Promise<void> {
+async function migrateContentSnapshotIndexToIndexedDb(
+  index: ContentSnapshotIndex,
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   await replaceContentSnapshotIndexInIndexedDb(index)
-  await compactContentSnapshotIndexLocalStorage(index).catch(() => {})
+  await compactContentSnapshotIndexLocalStorage(index, transaction).catch(() => {})
 }
 
 async function replaceContentSnapshotIndexInIndexedDb(index: ContentSnapshotIndex): Promise<void> {
-  await replaceCuratorDataStore(
+  await replaceCuratorDataStoreWithMeta(
     CURATOR_DATA_STORES.contentSnapshots,
-    Object.values(index.records)
+    Object.values(index.records),
+    buildContentSnapshotRepositoryMeta(index)
   )
-  await writeContentSnapshotRepositoryMeta(index)
 }
 
-async function writeContentSnapshotRepositoryMeta(index: ContentSnapshotIndex): Promise<void> {
-  await writeCuratorDataStoreMeta({
+function buildContentSnapshotRepositoryMeta(index: ContentSnapshotIndex) {
+  return {
     key: CONTENT_SNAPSHOT_REPOSITORY_META_KEY,
-    version: 1,
+    version: 1 as const,
     updatedAt: Number(index.updatedAt) || 0,
     recordCount: Object.keys(index.records || {}).length,
     migratedAt: Date.now(),
     compactedAt: Date.now()
-  })
+  }
 }
 
-async function compactContentSnapshotIndexLocalStorage(index: ContentSnapshotIndex): Promise<void> {
+async function compactContentSnapshotIndexLocalStorage(
+  index: ContentSnapshotIndex,
+  transaction?: LocalStorageTransaction
+): Promise<void> {
+  await compactContentSnapshotIndexLocalStorageWithMeta(
+    buildContentSnapshotRepositoryMeta(index),
+    transaction
+  )
+}
+
+async function compactContentSnapshotIndexLocalStorageWithMeta(
+  meta: {
+    updatedAt: number
+    recordCount: number
+  },
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   await setLocalStorage({
     [STORAGE_KEYS.contentSnapshotIndex]: {
       version: 1,
-      updatedAt: Number(index.updatedAt) || 0,
+      updatedAt: Number(meta.updatedAt) || 0,
       records: {},
       migratedTo: 'indexedDB',
       repository: CONTENT_SNAPSHOT_REPOSITORY_META_KEY,
-      recordCount: Object.keys(index.records || {}).length,
+      recordCount: Number(meta.recordCount) || 0,
       compactedAt: Date.now()
     }
-  })
+  }, { transaction })
 }
 
-async function writeContentSnapshotIndexToLocalStorage(index: ContentSnapshotIndex): Promise<void> {
+async function writeContentSnapshotIndexToLocalStorage(
+  index: ContentSnapshotIndex,
+  transaction?: LocalStorageTransaction
+): Promise<void> {
   await setLocalStorage({
     [STORAGE_KEYS.contentSnapshotIndex]: index
-  })
+  }, { transaction })
 }
 
 function diffContentSnapshotIndexes(
@@ -223,6 +316,14 @@ function areContentSnapshotRecordsEquivalent(
     left.summary === right.summary &&
     left.title === right.title &&
     left.finalUrl === right.finalUrl
+}
+
+function dedupeContentSnapshotRecords(records: ContentSnapshotRecord[]): ContentSnapshotRecord[] {
+  const recordsByBookmarkId = new Map<string, ContentSnapshotRecord>()
+  for (const record of records) {
+    recordsByBookmarkId.set(record.bookmarkId, record)
+  }
+  return Array.from(recordsByBookmarkId.values())
 }
 
 function requireContentSnapshotRepositoryNormalizers(): ContentSnapshotRepositoryNormalizers {

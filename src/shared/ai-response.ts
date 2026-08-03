@@ -267,6 +267,38 @@ export function getAiTruncationIssue(payload: unknown, apiStyle: unknown): strin
   return ''
 }
 
+const AI_ERROR_MESSAGE_DETAIL_LIMIT = 240
+
+/**
+ * 供应商错误可能原样回显 Authorization、API Key 或请求 URL。展示前统一压平、
+ * 脱敏和限长，避免错误提示与通知成为凭据泄漏通道。
+ */
+export function sanitizeAiErrorText(
+  value: unknown,
+  maxLength = AI_ERROR_MESSAGE_DETAIL_LIMIT
+): string {
+  const normalized = String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const redacted = normalized
+    .replace(/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [REDACTED]')
+    .replace(
+      /(\bapi\s+key\b\s*[:=]?\s*["']?)([^"',;\s}&]+)/gi,
+      '$1[REDACTED]'
+    )
+    .replace(
+      /(["']?(?:api[_-]?key|apikey|authorization|x-api-key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)["']?\s*[:=]\s*["']?)([^"',;\s}&]+)/gi,
+      '$1[REDACTED]'
+    )
+    .replace(
+      /([?&](?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)=)([^&#\s]+)/gi,
+      '$1[REDACTED]'
+    )
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .replace(/\bAIza[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]')
+  return truncateText(redacted, maxLength)
+}
+
 export function extractAiErrorMessage(payload: unknown, statusCode: unknown, rawBody: unknown = ''): string {
   const responsePayload = payload && typeof payload === 'object'
     ? payload as {
@@ -285,11 +317,11 @@ export function extractAiErrorMessage(payload: unknown, statusCode: unknown, raw
     responsePayload?.error_description,
     typeof payload === 'string' ? payload : ''
   ]
-    .map((item) => String(item || '').replace(/\s+/g, ' ').trim())
+    .map((item) => sanitizeAiErrorText(item))
     .find(Boolean)
   const rawExcerpt = message
     ? ''
-    : truncateText(String(rawBody || '').replace(/\s+/g, ' ').trim(), 220)
+    : sanitizeAiErrorText(rawBody)
 
   return message
     ? `AI 请求失败（${statusCode}）：${message}`

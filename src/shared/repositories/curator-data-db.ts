@@ -18,6 +18,7 @@ const STORE_KEY_PATHS: Record<CuratorDataStoreName, string> = {
 }
 
 let curatorDataDbPromise: Promise<IDBDatabase> | null = null
+let curatorDataDbFailureForTest: ((operation: string) => Error | null | undefined) | null = null
 
 export interface CuratorDataStoreMeta {
   key: string
@@ -106,12 +107,19 @@ export async function applyCuratorDataStoreDeltaWithMeta<T extends object>(
   upserts: T[],
   deletedKeys: string[],
   meta: CuratorDataStoreMeta
-): Promise<void> {
+): Promise<CuratorDataStoreMeta> {
   const keyPath = STORE_KEY_PATHS[storeName]
-  await runCuratorDataMultiStoreTransaction(
-    [storeName, CURATOR_DATA_STORES.metadata],
-    (stores) => {
-      const dataStore = stores[storeName]
+  const db = await openCuratorDataDb()
+  return new Promise<CuratorDataStoreMeta>((resolve, reject) => {
+    const transaction = db.transaction(
+      [storeName, CURATOR_DATA_STORES.metadata],
+      'readwrite'
+    )
+    const dataStore = transaction.objectStore(storeName)
+    const metadataStore = transaction.objectStore(CURATOR_DATA_STORES.metadata)
+    let committedMeta: CuratorDataStoreMeta | null = null
+
+    try {
       for (const record of upserts) {
         const source = record as Record<string, unknown>
         if (record && String(source[keyPath] || '').trim()) {
@@ -124,9 +132,64 @@ export async function applyCuratorDataStoreDeltaWithMeta<T extends object>(
           dataStore.delete(normalizedKey)
         }
       }
-      stores[CURATOR_DATA_STORES.metadata].put(meta)
+
+      const existingMetaRequest = metadataStore.get(meta.key)
+      const recordCountRequest = dataStore.count()
+      let existingMeta: CuratorDataStoreMeta | null = null
+      let existingMetaLoaded = false
+      let recordCount: number | null = null
+
+      const writeComputedMeta = () => {
+        if (!existingMetaLoaded || recordCount === null || committedMeta) {
+          return
+        }
+        const existingUpdatedAt = Number(existingMeta?.updatedAt) || 0
+        committedMeta = {
+          ...meta,
+          updatedAt: Math.max(existingUpdatedAt, Number(meta.updatedAt) || 0),
+          recordCount,
+          migratedAt: Number(existingMeta?.migratedAt) || Number(meta.migratedAt) || Date.now()
+        }
+        metadataStore.put(committedMeta)
+      }
+
+      existingMetaRequest.addEventListener('success', () => {
+        const value = existingMetaRequest.result
+        existingMeta = value && typeof value === 'object'
+          ? value as CuratorDataStoreMeta
+          : null
+        existingMetaLoaded = true
+        writeComputedMeta()
+      })
+      recordCountRequest.addEventListener('success', () => {
+        recordCount = Number(recordCountRequest.result) || 0
+        writeComputedMeta()
+      })
+
+      const injectedFailure = curatorDataDbFailureForTest?.('apply-delta-with-meta')
+      if (injectedFailure) {
+        throw injectedFailure
+      }
+    } catch (error) {
+      transaction.abort()
+      reject(error)
+      return
     }
-  )
+
+    transaction.addEventListener('complete', () => {
+      if (!committedMeta) {
+        reject(new Error('数据仓库元数据写入失败。'))
+        return
+      }
+      resolve(committedMeta)
+    })
+    transaction.addEventListener('error', () => {
+      reject(transaction.error || new Error('数据仓库写入失败。'))
+    })
+    transaction.addEventListener('abort', () => {
+      reject(transaction.error || new Error('数据仓库写入中断。'))
+    })
+  })
 }
 
 export async function clearCuratorDataStore(storeName: CuratorDataStoreName): Promise<void> {
@@ -157,6 +220,13 @@ export function resetCuratorDataDbForTest(): void {
     void curatorDataDbPromise.then((db) => db.close()).catch(() => {})
   }
   curatorDataDbPromise = null
+  curatorDataDbFailureForTest = null
+}
+
+export function setCuratorDataDbFailureForTest(
+  failure: ((operation: string) => Error | null | undefined) | null
+): void {
+  curatorDataDbFailureForTest = failure
 }
 
 function openCuratorDataDb(): Promise<IDBDatabase> {

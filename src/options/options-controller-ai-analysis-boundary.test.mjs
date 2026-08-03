@@ -17,8 +17,12 @@ const retryRunner = getSection(
   'function createAiNamingRunFailure('
 )
 const topLevelRun = getSection(
-  'async function runAiNamingSuggestions()',
+  'async function runAiNamingSuggestions({',
   'async function runAiNamingSuggestionChunks('
+)
+const beginRun = getSection(
+  'function beginAiAnalysisRunSession(',
+  'function hasActiveAiAnalysisRunSession('
 )
 const prepareRunner = getSection(
   'async function prepareAiNamingChunk(',
@@ -37,8 +41,32 @@ const resetRunState = getSection(
   'function markAiNamingBookmarkCompleted('
 )
 const commitResult = getSection(
-  'async function commitAiNamingResult(',
-  'function buildAiNamingResultFromModelItem('
+  'async function commitAiNamingResults(',
+  'async function persistAiNamingTagRecords('
+)
+const permissionRun = getSection(
+  'async function ensureAiNamingPermissionsForRun(',
+  'async function ensureAiNamingProviderPermission('
+)
+const batchRequest = getSection(
+  'async function requestAiNamingBatch(',
+  'function getResolvedAiProviderEndpoint('
+)
+const checkpointPersistence = getSection(
+  'async function persistAiAnalysisCheckpoint(',
+  'function scheduleAiAnalysisCheckpointSave('
+)
+const responseReader = getSection(
+  'async function fetchTextWithRequestTimeout(',
+  'function throwIfAborted('
+)
+const mutationGuard = getSection(
+  'async function requireCurrentAiNamingBookmark(',
+  'function validateAiNamingSettings('
+)
+const providerSettingsAction = getSection(
+  'export function handleAiProviderSettingsAction(',
+  'export function handleContentSnapshotSettingsChange('
 )
 
 assert.match(
@@ -51,19 +79,39 @@ assert.match(
   /recordAiGenerationFailure\(failureCircuit, error\)[\s\S]*?failureDecision\.shouldStop[\s\S]*?throw createAiNamingRunFailure/,
   'a failed batch should open the circuit before the next chunk can run'
 )
+assert.ok(
+  chunkRunner.indexOf('await mergeAiNamingBatchResults') <
+    chunkRunner.indexOf('recordAiGenerationSuccess(failureCircuit)'),
+  'generation success must not reset the failure circuit until local persistence succeeds'
+)
+assert.match(
+  chunkRunner,
+  /if \(isAiNamingPersistenceFailure\(error\)\) \{[\s\S]*?throw error[\s\S]*?recordAiGenerationFailure/,
+  'a local persistence failure must stop before any paid retry is scheduled'
+)
 assert.match(
   retryRunner,
-  /requestAiNamingBatch\(\[preparedItem\], \{\s*signal: controller\.signal\s*\}\)/,
-  'single-item isolation retries must inherit the active run AbortSignal'
+  /requestAiNamingBatch\(\[preparedItem\], \{[\s\S]*?deadlineAtMs: requestDeadlineAtMs,[\s\S]*?signal: controller\.signal,[\s\S]*?settings/,
+  'single-item isolation retries must inherit the active run AbortSignal, deadline, and settings snapshot'
 )
 assert.match(
   retryRunner,
   /recordAiGenerationFailure\(failureCircuit, retryError\)[\s\S]*?throw createAiNamingRunFailure/,
   'a second terminal generation failure should escape the retry loop'
 )
+assert.ok(
+  retryRunner.indexOf('await commitAiNamingResult') <
+    retryRunner.indexOf('recordAiGenerationSuccess(failureCircuit)'),
+  'isolated retries count as successful only after their result is durable'
+)
+assert.match(
+  retryRunner,
+  /if \(isAiNamingPersistenceFailure\(retryError\)\) \{[\s\S]*?throw retryError[\s\S]*?buildAiNamingRetriedFailureResult/,
+  'isolated retries must immediately surface a persistence failure without another model call'
+)
 assert.match(
   topLevelRun,
-  /catch \(error\)[\s\S]*?lastRunOutcome = 'failed'[\s\S]*?normalizeAiNamingRunFailure\(error\)/,
+  /catch \(error\)[\s\S]*?lastRunOutcome = stopped \? 'stopped' : 'failed'[\s\S]*?normalizeAiNamingRunFailure\(error\)/,
   'automatic circuit failures should publish a failed outcome and the concrete API error'
 )
 assert.doesNotMatch(
@@ -87,8 +135,8 @@ assert.match(
   'each AI run should reset its completed-result identity set'
 )
 assert.match(
-  topLevelRun,
-  /runTotalBookmarks = aiNamingState\.bookmarks\.length/,
+  beginRun,
+  /runTotalBookmarks = aiNamingState\.eligibleBookmarks/,
   'each AI run should freeze its progress denominator'
 )
 assert.match(
@@ -129,6 +177,65 @@ assert.match(
   progressPanelSource,
   /progressMax=\{state\.progressMax\}[\s\S]*?progressDivisions=\{state\.progressMax\}/,
   'small AI runs should expose exact equal divisions on the progress track'
+)
+assert.ok(
+  permissionRun.indexOf('requestPermissions({') < permissionRun.indexOf('containsPermissions({'),
+  'interactive AI permission requests must not await a contains check before requesting'
+)
+assert.match(
+  chunkRunner,
+  /const chunkSize = start === 0 \? 1 : settings\.batchSize/,
+  'the first structured generation request should probe one bookmark before larger batches'
+)
+assert.match(
+  batchRequest,
+  /const settings = options\.settings \|\|[\s\S]*?deadlineAtMs: options\.deadlineAtMs/,
+  'AI requests must consume the immutable run settings and shared absolute deadline'
+)
+assert.ok(
+  commitResult.indexOf('await persistAiNamingTagRecords') <
+    commitResult.indexOf('upsertAiNamingResult(result)'),
+  'a successful result must be persisted before it is published as complete'
+)
+assert.match(
+  commitResult,
+  /status: 'failed'[\s\S]*?reason: `AI 已返回分析结果，但本地标签数据保存失败[\s\S]*?throw createAiNamingPersistenceFailure\(error\)/,
+  'a failed local commit must retain failed rows and terminate the run with the concrete storage error'
+)
+assert.match(
+  checkpointPersistence,
+  /\[STORAGE_KEYS\.aiAnalysisCheckpoint\]: checkpoint/,
+  'completed partial AI results should be checkpointed outside page memory'
+)
+assert.match(
+  responseReader,
+  /const text = await readResponseTextWithLimit\(response,[\s\S]*?finally \{[\s\S]*?clearTimeout\(timeoutId\)/,
+  'request timeout cleanup must happen after the complete response body is read'
+)
+assert.match(
+  responseReader,
+  /content-length[\s\S]*?getReader\(\)[\s\S]*?bytesRead > normalizedMaxBytes/,
+  'auxiliary AI and page responses must enforce declared and streamed body limits'
+)
+assert.match(
+  mutationGuard,
+  /getBookmarkById\(bookmarkId\)[\s\S]*?latestBookmark\.url[\s\S]*?latestBookmark\.title[\s\S]*?latestBookmark\.parentId/,
+  'applying an AI result must revalidate URL, title, and parent immediately before mutation'
+)
+assert.match(
+  providerSettingsAction,
+  /providerOriginChanged[\s\S]*?apiKey: providerOriginChanged \? '' : previousSettings\.apiKey/,
+  'changing the provider origin must not retain a key from the previous provider'
+)
+assert.ok(
+  topLevelRun.indexOf('await requestAiNamingConnectivityTest(settings') <
+    topLevelRun.indexOf('initializeAiAnalysisRunState(bookmarks.length'),
+  'the provider canary must fail before replacing the previous analysis results'
+)
+assert.match(
+  topLevelRun,
+  /requestAiNamingConnectivityTest\(settings, \{[\s\S]*?signal: controller\.signal/,
+  'the provider canary must stop with the active analysis session'
 )
 
 console.log('Options AI analysis controller boundary tests passed.')

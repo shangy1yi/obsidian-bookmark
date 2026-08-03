@@ -3,11 +3,27 @@ import test from 'node:test'
 import { IDBFactory } from 'fake-indexeddb'
 import {
   __resetBookmarkTagRepositoryForTest,
+  buildBookmarkTagRecord,
   loadBookmarkTagIndex,
   restoreBookmarkTagIndexSnapshot,
+  upsertBookmarkTagsFromAnalysis,
+  type BookmarkTagRecord,
   type BookmarkTagIndex
 } from './bookmark-tags.js'
 import { STORAGE_KEYS } from './constants.js'
+import {
+  __resetContentSnapshotRepositoryForTest,
+  loadContentSnapshotIndex,
+  saveContentSnapshotFromContext,
+  saveContentSnapshotsFromContexts,
+  setContentFullTextOperationsForTest,
+  type ContentFullTextRecord
+} from './content-snapshots.js'
+import {
+  readCuratorDataStoreMeta,
+  setCuratorDataDbFailureForTest
+} from './repositories/curator-data-db.js'
+import { applyBookmarkTagRecordsDeltaInRepository } from './repositories/tag-repository.js'
 
 class NonReentrantTestLockManager {
   requestCount = 0
@@ -214,3 +230,197 @@ test('strict tag snapshot restore rejects a failed local compaction and remains 
     'successful retry must leave the local compatibility record compacted'
   )
 })
+
+test('batch tag analysis commits multiple records under one storage lock', async () => {
+  resetTestStorage()
+
+  const records = await upsertBookmarkTagsFromAnalysis([
+    createTagAnalysisInput('batch-a', ['alpha']),
+    createTagAnalysisInput('batch-b', ['beta'])
+  ])
+
+  assert.equal(records.length, 2)
+  assert.equal(lockManager.requestCount, 1)
+  const loaded = await loadBookmarkTagIndex()
+  assert.deepEqual(loaded.records['batch-a']?.tags, ['alpha'])
+  assert.deepEqual(loaded.records['batch-b']?.tags, ['beta'])
+  const meta = await readCuratorDataStoreMeta('bookmarkTags')
+  assert.equal(meta?.recordCount, 2)
+})
+
+test('record-level tag delta preserves records committed by another context', async () => {
+  resetTestStorage()
+  await upsertBookmarkTagsFromAnalysis([
+    createTagAnalysisInput('delta-a', ['alpha']),
+    createTagAnalysisInput('delta-b', ['beta'])
+  ])
+  const current = await loadBookmarkTagIndex()
+  const staleIndex: BookmarkTagIndex = {
+    ...current,
+    records: {
+      'delta-a': current.records['delta-a']
+    }
+  }
+  const record = buildBookmarkTagRecord(createTagAnalysisInput('delta-c', ['gamma']))
+  assert.ok(record)
+
+  await applyBookmarkTagRecordsDeltaInRepository(staleIndex, {
+    upserts: [record as BookmarkTagRecord],
+    updatedAt: Date.now()
+  })
+
+  const loaded = await loadBookmarkTagIndex()
+  assert.deepEqual(Object.keys(loaded.records).sort(), ['delta-a', 'delta-b', 'delta-c'])
+  const meta = await readCuratorDataStoreMeta('bookmarkTags')
+  assert.equal(meta?.recordCount, 3)
+})
+
+test('batch snapshots use one blob batch and one index transaction', async () => {
+  resetTestStorage({ snapshots: true })
+  const blobs = new Map<string, ContentFullTextRecord>()
+  let putManyCalls = 0
+  const restoreOperations = setContentFullTextOperationsForTest({
+    putMany: async (records) => {
+      putManyCalls += 1
+      for (const record of records) {
+        blobs.set(record.snapshotId, structuredClone(record))
+      }
+    },
+    deleteMany: async (snapshotIds) => {
+      for (const snapshotId of snapshotIds) {
+        blobs.delete(snapshotId)
+      }
+    }
+  })
+
+  try {
+    const records = await saveContentSnapshotsFromContexts([
+      createSnapshotInput('snapshot-a', 100),
+      createSnapshotInput('snapshot-b', 101)
+    ])
+
+    assert.equal(records.length, 2)
+    assert.equal(putManyCalls, 1)
+    assert.equal(blobs.size, 2)
+    assert.equal(lockManager.requestCount, 1)
+    const loaded = await loadContentSnapshotIndex()
+    assert.deepEqual(Object.keys(loaded.records).sort(), ['snapshot-a', 'snapshot-b'])
+    const meta = await readCuratorDataStoreMeta('contentSnapshots')
+    assert.equal(meta?.recordCount, 2)
+  } finally {
+    restoreOperations()
+  }
+})
+
+test('failed snapshot index commit removes the new blob and preserves the previous blob', async () => {
+  resetTestStorage({ snapshots: true })
+  const blobs = new Map<string, ContentFullTextRecord>()
+  const deletedSnapshotIds: string[] = []
+  const restoreOperations = setContentFullTextOperationsForTest({
+    putMany: async (records) => {
+      for (const record of records) {
+        blobs.set(record.snapshotId, structuredClone(record))
+      }
+    },
+    deleteMany: async (snapshotIds) => {
+      deletedSnapshotIds.push(...snapshotIds)
+      for (const snapshotId of snapshotIds) {
+        blobs.delete(snapshotId)
+      }
+    }
+  })
+
+  try {
+    const previous = await saveContentSnapshotFromContext(
+      createSnapshotInput('snapshot-replace', 200)
+    )
+    assert.ok(previous?.fullTextRef)
+    const previousFullTextRef = previous?.fullTextRef || ''
+
+    failStorageSet = true
+    setCuratorDataDbFailureForTest((operation) => (
+      operation === 'apply-delta-with-meta'
+        ? new Error('simulated snapshot index failure')
+        : null
+    ))
+    await assert.rejects(
+      saveContentSnapshotFromContext(createSnapshotInput('snapshot-replace', 201)),
+      /simulated tag compaction failure/
+    )
+
+    failStorageSet = false
+    setCuratorDataDbFailureForTest(null)
+    const afterFailure = await loadContentSnapshotIndex()
+    assert.equal(afterFailure.records['snapshot-replace']?.fullTextRef, previousFullTextRef)
+    assert.equal(blobs.has(previousFullTextRef), true)
+    assert.equal(blobs.has('snapshot-snapshot-replace-201'), false)
+    assert.equal(deletedSnapshotIds.includes(previousFullTextRef), false)
+
+    const saved = await saveContentSnapshotFromContext(
+      createSnapshotInput('snapshot-replace', 202)
+    )
+    assert.equal(saved?.fullTextRef, 'snapshot-snapshot-replace-202')
+    assert.equal(blobs.has(previousFullTextRef), false)
+    assert.equal(blobs.has('snapshot-snapshot-replace-202'), true)
+  } finally {
+    failStorageSet = false
+    setCuratorDataDbFailureForTest(null)
+    restoreOperations()
+  }
+})
+
+function resetTestStorage({ snapshots = false }: { snapshots?: boolean } = {}): void {
+  __resetBookmarkTagRepositoryForTest()
+  if (snapshots) {
+    __resetContentSnapshotRepositoryForTest()
+  }
+  globalThis.indexedDB = new IDBFactory()
+  lockManager.requestCount = 0
+  runtimeError = ''
+  failStorageSet = false
+  storageState = {}
+}
+
+function createTagAnalysisInput(bookmarkId: string, tags: string[]) {
+  return {
+    bookmark: {
+      id: bookmarkId,
+      title: bookmarkId,
+      url: `https://${bookmarkId}.example/`,
+      path: 'Bookmarks'
+    },
+    analysis: {
+      tags,
+      summary: `${bookmarkId} summary`,
+      confidence: 0.9
+    },
+    source: 'ai_naming' as const,
+    model: 'test-model',
+    now: 100
+  }
+}
+
+function createSnapshotInput(bookmarkId: string, now: number) {
+  return {
+    bookmark: {
+      id: bookmarkId,
+      title: bookmarkId,
+      url: `https://${bookmarkId}.example/`
+    },
+    context: {
+      title: bookmarkId,
+      mainText: `${bookmarkId} `.repeat(3_000),
+      extractionStatus: 'success',
+      source: 'page'
+    },
+    settings: {
+      version: 1 as const,
+      enabled: true,
+      autoCaptureOnBookmarkCreate: true,
+      saveFullText: true,
+      fullTextSearchEnabled: true,
+      localOnlyNoAiUpload: false
+    },
+    now
+  }
+}

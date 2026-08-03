@@ -4,7 +4,8 @@ import {
   extractChatCompletionsJsonText,
   extractResponsesJsonText,
   getAiEndpoint,
-  getAiTruncationIssue
+  getAiTruncationIssue,
+  sanitizeAiErrorText
 } from './ai-response.js'
 import {
   getAiProviderAuthHeaders,
@@ -77,10 +78,19 @@ export interface AiStructuredRequest<T> {
   userPrompt: string
   signal?: AbortSignal | null
   timeoutMs?: number
+  /**
+   * 整次结构化请求的相对时间预算。兼容降级、修复请求、瞬时错误重试与退避
+   * 都共享这一个预算；省略时沿用 timeoutMs/settings.timeoutMs 作为总预算。
+   */
+  totalBudgetMs?: number
+  /** 整次结构化请求的绝对截止时间（Unix 毫秒），可用于跨调用链传递剩余预算。 */
+  deadlineAtMs?: number
   fetchImpl?: typeof fetch
   retry?: boolean
   validate?: (data: T) => void
 }
+
+export const AI_PROVIDER_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
 
 export interface AiPromptEnvelope {
   settings: Pick<
@@ -565,11 +575,22 @@ export async function requestStructuredAiOutput<T>({
   userPrompt,
   signal = null,
   timeoutMs,
+  totalBudgetMs,
+  deadlineAtMs,
   fetchImpl = fetch,
   retry = true,
   validate
 }: AiStructuredRequest<T>): Promise<AiRuntimeResult<T>> {
   ensureAiProviderConfigured(settings)
+  const startedAtMs = Date.now()
+  const effectiveRequestTimeoutMs = normalizeAiRequestTimeoutMs(timeoutMs || settings.timeoutMs)
+  const effectiveDeadlineAtMs = resolveAiRequestDeadlineAtMs({
+    startedAtMs,
+    requestTimeoutMs: effectiveRequestTimeoutMs,
+    totalBudgetMs,
+    deadlineAtMs
+  })
+  const effectiveTotalBudgetMs = Math.max(1, effectiveDeadlineAtMs - startedAtMs)
   const directAnthropic = isDirectAnthropicProvider(settings.baseUrl)
   const endpoint = directAnthropic
     ? getAnthropicMessagesEndpoint(settings.baseUrl)
@@ -590,7 +611,7 @@ export async function requestStructuredAiOutput<T>({
     lastError: unknown = null,
     lastRawText = ''
   ): Promise<AiRuntimeResult<T>> => {
-    throwIfAiAborted(signal)
+    throwIfAiRequestUnavailable(signal, effectiveDeadlineAtMs, effectiveTotalBudgetMs)
     const repaired = attempt > 1 && shouldUseRepairRetry(lastError)
     const effectiveUserPrompt = repaired
       ? buildRepairUserPrompt(userPrompt, schemaName, lastRawText, lastError)
@@ -612,7 +633,9 @@ export async function requestStructuredAiOutput<T>({
         settings,
         requestBody,
         signal,
-        timeoutMs,
+        timeoutMs: effectiveRequestTimeoutMs,
+        deadlineAtMs: effectiveDeadlineAtMs,
+        totalBudgetMs: effectiveTotalBudgetMs,
         fetchImpl
       })
       attemptPayload = payload
@@ -707,7 +730,13 @@ export async function requestStructuredAiOutput<T>({
         }
         transientRetryAttemptsLeft -= 1
         // 限流/服务端错误/网络抖动：退避后重试，优先尊重 Retry-After。
-        await waitForAiRetryDelay(normalizedError, attempt, signal)
+        await waitForAiRetryDelay(
+          normalizedError,
+          attempt,
+          signal,
+          effectiveDeadlineAtMs,
+          effectiveTotalBudgetMs
+        )
       }
       return runAttempt(attempt + 1, normalizedError, attemptRawText)
     }
@@ -899,6 +928,8 @@ async function requestAiProviderPayload({
   requestBody,
   signal,
   timeoutMs,
+  deadlineAtMs,
+  totalBudgetMs,
   fetchImpl
 }: {
   endpoint: string
@@ -906,11 +937,17 @@ async function requestAiProviderPayload({
   requestBody: unknown
   signal?: AbortSignal | null
   timeoutMs?: number
+  deadlineAtMs: number
+  totalBudgetMs: number
   fetchImpl: typeof fetch
 }): Promise<unknown> {
   const controller = new AbortController()
   const externalSignal = signal
-  const effectiveTimeoutMs = normalizeAiRequestTimeoutMs(timeoutMs || settings.timeoutMs)
+  throwIfAiRequestUnavailable(externalSignal, deadlineAtMs, totalBudgetMs)
+  const configuredTimeoutMs = normalizeAiRequestTimeoutMs(timeoutMs || settings.timeoutMs)
+  const remainingBudgetMs = getAiRequestRemainingMs(deadlineAtMs)
+  const effectiveTimeoutMs = Math.max(1, Math.min(configuredTimeoutMs, remainingBudgetMs))
+  const deadlineLimitsAttempt = remainingBudgetMs <= configuredTimeoutMs
   let timedOut = false
   const abortCurrentFetch = () => {
     controller.abort()
@@ -939,17 +976,21 @@ async function requestAiProviderPayload({
       body: JSON.stringify(requestBody),
       signal: controller.signal
     })
-    const { payload, rawBody } = await readAiProviderResponseBody(response)
+    const { payload, rawBody, bytesRead } = await readAiProviderResponseBody(
+      response,
+      controller.signal
+    )
     if (!response.ok) {
+      const providerMessage = extractAiErrorMessage(payload, response.status, rawBody)
       throw new AiRuntimeError(
         'provider',
-        extractAiErrorMessage(payload, response.status, rawBody),
+        providerMessage,
         {
           status: response.status,
           retryable: isRetryableProviderStatus(response.status),
           details: {
             retryAfterMs: parseRetryAfterMs(response.headers?.get?.('retry-after')),
-            body: payload ?? { rawBody: cleanAiRuntimeText(rawBody, 1200) }
+            responseBytes: bytesRead
           }
         }
       )
@@ -957,26 +998,31 @@ async function requestAiProviderPayload({
     if (payload === null && rawBody.trim()) {
       throw new AiRuntimeError(
         'parse',
-        `AI 返回了无效的 JSON 响应：${cleanAiRuntimeText(rawBody, 220)}`,
+        `AI 返回了无效的 JSON 响应：${sanitizeAiErrorText(rawBody, 220)}`,
         {
           retryable: true,
-          details: { rawBody: cleanAiRuntimeText(rawBody, 1200) }
+          details: { responseBytes: bytesRead }
         }
       )
     }
     return payload
   } catch (error) {
-    if (timedOut && isAbortError(error)) {
+    if (timedOut) {
       throw new AiRuntimeError(
         'abort',
-        buildAiTimeoutMessage(effectiveTimeoutMs),
+        deadlineLimitsAttempt
+          ? buildAiDeadlineMessage(totalBudgetMs)
+          : buildAiTimeoutMessage(effectiveTimeoutMs),
         {
           cause: error,
-          details: { timeoutMs: effectiveTimeoutMs }
+          details: {
+            timeoutMs: effectiveTimeoutMs,
+            deadlineAtMs
+          }
         }
       )
     }
-    if (externalSignal?.aborted && isAbortError(error)) {
+    if (externalSignal?.aborted) {
       throw new AiRuntimeError('abort', 'AI 请求已取消。', { cause: error })
     }
     throw normalizeAiRuntimeError(error)
@@ -986,18 +1032,164 @@ async function requestAiProviderPayload({
   }
 }
 
-async function readAiProviderResponseBody(response: Response): Promise<{ payload: unknown | null; rawBody: string }> {
-  const rawBody = await response.text()
+async function readAiProviderResponseBody(
+  response: Response,
+  signal?: AbortSignal | null
+): Promise<{ payload: unknown | null; rawBody: string; bytesRead: number }> {
+  const contentLength = parseAiContentLength(response.headers?.get?.('content-length'))
+  if (contentLength !== undefined && contentLength > AI_PROVIDER_RESPONSE_MAX_BYTES) {
+    await cancelAiResponseBody(response)
+    throw buildAiResponseTooLargeError(response.status, contentLength)
+  }
+
+  const body = response.body
+  const reader = body && typeof body.getReader === 'function'
+    ? body.getReader()
+    : null
+  let rawBody = ''
+  let bytesRead = 0
+
+  if (reader) {
+    const decoder = new TextDecoder()
+    const textChunks: string[] = []
+    try {
+      while (true) {
+        const result = await waitForAiBodyOperation(reader.read(), signal)
+        if (result.done) {
+          break
+        }
+        const chunk = normalizeAiResponseChunk(result.value)
+        bytesRead += chunk.byteLength
+        if (bytesRead > AI_PROVIDER_RESPONSE_MAX_BYTES) {
+          await cancelAiReader(reader)
+          throw buildAiResponseTooLargeError(response.status, bytesRead)
+        }
+        textChunks.push(decoder.decode(chunk, { stream: true }))
+      }
+      textChunks.push(decoder.decode())
+      rawBody = textChunks.join('')
+    } finally {
+      try {
+        reader.releaseLock()
+      } catch {
+        // 某些测试 Response 或已取消的流不支持重复释放，忽略清理错误。
+      }
+    }
+  } else {
+    rawBody = await waitForAiBodyOperation(response.text(), signal)
+    bytesRead = new TextEncoder().encode(rawBody).byteLength
+    if (bytesRead > AI_PROVIDER_RESPONSE_MAX_BYTES) {
+      await cancelAiResponseBody(response)
+      throw buildAiResponseTooLargeError(response.status, bytesRead)
+    }
+  }
+
   const trimmedBody = rawBody.trim()
   if (!trimmedBody) {
-    return { payload: null, rawBody }
+    return { payload: null, rawBody, bytesRead }
   }
 
   try {
-    return { payload: JSON.parse(trimmedBody), rawBody }
+    return { payload: JSON.parse(trimmedBody), rawBody, bytesRead }
   } catch {
-    return { payload: null, rawBody }
+    return { payload: null, rawBody, bytesRead }
   }
+}
+
+function normalizeAiResponseChunk(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) {
+    return value
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value)
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+  }
+  return new TextEncoder().encode(String(value ?? ''))
+}
+
+function waitForAiBodyOperation<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal | null
+): Promise<T> {
+  if (!signal) {
+    return operation
+  }
+  if (signal.aborted) {
+    return Promise.reject(createAbortException())
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(createAbortException())
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      }
+    )
+  })
+}
+
+function createAbortException(): Error {
+  if (typeof DOMException === 'function') {
+    return new DOMException('The operation was aborted.', 'AbortError')
+  }
+  const error = new Error('The operation was aborted.')
+  error.name = 'AbortError'
+  return error
+}
+
+async function cancelAiResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel()
+  } catch {
+    // 响应已取消、锁定或 mock 未实现 cancel 时无需覆盖原始诊断。
+  }
+}
+
+async function cancelAiReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): Promise<void> {
+  try {
+    await reader.cancel()
+  } catch {
+    // 保留“响应过大”作为主错误。
+  }
+}
+
+function parseAiContentLength(value: unknown): number | undefined {
+  const normalized = String(value ?? '').trim()
+  if (!/^\d+$/.test(normalized)) {
+    return undefined
+  }
+  const contentLength = Number(normalized)
+  if (!Number.isFinite(contentLength)) {
+    return AI_PROVIDER_RESPONSE_MAX_BYTES + 1
+  }
+  return contentLength >= 0 ? contentLength : undefined
+}
+
+function buildAiResponseTooLargeError(status: unknown, bytes: number): AiRuntimeError {
+  const limitMb = Math.round(AI_PROVIDER_RESPONSE_MAX_BYTES / (1024 * 1024))
+  return new AiRuntimeError(
+    'provider',
+    `AI 响应体超过 ${limitMb} MB 安全上限，已停止读取。请减小批量大小或检查自定义 API 返回内容。`,
+    {
+      status: Number(status) || undefined,
+      retryable: false,
+      details: {
+        maxBytes: AI_PROVIDER_RESPONSE_MAX_BYTES,
+        receivedBytes: Math.max(0, Number(bytes) || 0)
+      }
+    }
+  )
 }
 
 function normalizeAiRequestTimeoutMs(timeoutMs: unknown): number {
@@ -1007,6 +1199,57 @@ function normalizeAiRequestTimeoutMs(timeoutMs: unknown): number {
 function buildAiTimeoutMessage(timeoutMs: number): string {
   const seconds = Math.max(1, Math.round(normalizeAiRequestTimeoutMs(timeoutMs) / 1000))
   return `AI 请求超时，超过 ${seconds} 秒仍未返回。请稍后重试或在通用设置里调大请求超时。`
+}
+
+function buildAiDeadlineMessage(totalBudgetMs: number): string {
+  const normalizedBudgetMs = Math.max(1, Math.round(totalBudgetMs))
+  const duration = normalizedBudgetMs < 1000
+    ? `${normalizedBudgetMs} 毫秒`
+    : `${Math.max(1, Math.round(normalizedBudgetMs / 1000))} 秒`
+  return `AI 请求超时：总时限 ${duration} 已用尽。兼容降级与重试不会获得额外等待时间。`
+}
+
+function resolveAiRequestDeadlineAtMs({
+  startedAtMs,
+  requestTimeoutMs,
+  totalBudgetMs,
+  deadlineAtMs
+}: {
+  startedAtMs: number
+  requestTimeoutMs: number
+  totalBudgetMs?: number
+  deadlineAtMs?: number
+}): number {
+  const requestedBudgetMs = Number(totalBudgetMs)
+  const requestedDeadlineAtMs = Number(deadlineAtMs)
+  const explicitDeadlines: number[] = []
+  if (Number.isFinite(requestedBudgetMs) && requestedBudgetMs > 0) {
+    explicitDeadlines.push(startedAtMs + Math.max(1, requestedBudgetMs))
+  }
+  if (Number.isFinite(requestedDeadlineAtMs) && requestedDeadlineAtMs > 0) {
+    explicitDeadlines.push(requestedDeadlineAtMs)
+  }
+  return explicitDeadlines.length
+    ? Math.min(...explicitDeadlines)
+    : startedAtMs + requestTimeoutMs
+}
+
+function getAiRequestRemainingMs(deadlineAtMs: number): number {
+  return Math.max(0, Math.ceil(deadlineAtMs - Date.now()))
+}
+
+function throwIfAiRequestUnavailable(
+  signal: AbortSignal | null | undefined,
+  deadlineAtMs: number,
+  totalBudgetMs: number
+): void {
+  throwIfAiAborted(signal)
+  if (getAiRequestRemainingMs(deadlineAtMs) <= 0) {
+    throw new AiRuntimeError('abort', buildAiDeadlineMessage(totalBudgetMs), {
+      retryable: false,
+      details: { deadlineAtMs }
+    })
+  }
 }
 
 function validateSchemaNode(value: unknown, schema: JsonSchema, path: string, issues: string[]): void {
@@ -1172,7 +1415,14 @@ const AI_RETRY_BASE_DELAY_MS = 600
 const AI_RETRY_MAX_DELAY_MS = 15000
 
 /** 限流/服务端错误的退避等待：优先尊重 Retry-After，否则指数退避 + 抖动。 */
-async function waitForAiRetryDelay(error: AiRuntimeError, attempt: number, signal?: AbortSignal | null): Promise<void> {
+async function waitForAiRetryDelay(
+  error: AiRuntimeError,
+  attempt: number,
+  signal: AbortSignal | null | undefined,
+  deadlineAtMs: number,
+  totalBudgetMs: number
+): Promise<void> {
+  throwIfAiRequestUnavailable(signal, deadlineAtMs, totalBudgetMs)
   const retryAfterMs = error.details && typeof error.details === 'object'
     ? Number((error.details as { retryAfterMs?: unknown }).retryAfterMs)
     : Number.NaN
@@ -1185,6 +1435,11 @@ async function waitForAiRetryDelay(error: AiRuntimeError, attempt: number, signa
     : backoffMs
   if (delayMs <= 0) {
     return
+  }
+  const remainingMs = getAiRequestRemainingMs(deadlineAtMs)
+  if (delayMs >= remainingMs) {
+    await sleepWithAbort(remainingMs, signal)
+    throwIfAiRequestUnavailable(signal, deadlineAtMs, totalBudgetMs)
   }
   await sleepWithAbort(delayMs, signal)
 }

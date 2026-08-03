@@ -1,5 +1,6 @@
 import { STORAGE_KEYS } from './constants.js'
 import {
+  applyBookmarkTagRecordsDeltaInRepository,
   clearBookmarkTagIndexInRepository,
   configureBookmarkTagRepository,
   loadBookmarkTagIndexFromRepository,
@@ -491,32 +492,60 @@ export async function clearBookmarkTagIndex(): Promise<void> {
 }
 
 export async function upsertBookmarkTagRecord(record: BookmarkTagRecord): Promise<BookmarkTagIndex> {
-  const normalizedRecord = normalizeBookmarkTagRecord(record)
-  if (!hasUsefulBookmarkTagData(normalizedRecord)) {
+  return upsertBookmarkTagRecords([record])
+}
+
+export async function upsertBookmarkTagRecords(
+  records: BookmarkTagRecord[]
+): Promise<BookmarkTagIndex> {
+  const normalizedRecords = Array.from(new Map(
+    records.flatMap((record) => {
+      const normalized = normalizeBookmarkTagRecord(record)
+      return hasUsefulBookmarkTagData(normalized)
+        ? [[normalized.bookmarkId, normalized] as const]
+        : []
+    })
+  ).values())
+  if (!normalizedRecords.length) {
     return loadBookmarkTagIndex()
   }
 
-  return updateBookmarkTagIndex((current) => {
-    const existingRecord = current.records[normalizedRecord.bookmarkId]
+  const task = bookmarkTagIndexWriteQueue.then(async () => {
     const now = Date.now()
-    const nextRecord: BookmarkTagRecord = {
-      ...normalizedRecord,
-      updatedAt: now
-    }
-    if (existingRecord?.manualTags?.length && normalizedRecord.manualTags === undefined) {
-      nextRecord.manualTags = existingRecord.manualTags
-      nextRecord.manualUpdatedAt = existingRecord.manualUpdatedAt
-    }
+    return withLocalStorageTransaction(async (transaction) => {
+      const current = await loadBookmarkTagIndexFromRepository(transaction)
+      const upserts = normalizedRecords.map((normalizedRecord) => {
+        const existingRecord = current.records[normalizedRecord.bookmarkId]
+        const nextRecord: BookmarkTagRecord = {
+          ...normalizedRecord,
+          updatedAt: now
+        }
+        if (existingRecord?.manualTags?.length && normalizedRecord.manualTags === undefined) {
+          nextRecord.manualTags = existingRecord.manualTags
+          nextRecord.manualUpdatedAt = existingRecord.manualUpdatedAt
+        }
+        return nextRecord
+      })
+      const nextIndexForQuota = normalizeBookmarkTagIndex({
+        version: BOOKMARK_TAG_INDEX_VERSION,
+        updatedAt: now,
+        records: {
+          ...current.records,
+          ...Object.fromEntries(upserts.map((record) => [record.bookmarkId, record]))
+        }
+      })
+      assertBookmarkTagIndexWithinQuota(nextIndexForQuota)
 
-    return {
-      version: BOOKMARK_TAG_INDEX_VERSION,
-      updatedAt: now,
-      records: {
-        ...current.records,
-        [normalizedRecord.bookmarkId]: nextRecord
-      }
-    }
+      return applyBookmarkTagRecordsDeltaInRepository(
+        current,
+        { upserts, updatedAt: now },
+        transaction
+      )
+    })
   })
+
+  bookmarkTagIndexWriteQueue = task.catch(() => {})
+  return task
 }
 
 function updateBookmarkTagIndex(
@@ -542,13 +571,30 @@ export function __resetBookmarkTagRepositoryForTest(): void {
 }
 
 export async function upsertBookmarkTagFromAnalysis(input: BookmarkTagBuildInput): Promise<BookmarkTagRecord | null> {
-  const record = buildBookmarkTagRecord(input)
-  if (!hasUsefulBookmarkTagData(record)) {
-    return null
+  const records = await upsertBookmarkTagsFromAnalysis([input])
+  return records[0] || null
+}
+
+export async function upsertBookmarkTagsFromAnalysis(
+  inputs: BookmarkTagBuildInput[]
+): Promise<BookmarkTagRecord[]> {
+  const records = Array.from(new Map(
+    inputs.flatMap((input) => {
+      const record = buildBookmarkTagRecord(input)
+      return hasUsefulBookmarkTagData(record)
+        ? [[record.bookmarkId, record] as const]
+        : []
+    })
+  ).values())
+  if (!records.length) {
+    return []
   }
 
-  const index = await upsertBookmarkTagRecord(record)
-  return index.records[record.bookmarkId] || null
+  const index = await upsertBookmarkTagRecords(records)
+  return records.flatMap((record) => {
+    const saved = index.records[record.bookmarkId]
+    return saved ? [saved] : []
+  })
 }
 
 export async function saveManualBookmarkTags(

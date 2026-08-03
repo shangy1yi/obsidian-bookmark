@@ -1,6 +1,11 @@
 import { CONTENT_SNAPSHOT_LOCAL_TEXT_LIMIT, STORAGE_KEYS } from './constants.js'
-import { setLocalStorage } from './storage.js'
 import {
+  setLocalStorage,
+  withLocalStorageTransaction
+} from './storage.js'
+import {
+  applyContentSnapshotRecordsDeltaInRepository,
+  loadContentSnapshotIndexFromRepository,
   resetContentSnapshotRepositoryForTest,
   updateContentSnapshotIndexInRepository
 } from './repositories/snapshot-repository.js'
@@ -41,16 +46,20 @@ export const AUTO_BACKUP_STORE = 'autoBackups'
 let contentSnapshotIndexWriteQueue: Promise<unknown> = Promise.resolve()
 interface ContentFullTextOperations {
   put: (record: ContentFullTextRecord) => Promise<void>
+  putMany: (records: ContentFullTextRecord[]) => Promise<void>
   get: (snapshotId: string) => Promise<string>
   getMany: (snapshotIds: string[]) => Promise<Map<string, string>>
   delete: (snapshotId: string) => Promise<void>
+  deleteMany: (snapshotIds: string[]) => Promise<void>
 }
 
 let contentFullTextOperations: ContentFullTextOperations = {
   put: putContentFullText,
+  putMany: putContentFullTexts,
   get: getContentFullText,
   getMany: getContentFullTexts,
-  delete: deleteContentFullText
+  delete: deleteContentFullText,
+  deleteMany: deleteContentFullTexts
 }
 
 export interface ContentSnapshotSourceContext {
@@ -76,6 +85,13 @@ export interface ContentFullTextRecord {
   savedAt: number
 }
 
+export interface ContentSnapshotSaveInput {
+  bookmark: Pick<BookmarkRecord, 'id' | 'url' | 'title'>
+  context: ContentSnapshotSourceContext
+  settings?: ContentSnapshotSettings
+  now?: number
+}
+
 export async function saveContentSnapshotSettings(settings: unknown): Promise<ContentSnapshotSettings> {
   const normalized = normalizeContentSnapshotSettings(settings)
   await setLocalStorage({
@@ -89,54 +105,110 @@ export async function saveContentSnapshotFromContext({
   context,
   settings,
   now = Date.now()
-}: {
-  bookmark: Pick<BookmarkRecord, 'id' | 'url' | 'title'>
-  context: ContentSnapshotSourceContext
-  settings?: ContentSnapshotSettings
-  now?: number
-}): Promise<ContentSnapshotRecord | null> {
-  const normalizedSettings = normalizeContentSnapshotSettings(settings)
-  if (!normalizedSettings.enabled || !bookmark?.id) {
-    return null
-  }
-
-  const bookmarkId = String(bookmark.id || '').trim()
-  const { record, fullTextRecord } = buildContentSnapshotRecord({
+}: ContentSnapshotSaveInput): Promise<ContentSnapshotRecord | null> {
+  const records = await saveContentSnapshotsFromContexts([{
     bookmark,
     context,
-    settings: normalizedSettings,
+    settings,
     now
-  })
+  }])
+  return records[0] || null
+}
 
-  if (fullTextRecord) {
-    await contentFullTextOperations.put(fullTextRecord)
+export async function saveContentSnapshotsFromContexts(
+  inputs: ContentSnapshotSaveInput[]
+): Promise<ContentSnapshotRecord[]> {
+  const entriesByBookmarkId = new Map<string, {
+    record: ContentSnapshotRecord
+    fullTextRecord: ContentFullTextRecord | null
+  }>()
+  for (const input of inputs) {
+    const normalizedSettings = normalizeContentSnapshotSettings(input.settings)
+    const bookmarkId = String(input.bookmark?.id || '').trim()
+    if (!normalizedSettings.enabled || !bookmarkId) {
+      continue
+    }
+    entriesByBookmarkId.set(bookmarkId, buildContentSnapshotRecord({
+      bookmark: input.bookmark,
+      context: input.context,
+      settings: normalizedSettings,
+      now: input.now ?? Date.now()
+    }))
   }
-  try {
-    await updateContentSnapshotIndex((index) => {
-      const previous = index.records[bookmarkId] || null
-      if (previous?.fullTextStorage === 'idb' && previous.fullTextRef && previous.fullTextRef !== record.fullTextRef) {
-        contentFullTextOperations.delete(previous.fullTextRef).catch(() => {})
-      }
-      if (!record.hasFullText && previous?.fullTextStorage === 'idb' && previous.fullTextRef) {
-        contentFullTextOperations.delete(previous.fullTextRef).catch(() => {})
-      }
 
-      return {
-        version: 1,
-        updatedAt: now,
-        records: {
-          ...index.records,
-          [record.bookmarkId]: record
+  const entries = Array.from(entriesByBookmarkId.values())
+  if (!entries.length) {
+    return []
+  }
+
+  const task = contentSnapshotIndexWriteQueue.then(() => {
+    return withLocalStorageTransaction(async (transaction) => {
+      const current = await loadContentSnapshotIndexFromRepository(transaction)
+      const records = entries.map((entry) => entry.record)
+      const newFullTextRecords = entries.flatMap((entry) => (
+        entry.fullTextRecord ? [entry.fullTextRecord] : []
+      ))
+      const existingFullTextRefs = new Set(
+        Object.values(current.records).flatMap((record) => (
+          record.fullTextStorage === 'idb' && record.fullTextRef
+            ? [record.fullTextRef]
+            : []
+        ))
+      )
+
+      try {
+        if (newFullTextRecords.length) {
+          await contentFullTextOperations.putMany(newFullTextRecords)
         }
+        const nextIndex = await applyContentSnapshotRecordsDeltaInRepository(
+          current,
+          {
+            upserts: records,
+            updatedAt: Math.max(...records.map((record) => record.extractedAt))
+          },
+          transaction
+        )
+
+        const retainedFullTextRefs = new Set(
+          Object.values(nextIndex.records).flatMap((record) => (
+            record.fullTextStorage === 'idb' && record.fullTextRef
+              ? [record.fullTextRef]
+              : []
+          ))
+        )
+        const obsoleteFullTextRefs = Array.from(new Set(
+          records.flatMap((record) => {
+            const previous = current.records[record.bookmarkId]
+            return previous?.fullTextStorage === 'idb' &&
+              previous.fullTextRef &&
+              previous.fullTextRef !== record.fullTextRef &&
+              !retainedFullTextRefs.has(previous.fullTextRef)
+              ? [previous.fullTextRef]
+              : []
+          })
+        ))
+        if (obsoleteFullTextRefs.length) {
+          await contentFullTextOperations.deleteMany(obsoleteFullTextRefs).catch(() => {})
+        }
+
+        return records.flatMap((record) => {
+          const saved = nextIndex.records[record.bookmarkId]
+          return saved ? [saved] : []
+        })
+      } catch (error) {
+        const uncommittedFullTextRefs = newFullTextRecords
+          .map((record) => record.snapshotId)
+          .filter((snapshotId) => !existingFullTextRefs.has(snapshotId))
+        if (uncommittedFullTextRefs.length) {
+          await contentFullTextOperations.deleteMany(uncommittedFullTextRefs).catch(() => {})
+        }
+        throw error
       }
     })
-    return record
-  } catch (error) {
-    if (fullTextRecord?.snapshotId) {
-      await contentFullTextOperations.delete(fullTextRecord.snapshotId).catch(() => {})
-    }
-    throw error
-  }
+  })
+
+  contentSnapshotIndexWriteQueue = task.catch(() => {})
+  return task
 }
 
 export async function removeContentSnapshotForBookmark(bookmarkId: string, now = Date.now()): Promise<boolean> {
@@ -176,8 +248,10 @@ function updateContentSnapshotIndex(
   updater: (index: ContentSnapshotIndex) => ContentSnapshotIndex
 ): Promise<ContentSnapshotIndex> {
   const task = contentSnapshotIndexWriteQueue.then(async () => {
-    return updateContentSnapshotIndexInRepository((current) => {
-      return normalizeContentSnapshotIndex(updater(current))
+    return withLocalStorageTransaction((transaction) => {
+      return updateContentSnapshotIndexInRepository((current) => {
+        return normalizeContentSnapshotIndex(updater(current))
+      }, transaction)
     })
   })
 
@@ -277,9 +351,28 @@ export async function buildContentSnapshotSearchMapWithFullText(
 }
 
 export async function putContentFullText(record: ContentFullTextRecord): Promise<void> {
+  await putContentFullTexts([record])
+}
+
+export async function putContentFullTexts(records: ContentFullTextRecord[]): Promise<void> {
+  const normalizedRecords = Array.from(new Map(
+    records
+      .filter((record) => String(record?.snapshotId || '').trim())
+      .map((record) => [record.snapshotId, record] as const)
+  ).values())
+  if (!normalizedRecords.length) {
+    return
+  }
   const db = await openHeavyUserDb()
-  await runStoreRequest(db, CONTENT_FULL_TEXT_STORE, 'readwrite', (store) => store.put(record))
-  db.close()
+  try {
+    await runStoreMutation(db, CONTENT_FULL_TEXT_STORE, (store) => {
+      for (const record of normalizedRecords) {
+        store.put(record)
+      }
+    })
+  } finally {
+    db.close()
+  }
 }
 
 export async function getContentFullText(snapshotId: string): Promise<string> {
@@ -327,12 +420,28 @@ export async function getContentFullTexts(snapshotIds: string[]): Promise<Map<st
 }
 
 export async function deleteContentFullText(snapshotId: string): Promise<void> {
-  if (!snapshotId) {
+  await deleteContentFullTexts([snapshotId])
+}
+
+export async function deleteContentFullTexts(snapshotIds: string[]): Promise<void> {
+  const normalizedSnapshotIds = Array.from(new Set(
+    snapshotIds
+      .map((snapshotId) => String(snapshotId || '').trim())
+      .filter(Boolean)
+  ))
+  if (!normalizedSnapshotIds.length) {
     return
   }
   const db = await openHeavyUserDb()
-  await runStoreRequest(db, CONTENT_FULL_TEXT_STORE, 'readwrite', (store) => store.delete(snapshotId))
-  db.close()
+  try {
+    await runStoreMutation(db, CONTENT_FULL_TEXT_STORE, (store) => {
+      for (const snapshotId of normalizedSnapshotIds) {
+        store.delete(snapshotId)
+      }
+    })
+  } finally {
+    db.close()
+  }
 }
 
 export function setContentFullTextOperationsForTest(
@@ -345,6 +454,20 @@ export function setContentFullTextOperationsForTest(
   }
   if (operations.get && !operations.getMany) {
     nextOperations.getMany = (snapshotIds: string[]) => getContentFullTextsWithSingleReads(snapshotIds, nextOperations.get)
+  }
+  if (operations.put && !operations.putMany) {
+    nextOperations.putMany = async (records: ContentFullTextRecord[]) => {
+      for (const record of records) {
+        await nextOperations.put(record)
+      }
+    }
+  }
+  if (operations.delete && !operations.deleteMany) {
+    nextOperations.deleteMany = async (snapshotIds: string[]) => {
+      for (const snapshotId of snapshotIds) {
+        await nextOperations.delete(snapshotId)
+      }
+    }
   }
   contentFullTextOperations = nextOperations
   return () => {
@@ -427,16 +550,21 @@ function openHeavyUserDb(): Promise<IDBDatabase> {
   })
 }
 
-function runStoreRequest(
+function runStoreMutation(
   db: IDBDatabase,
   storeName: string,
-  mode: IDBTransactionMode,
-  createRequest: (store: IDBObjectStore) => IDBRequest
+  mutate: (store: IDBObjectStore) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction(storeName, mode)
+    const transaction = db.transaction(storeName, 'readwrite')
     const store = transaction.objectStore(storeName)
-    createRequest(store)
+    try {
+      mutate(store)
+    } catch (error) {
+      transaction.abort()
+      reject(error)
+      return
+    }
     transaction.addEventListener('complete', () => resolve())
     transaction.addEventListener('error', () => reject(transaction.error || new Error('全文索引存储失败。')))
     transaction.addEventListener('abort', () => reject(transaction.error || new Error('全文索引存储中断。')))

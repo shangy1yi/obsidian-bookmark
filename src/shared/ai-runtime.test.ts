@@ -1,4 +1,5 @@
 import {
+  AI_PROVIDER_RESPONSE_MAX_BYTES,
   AiRuntimeError,
   buildAiProviderConnectivityRequestBody,
   buildAiFolderCandidates,
@@ -91,6 +92,11 @@ async function run(): Promise<void> {
   await testResponseFormatFullFallback()
   await testRetryAfterBackoff()
   await testBodyReadTimeout()
+  await testExternalAbortDuringBodyRead()
+  await testOversizedResponseContentLength()
+  await testOversizedStreamingResponse()
+  await testProviderErrorRedaction()
+  await testSharedRequestDeadline()
   testProviderConnectivityReasoningEffort()
   testOfficialProviderReasoningAdapters()
   await testReasoningEffortInjection()
@@ -1912,7 +1918,8 @@ async function testBodyReadTimeout(): Promise<void> {
       systemPrompt: 'system',
       userPrompt: 'user',
       retry: false,
-      timeoutMs: 1,
+      timeoutMs: 1000,
+      totalBudgetMs: 25,
       fetchImpl: (async (_url: RequestInfo | URL, init?: RequestInit) => {
         const signal = init?.signal
         // headers 立即返回，body 永久挂起：超时保护必须覆盖读体阶段。
@@ -1935,6 +1942,207 @@ async function testBodyReadTimeout(): Promise<void> {
   }, 'abort')
 
   assert(error.message.includes('AI 请求超时'), 'hung response body should hit the timeout instead of hanging forever')
+}
+
+async function testExternalAbortDuringBodyRead(): Promise<void> {
+  const controller = new AbortController()
+  let calls = 0
+  const pendingRequest = assertRejectsKind(async () => {
+    await requestStructuredAiOutput({
+      settings: getSettings('responses'),
+      schema: SAMPLE_SCHEMA,
+      schemaName: 'sample',
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      signal: controller.signal,
+      retry: true,
+      fetchImpl: (async () => {
+        calls += 1
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          text: () => new Promise<string>(() => {})
+        } as unknown as Response
+      }) as typeof fetch
+    })
+  }, 'abort')
+  globalThis.setTimeout(() => controller.abort(), 10)
+  const error = await pendingRequest
+
+  assert(error.message.includes('已取消'), 'external aborts should remain distinguishable from timeouts')
+  assert(calls === 1, 'external aborts during body reads must not trigger a retry')
+}
+
+async function testOversizedResponseContentLength(): Promise<void> {
+  let bodyCanceled = false
+  let textCalled = false
+  const error = await assertRejectsKind(async () => {
+    await requestStructuredAiOutput({
+      settings: getSettings('responses'),
+      schema: SAMPLE_SCHEMA,
+      schemaName: 'sample',
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      retry: true,
+      fetchImpl: (async () => ({
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name: string) => name.toLowerCase() === 'content-length'
+            ? String(AI_PROVIDER_RESPONSE_MAX_BYTES + 1)
+            : null
+        },
+        body: {
+          cancel: async () => {
+            bodyCanceled = true
+          }
+        },
+        text: async () => {
+          textCalled = true
+          return '{}'
+        }
+      } as unknown as Response)) as typeof fetch
+    })
+  }, 'provider')
+
+  assert(!error.retryable, 'oversized responses should fail without retrying')
+  assert(error.message.includes('安全上限'), 'oversized responses should return an actionable diagnostic')
+  assert(bodyCanceled, 'Content-Length preflight should cancel the unread response body')
+  assert(!textCalled, 'Content-Length preflight should reject before reading the response body')
+}
+
+async function testOversizedStreamingResponse(): Promise<void> {
+  let streamCanceled = false
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(AI_PROVIDER_RESPONSE_MAX_BYTES))
+      controller.enqueue(new Uint8Array([1]))
+    },
+    cancel() {
+      streamCanceled = true
+    }
+  })
+  const error = await assertRejectsKind(async () => {
+    await requestStructuredAiOutput({
+      settings: getSettings('responses'),
+      schema: SAMPLE_SCHEMA,
+      schemaName: 'sample',
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      retry: true,
+      fetchImpl: (async () => new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })) as typeof fetch
+    })
+  }, 'provider')
+
+  assert(!error.retryable, 'stream byte overflow should be terminal')
+  assert(streamCanceled, 'stream byte overflow should cancel the active reader')
+  const details = error.details as { maxBytes?: unknown; receivedBytes?: unknown }
+  assert(
+    details.maxBytes === AI_PROVIDER_RESPONSE_MAX_BYTES,
+    'oversize diagnostics should expose the configured byte limit'
+  )
+  assert(
+    Number(details.receivedBytes) > AI_PROVIDER_RESPONSE_MAX_BYTES,
+    'oversize diagnostics should expose the observed byte count without retaining the body'
+  )
+}
+
+async function testProviderErrorRedaction(): Promise<void> {
+  const bearerSecret = 'top-secret-bearer-token'
+  const apiSecret = 'sk-super-secret-provider-key'
+  const error = await assertRejectsKind(async () => {
+    await requestStructuredAiOutput({
+      settings: getSettings('responses'),
+      schema: SAMPLE_SCHEMA,
+      schemaName: 'sample',
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      retry: false,
+      fetchImpl: (async () => new Response(JSON.stringify({
+        error: {
+          message: `Authorization: Bearer ${bearerSecret}; api_key=${apiSecret}; ${'x'.repeat(800)}`
+        },
+        echoed_request: { api_key: apiSecret }
+      }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      })) as typeof fetch
+    })
+  }, 'provider')
+
+  assert(error.message.includes('[REDACTED]'), 'provider errors should mark removed credentials')
+  assert(!error.message.includes(bearerSecret), 'provider errors must redact Bearer credentials')
+  assert(!error.message.includes(apiSecret), 'provider errors must redact API keys')
+  assert(error.message.length <= 280, 'provider error messages should have a uniform display bound')
+  const serializedDetails = JSON.stringify(error.details)
+  assert(!serializedDetails.includes(bearerSecret), 'error details must not retain the provider payload')
+  assert(!serializedDetails.includes(apiSecret), 'error details must not retain echoed API keys')
+  assert(!serializedDetails.includes('echoed_request'), 'error details must contain metadata instead of raw payloads')
+}
+
+async function testSharedRequestDeadline(): Promise<void> {
+  let calls = 0
+  const startedAtMs = Date.now()
+  const error = await assertRejectsKind(async () => {
+    await requestStructuredAiOutput({
+      settings: getSettings('responses'),
+      schema: SAMPLE_SCHEMA,
+      schemaName: 'sample',
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      timeoutMs: 1000,
+      totalBudgetMs: 40,
+      fetchImpl: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+        calls += 1
+        if (calls === 1) {
+          return new Response(JSON.stringify({ error: { message: 'temporarily unavailable' } }), {
+            status: 429,
+            headers: {
+              'Content-Type': 'application/json',
+              'Retry-After': '0'
+            }
+          })
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          text: () => new Promise<string>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('The operation was aborted.', 'AbortError'))
+            }, { once: true })
+          })
+        } as unknown as Response
+      }) as typeof fetch
+    })
+  }, 'abort')
+
+  assert(calls === 2, 'a transient provider failure should retry within the remaining shared budget')
+  assert(error.message.includes('总时限'), 'shared-budget exhaustion should be distinguishable from one attempt timeout')
+  assert(Date.now() - startedAtMs < 500, 'retry attempts must not each reset the full request timeout')
+
+  let expiredDeadlineCalls = 0
+  const expiredError = await assertRejectsKind(async () => {
+    await requestStructuredAiOutput({
+      settings: getSettings('responses'),
+      schema: SAMPLE_SCHEMA,
+      schemaName: 'sample',
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      deadlineAtMs: Date.now() - 1,
+      fetchImpl: (async () => {
+        expiredDeadlineCalls += 1
+        return new Response('{}')
+      }) as typeof fetch
+    })
+  }, 'abort')
+
+  assert(expiredDeadlineCalls === 0, 'an expired absolute deadline should stop before contacting the provider')
+  assert(expiredError.message.includes('总时限'), 'absolute deadline exhaustion should use the total-budget diagnostic')
 }
 
 async function testReasoningEffortInjection(): Promise<void> {

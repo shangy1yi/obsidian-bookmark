@@ -178,6 +178,7 @@ export function AiProviderSettings({
                   aria-label="显示密码"
                   checked={state.revealApiKey}
                   className={AI_SETTINGS_SWITCH_CONTROL_CLASS}
+                  disabled={state.fieldsDisabled}
                   thumbClassName={AI_SETTINGS_SWITCH_THUMB_CLASS}
                   onCheckedChange={(checked) => handleAiProviderSettingsAction({
                     action: 'toggle-api-key',
@@ -196,6 +197,7 @@ export function AiProviderSettings({
             autoComplete="off"
             placeholder={state.apiKeyPlaceholder}
             value={state.apiKey}
+            disabled={state.fieldsDisabled}
             onValueChange={(value) => handleAiProviderSettingsAction({
               action: 'change',
               field: 'apiKey',
@@ -236,6 +238,7 @@ export function AiProviderSettings({
                   autoComplete="off"
                   placeholder="https://api.openai.com/v1"
                   value={state.baseUrl}
+                  disabled={state.fieldsDisabled}
                   onValueChange={(value) => handleAiProviderSettingsAction({
                     action: 'change',
                     field: 'baseUrl',
@@ -275,6 +278,7 @@ export function AiProviderSettings({
                   inputMode="numeric"
                   placeholder="30000"
                   value={state.timeoutMs}
+                  disabled={state.fieldsDisabled}
                   onValueChange={(value) => handleAiProviderSettingsAction({
                     action: 'change',
                     field: 'timeoutMs',
@@ -296,6 +300,7 @@ export function AiProviderSettings({
                   inputMode="numeric"
                   placeholder="6"
                   value={state.batchSize}
+                  disabled={state.fieldsDisabled}
                   onValueChange={(value) => handleAiProviderSettingsAction({
                     action: 'change',
                     field: 'batchSize',

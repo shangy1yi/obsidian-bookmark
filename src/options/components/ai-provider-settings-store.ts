@@ -15,6 +15,7 @@ const defaultAiProviderSettingsState: AiProviderSettingsState = {
   connectivityTone: 'muted',
   connectivityVisible: false,
   customModels: [],
+  fieldsDisabled: true,
   hasRequiredConfig: false,
   modelTools: {
     fetchDisabled: true,

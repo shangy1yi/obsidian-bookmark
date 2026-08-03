@@ -38,6 +38,7 @@ export interface AiProviderSettingsState {
   connectivityTone: string
   connectivityVisible: boolean
   customModels: string[]
+  fieldsDisabled: boolean
   hasRequiredConfig: boolean
   modelTools: AiProviderModelToolsState
   modelToolsDisabled: boolean
