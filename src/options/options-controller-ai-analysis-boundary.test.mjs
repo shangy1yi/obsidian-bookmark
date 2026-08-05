@@ -224,8 +224,13 @@ assert.match(
 )
 assert.match(
   providerSettingsAction,
-  /providerOriginChanged[\s\S]*?apiKey: providerOriginChanged \? '' : previousSettings\.apiKey/,
-  'changing the provider origin must not retain a key from the previous provider'
+  /updateAiNamingSettingsField\(\s*previousSettings,\s*detail\.field,\s*nextValue\s*\)/,
+  'provider field edits must use the tested draft update boundary'
+)
+assert.match(
+  providerSettingsAction,
+  /resetAiNamingConnectivityState\(\)[\s\S]*?renderAiProviderConfiguration\(\)/,
+  'typing in provider fields should refresh only provider configuration instead of rebuilding AI results'
 )
 assert.ok(
   topLevelRun.indexOf('await requestAiNamingConnectivityTest(settings') <

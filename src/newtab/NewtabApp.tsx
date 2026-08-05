@@ -52,7 +52,7 @@ import {
   isLegacyBackgroundMaskStyle
 } from './background-mask-settings'
 
-const BACKGROUND_MASK_BASE_CLASS = 'newtab-background-mask fixed inset-0 z-0 pointer-events-none opacity-0 [transition:opacity_var(--ui-motion-standard)_var(--ui-ease-standard),background-color_var(--ui-motion-standard)_var(--ui-ease-standard)] before:absolute before:inset-0 before:pointer-events-none before:opacity-0 before:mix-blend-overlay before:[transition:opacity_var(--ui-motion-standard)_var(--ui-ease-standard)]'
+const BACKGROUND_MASK_BASE_CLASS = 'newtab-background-mask fixed inset-0 z-0 pointer-events-none opacity-0 before:absolute before:inset-0 before:pointer-events-none before:opacity-0 before:mix-blend-overlay'
 const BACKGROUND_MASK_ENABLED_CLASS = 'opacity-100'
 const BACKGROUND_MASK_STYLE_CLASS_BY_STYLE = {
   dark: '',
@@ -61,6 +61,7 @@ const BACKGROUND_MASK_STYLE_CLASS_BY_STYLE = {
   noise: 'before:opacity-[0.16] before:[background-image:radial-gradient(rgba(255,255,255,0.18)_0.65px,transparent_0.9px),radial-gradient(rgba(0,0,0,0.24)_0.7px,transparent_1px)] before:[background-position:0_0,12px_14px] before:[background-size:4px_4px,5px_5px]'
 } as const
 const SOLID_BACKGROUND_NOISE_CLASS = 'newtab-solid-background-noise fixed inset-0 z-0 pointer-events-none overflow-hidden'
+const DYNAMIC_BACKGROUND_STAGE_CLASS = 'newtab-dynamic-background-stage fixed inset-0 z-0 h-full w-full overflow-hidden pointer-events-none isolate [contain:strict] [transform:translateZ(0)]'
 const NEWTAB_REDUCED_MOTION_DESCENDANTS_CLASS = [
   'motion-reduce:[&_*]:![animation:none]',
   'motion-reduce:[&_*::before]:![animation:none]',
@@ -182,9 +183,9 @@ function NewtabShell() {
   const appChromeAttributes = useNewtabAppChromeAttributes()
   const autoHideSettingsTrigger = folderSource.general.hideSettingsTrigger
   const shellRef = useRef<HTMLDivElement | null>(null)
+  const backgroundMaskHostRef = useRef<HTMLDivElement | null>(null)
   const settingsBackdropRef = useRef<HTMLButtonElement | null>(null)
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null)
-  const pendingHandoffFrame = useRef(0)
   const [settingsDrawerHostRequested, setSettingsDrawerHostRequested] = useState(false)
   const settingsBackgroundProps = settingsDrawerOpen && settingsDrawerModal
     ? {
@@ -197,6 +198,14 @@ function NewtabShell() {
     setNewtabContentShellNode(shellRef.current)
     return () => {
       setNewtabContentShellNode(null)
+    }
+  }, [])
+
+  useLayoutEffect(() => {
+    const mask = document.getElementById('newtab-background-mask')
+    const host = backgroundMaskHostRef.current
+    if (mask && host && mask.parentElement !== host) {
+      host.append(mask)
     }
   }, [])
 
@@ -215,21 +224,19 @@ function NewtabShell() {
 
   useLayoutEffect(() => {
     if (!backgroundSettings.ready) return
-    // Hand off without a bare frame: the React mask paints this frame at full
-    // opacity (no fade — see [data-mask-initial]); only after it has painted do
-    // we drop the identical startup mask on the next frame.
-    const firstFrame = window.requestAnimationFrame(() => {
-      const secondFrame = window.requestAnimationFrame(() => {
-        removeStartupBackgroundMask()
-        document.getElementById('newtab-background-mask')?.removeAttribute('data-mask-initial')
-      })
-      pendingHandoffFrame.current = secondFrame
-    })
-    pendingHandoffFrame.current = firstFrame
-    return () => {
-      window.cancelAnimationFrame(pendingHandoffFrame.current)
-    }
-  }, [backgroundSettings.ready])
+    const mask = document.getElementById('newtab-background-mask')
+    if (!mask) return
+
+    const style = getBackgroundMaskInlineStyle(backgroundSettings)
+    mask.className = getBackgroundMaskClass(backgroundSettings)
+    mask.style.backgroundColor = String(style.backgroundColor ?? '')
+    mask.style.backgroundImage = String(style.backgroundImage ?? '')
+    mask.style.setProperty('-webkit-backdrop-filter', String(style.WebkitBackdropFilter ?? ''))
+    mask.style.backdropFilter = String(style.backdropFilter ?? '')
+    document.documentElement.dataset.instantWallpaperMask = backgroundSettings.maskEnabled
+      ? 'true'
+      : 'false'
+  }, [backgroundSettings])
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -259,19 +266,18 @@ function NewtabShell() {
   return (
     <div {...appChromeAttributes} onPointerDownCapture={dispatchNewtabContentShellPointerDownCapture}>
       <NewtabInstantWallpaperHost />
-      <NewtabBackgroundLayer loadingWallpaper={instantWallpaper.loading} />
-      <SolidBackgroundNoiseLayer active={backgroundSettings.type === 'color'} />
-      <NewtabWallpaperFilterLayer />
-      <NewtabPaperShaderLayer />
-      {backgroundSettings.ready ? (
-        <div
-          id="newtab-background-mask"
-          className={getBackgroundMaskClass(backgroundSettings)}
-          style={getBackgroundMaskInlineStyle(backgroundSettings)}
-          data-mask-initial=""
-          aria-hidden="true"
-        ></div>
-      ) : null}
+      <div id="newtab-dynamic-background-stage" className={DYNAMIC_BACKGROUND_STAGE_CLASS} aria-hidden="true">
+        <NewtabBackgroundLayer loadingWallpaper={instantWallpaper.loading} />
+        <SolidBackgroundNoiseLayer active={backgroundSettings.type === 'color'} />
+        <NewtabWallpaperFilterLayer />
+        <NewtabPaperShaderLayer />
+      </div>
+      <div
+        id="newtab-background-mask-host"
+        className="contents"
+        ref={backgroundMaskHostRef}
+        aria-hidden="true"
+      ></div>
       <WallpaperLoadingIndicator />
 
       <div
@@ -490,15 +496,6 @@ function getBackgroundMaskStyleClass(maskStyle: string): string {
     return ''
   }
   return BACKGROUND_MASK_STYLE_CLASS_BY_STYLE[maskStyle]
-}
-
-function removeStartupBackgroundMask(): void {
-  document.getElementById('newtab-startup-background-mask')?.remove()
-  document.getElementById('newtab-startup-background-mask-style')?.remove()
-  document.documentElement.style.removeProperty('--instant-wallpaper-mask-color')
-  document.documentElement.style.removeProperty('--instant-wallpaper-mask-filter')
-  document.documentElement.style.removeProperty('--instant-wallpaper-mask-image')
-  delete document.documentElement.dataset.instantWallpaperMask
 }
 
 function getBackgroundMaskInlineStyle(background: NewtabBackgroundSettingsView): CSSProperties {

@@ -1,72 +1,19 @@
 import { useLayoutEffect } from 'react'
 import { useNewtabInstantWallpaperView } from '../newtab-instant-wallpaper-store'
 
-const STARTUP_STYLE_ID = 'instant-wallpaper-startup-style'
 const STARTUP_PREVIEW_CLASS = 'instant-wallpaper-startup-preview'
-const STARTUP_PREVIEW_SETTLE_MS = 300
-const STARTUP_HTML_CLASSES = [
-  'loading-wallpaper',
-  'newtab-booting',
-  'instant-wallpaper-ready',
-  'instant-wallpaper-remote-ready',
-  STARTUP_PREVIEW_CLASS
-]
-const STARTUP_HTML_DATASET_KEYS = [
-  'instantWallpaperLoaderVisible',
-  'instantWallpaperPending',
-  'instantWallpaperRemoteReady',
-  'instantWallpaperSignature'
-]
-const STARTUP_HTML_PROPERTIES = [
-  '--bg',
-  '--wallpaper-placeholder-bg',
-  '--instant-wallpaper-image',
-  '--instant-wallpaper-preview-image',
-  '--instant-wallpaper-size',
-  '--instant-wallpaper-position'
-]
 
 export function NewtabInstantWallpaperHost() {
   const view = useNewtabInstantWallpaperView()
 
   useLayoutEffect(() => {
-    const startupStyle = document.getElementById(STARTUP_STYLE_ID)
     const root = document.documentElement
-    if (view.booting) {
-      return
-    }
-
-    if (startupStyle) {
-      syncStartupHtmlState(root, view)
-    }
-
-    const hasStartupPreview = Boolean(startupStyle && hasUsableStartupPreview(view.previewImage))
-    root.classList.toggle(STARTUP_PREVIEW_CLASS, hasStartupPreview)
-    if (hasStartupPreview && !view.remoteReady) {
-      return
-    }
-
-    const cleanupDelay = hasStartupPreview && view.remoteReady ? STARTUP_PREVIEW_SETTLE_MS : 0
-    const cleanupStartupWallpaper = () => {
-      STARTUP_HTML_CLASSES.forEach((className) => root.classList.remove(className))
-      STARTUP_HTML_DATASET_KEYS.forEach((key) => {
-        delete root.dataset[key]
-      })
-      STARTUP_HTML_PROPERTIES.forEach((property) => {
-        root.style.removeProperty(property)
-      })
-      startupStyle?.remove()
-    }
-
-    if (cleanupDelay <= 0) {
-      cleanupStartupWallpaper()
-      return
-    }
-
-    const cleanupTimer = window.setTimeout(cleanupStartupWallpaper, cleanupDelay)
-    return () => {
-      window.clearTimeout(cleanupTimer)
-    }
+    syncPersistentWallpaperProperties(root, view)
+    syncWallpaperState(root, view)
+    root.classList.toggle(
+      STARTUP_PREVIEW_CLASS,
+      hasUsableStartupPreview(view.previewImage) && !view.remoteReady
+    )
   }, [view])
 
   return null
@@ -77,7 +24,19 @@ function hasUsableStartupPreview(previewImage: string): boolean {
   return Boolean(normalizedPreviewImage && normalizedPreviewImage !== 'none')
 }
 
-function syncStartupHtmlState(
+function syncPersistentWallpaperProperties(
+  root: HTMLElement,
+  view: ReturnType<typeof useNewtabInstantWallpaperView>
+): void {
+  setOrRemoveProperty(root, '--bg', view.backgroundColor)
+  setOrRemoveProperty(root, '--wallpaper-placeholder-bg', view.placeholderColor)
+  setOrRemoveProperty(root, '--instant-wallpaper-image', view.image)
+  setOrRemoveProperty(root, '--instant-wallpaper-preview-image', view.previewImage)
+  setOrRemoveProperty(root, '--instant-wallpaper-size', view.size)
+  setOrRemoveProperty(root, '--instant-wallpaper-position', view.position)
+}
+
+function syncWallpaperState(
   root: HTMLElement,
   view: ReturnType<typeof useNewtabInstantWallpaperView>
 ): void {
@@ -85,17 +44,23 @@ function syncStartupHtmlState(
   root.classList.toggle('newtab-booting', view.booting)
   root.classList.toggle('instant-wallpaper-ready', view.ready)
   root.classList.toggle('instant-wallpaper-remote-ready', view.remoteReady)
-  root.dataset.instantWallpaperPending = view.pending ? 'true' : ''
-  if (!view.pending) {
-    delete root.dataset.instantWallpaperPending
-  }
-  root.dataset.instantWallpaperRemoteReady = view.remoteReady ? 'true' : ''
-  if (!view.remoteReady) {
-    delete root.dataset.instantWallpaperRemoteReady
-  }
-  if (view.signature) {
-    root.dataset.instantWallpaperSignature = view.signature
+  setOrDeleteDataset(root, 'instantWallpaperPending', view.pending ? 'true' : '')
+  setOrDeleteDataset(root, 'instantWallpaperRemoteReady', view.remoteReady ? 'true' : '')
+  setOrDeleteDataset(root, 'instantWallpaperSignature', view.signature)
+}
+
+function setOrRemoveProperty(root: HTMLElement, property: string, value: string): void {
+  if (value) {
+    root.style.setProperty(property, value)
   } else {
-    delete root.dataset.instantWallpaperSignature
+    root.style.removeProperty(property)
+  }
+}
+
+function setOrDeleteDataset(root: HTMLElement, key: string, value: string): void {
+  if (value) {
+    root.dataset[key] = value
+  } else {
+    delete root.dataset[key]
   }
 }

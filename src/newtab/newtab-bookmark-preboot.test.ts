@@ -66,6 +66,26 @@ function testPrebootHandoffIsAtomic(): void {
   assert(source.includes('root.remove()'))
   assert(!source.includes('window.setTimeout(() => {\n    root.remove()'))
   assert(source.includes('transition: none;'))
+  assert(
+    source.includes('--preboot-card-bg: rgba(0, 0, 0, 0.6);') &&
+      source.includes('--preboot-card-filter: blur(8px);') &&
+      source.includes('-webkit-backdrop-filter: var(--preboot-card-filter);') &&
+      source.includes('backdrop-filter: var(--preboot-card-filter);'),
+    'The synchronous snapshot must paint the final bookmark glass material on its first frame.'
+  )
+  assert(
+    source.includes('NEWTAB_BOOKMARK_PREBOOT_SURFACE_HANDOFF_FRAMES = 2') &&
+      source.includes("root.dataset.surfaceHandoff = 'true'") &&
+      source.includes('[data-surface-handoff="true"] ~ #newtab-react-root .bookmark-tile') &&
+      source.includes('transition: none !important;') &&
+      source.includes('-webkit-backdrop-filter: blur(0.01px);') &&
+      source.includes('backdrop-filter: blur(0.01px);'),
+    'The live glass must paint for two frames while the cached compositor layer remains alive before removal.'
+  )
+  assert(
+    source.includes('[data-title-guard="true"]:not([data-surface-handoff="true"]) ~ #newtab-react-root .bookmark-tile'),
+    'Delayed titles must keep a single cached glass owner until the live surface handoff begins.'
+  )
 }
 
 function testPrebootHandoffGuardsIconClip(): void {

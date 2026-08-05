@@ -46,50 +46,7 @@ html[data-newtab-search-layout-pending] .newtab-search-slot {
   visibility: hidden !important;
 }
 
-/* 蒙版首帧交接：React 蒙版初次挂载时禁用过渡，直接以最终态（maskEnabled 时 opacity:1）
-   出现，与启动蒙版像素一致；下一帧（启动蒙版撤除后）移除 data-mask-initial 恢复过渡，
-   供后续用户改设置时的平滑淡入用。消除 opacity-0→100 的可感知蒙版加载。 */
-#newtab-background-mask[data-mask-initial],
-#newtab-background-mask[data-mask-initial]::before {
-  transition: none !important;
-}
-
-/* 自动居中：首帧信任缓存直接落位；reveal（移除 pending 属性）时仅做 opacity 淡入。
-   绝不过渡 margin-top——位移动画会让 getBoundingClientRect 读到动画中间值，
-   污染下一次测量并形成可见的上下漂移。 */
-.newtab-search-slot[data-search-auto-vertical-center="true"] {
-  transition: opacity var(--ui-motion-standard) var(--ui-ease-standard);
-}
-
-/* 时钟/搜索/引导条在 storage 水合后一次性挂载：轻淡入替代瞬间弹现。
-   CSS animation 只在节点插入时播放，后续 re-render 不重播。 */
-@keyframes newtab-utility-module-enter {
-  from {
-    opacity: 0;
-  }
-
-  to {
-    opacity: 1;
-  }
-}
-
-.newtab-utility-stack > * {
-  animation: newtab-utility-module-enter var(--ui-motion-standard) var(--ui-ease-standard);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .newtab-search-slot[data-search-auto-vertical-center="true"] {
-    transition: none;
-  }
-
-  .newtab-utility-stack > * {
-    animation: none;
-  }
-}
-
 .newtab-app {
-  --newtab-wallpaper-focus-duration: 280ms;
-  --newtab-wallpaper-focus-ease: var(--panel-ease);
   --newtab-bookmark-shadow: 0 1px 2px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.052);
   --newtab-bookmark-hover-lift: -2.5px;
   --newtab-bookmark-hover-shadow:
@@ -169,14 +126,6 @@ body {
   font-family: var(--newtab-font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-}
-
-html.instant-wallpaper-startup-preview body {
-  background-color: var(--wallpaper-placeholder-bg, #101013);
-  background-image: var(--instant-wallpaper-image, none), var(--instant-wallpaper-preview-image, none);
-  background-position: var(--instant-wallpaper-position, center);
-  background-repeat: no-repeat;
-  background-size: var(--instant-wallpaper-size, cover);
 }
 
 .newtab-app,
@@ -340,20 +289,8 @@ html.instant-wallpaper-startup-preview body {
   width: 100%;
   height: 100vh;
   height: 100dvh;
-  background-color: var(--bg);
-  color: var(--ds-text-primary);
-}
-
-html.instant-wallpaper-startup-preview .newtab-app {
   background-color: transparent;
-}
-
-.newtab-app.instant-wallpaper-ready:not(.instant-wallpaper-remote-ready) {
-  background-color: var(--wallpaper-placeholder-bg, #101013);
-  background-image: var(--instant-wallpaper-image, none), var(--instant-wallpaper-preview-image, none);
-  background-position: var(--instant-wallpaper-position, center);
-  background-repeat: no-repeat;
-  background-size: var(--instant-wallpaper-size, cover);
+  color: var(--ds-text-primary);
 }
 
 .newtab-solid-background-noise {
@@ -495,76 +432,15 @@ html.instant-wallpaper-startup-preview .newtab-app {
   }
 }
 
-.newtab-app::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  background-color: transparent;
-  background-image: var(--instant-wallpaper-image, none), var(--instant-wallpaper-preview-image, none);
-  background-position: var(--instant-wallpaper-position, center);
-  background-size: var(--instant-wallpaper-size, cover);
+.newtab-background-image {
+  opacity: 1;
   filter: none;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--newtab-wallpaper-focus-duration) var(--newtab-wallpaper-focus-ease);
-}
-
-.newtab-app.loading-wallpaper::before,
-html:not([data-instant-wallpaper-preview-only="true"]) .newtab-app.instant-wallpaper-ready:not(.instant-wallpaper-remote-ready)::before,
-.newtab-background-image[data-transitioning="true"] {
-  will-change: opacity;
-}
-
-.newtab-app.instant-wallpaper-ready:not(.instant-wallpaper-remote-ready)::before {
-  opacity: var(--instant-wallpaper-preview-opacity, 1);
-}
-
-html.instant-wallpaper-startup-preview .newtab-app::before {
-  opacity: 0 !important;
   transition: none;
 }
 
-.newtab-app.instant-wallpaper-remote-ready::before {
-  opacity: 0;
-}
-
-.newtab-app.loading-wallpaper {
-  background-color: var(--wallpaper-placeholder-bg, #101013);
-}
-
-.newtab-app.loading-wallpaper:not(.instant-wallpaper-ready) {
-  background-image: none;
-}
-
-.newtab-app.loading-wallpaper:not(.instant-wallpaper-ready)::before {
-  filter: none;
-  opacity: var(--instant-wallpaper-preview-loading-opacity, 1);
-  transition: opacity var(--newtab-wallpaper-focus-duration) var(--newtab-wallpaper-focus-ease);
-}
-
-.newtab-background-image {
-  opacity: 0;
-  filter: none;
-  transition: opacity var(--newtab-wallpaper-focus-duration) var(--newtab-wallpaper-focus-ease);
-}
-
-.newtab-background-image[data-state="visible"] {
-  opacity: 1;
-  filter: none;
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .newtab-app::before,
-  .newtab-app.loading-wallpaper:not(.instant-wallpaper-ready)::before,
   .newtab-background-image {
-    transition: none;
-  }
-
-  .newtab-background-image {
-    transform: none;
     filter: none;
-    will-change: auto;
   }
 }
 

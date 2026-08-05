@@ -95,7 +95,8 @@ import {
   normalizeAiNamingSettings,
   normalizeAiNamingCustomModels,
   normalizeAiNamingFetchedModels,
-  serializeAiNamingSettings
+  serializeAiNamingSettings,
+  updateAiNamingSettingsField
 } from './sections/ai-settings.js'
 import {
   buildAvailabilityProfileFromUserSettings,
@@ -3573,7 +3574,7 @@ export function handleAiProviderSettingsAction(detail: AiProviderSettingsActionD
 
   if (detail.action === 'toggle-api-key') {
     managerState.aiRevealApiKey = Boolean(detail.value)
-    renderAiNamingSection()
+    renderAiProviderConfiguration()
     return
   }
 
@@ -3625,23 +3626,15 @@ export function handleAiProviderSettingsAction(detail: AiProviderSettingsActionD
   }
 
   const previousSettings = syncAiNamingSettingsDraftFromState()
-  const clearReasoningCapabilities = detail.field === 'baseUrl'
   const nextValue = String(detail.value ?? '')
-  const providerOriginChanged =
-    detail.field === 'baseUrl' &&
-    getOriginPermissionPattern(previousSettings.baseUrl) !==
-      getOriginPermissionPattern(nextValue)
-  aiNamingManagerState.settings = normalizeAiNamingSettings({
-    ...previousSettings,
-    [detail.field]: nextValue,
-    apiKey: providerOriginChanged ? '' : previousSettings.apiKey,
-    reasoningCapabilities: clearReasoningCapabilities
-      ? {}
-      : previousSettings.reasoningCapabilities
-  })
+  aiNamingManagerState.settings = updateAiNamingSettingsField(
+    previousSettings,
+    detail.field,
+    nextValue
+  )
   aiNamingState.settingsDirty = true
   resetAiNamingConnectivityState()
-  renderAiNamingSection()
+  renderAiProviderConfiguration()
 }
 
 export function handleContentSnapshotSettingsChange(
@@ -4220,11 +4213,8 @@ async function handleAiConnectivityTest() {
   }
 }
 
-function renderAiNamingSection() {
+function renderAiProviderConfiguration() {
   const settings = aiNamingManagerState.settings
-  const hasSavedApiKey = Boolean(settings.apiKey)
-  const featureSwitchInFlight = aiNamingState.pendingFeatureSwitch
-  const featureSwitchesLocked = aiNamingState.running || aiNamingState.applying
   const hasRequiredConfig = Boolean(settings.baseUrl && settings.apiKey && settings.model)
   const configTone = aiNamingState.settingsDirty
     ? 'warning'
@@ -4246,19 +4236,46 @@ function renderAiNamingSection() {
     hasRequiredConfig,
     showSaveSettingsButton
   })
-  renderFeatureSettingsControls(settings, {
-    featureSwitchesLocked,
-    featureSwitchInFlight
-  })
-  renderContentSnapshotSettings()
 
-  publishAiConfigLinkState({ configured: hasSavedApiKey })
+  publishAiConfigLinkState({ configured: Boolean(settings.apiKey) })
 
   publishAiAnalysisStatus({
     badgeText: getAiNamingBadgeText(),
     badgeTone: getAiNamingBadgeTone(),
     statusCopy: getAiNamingStatusCopy()
   })
+
+  publishAiAnalysisActions({
+    actionDisabled:
+      availabilityState.catalogLoading ||
+      !hasRequiredConfig ||
+      aiNamingState.testingConnection ||
+      aiNamingState.running ||
+      aiNamingState.applying ||
+      aiNamingState.requestingPermission,
+    actionLabel: aiNamingState.lastCompletedAt ? '重新分析并生成建议' : '开始分析并生成建议',
+    pauseDisabled: !aiNamingState.running || aiNamingState.stopRequested,
+    pauseHidden: !aiNamingState.running,
+    pauseLabel: aiNamingState.paused ? '继续生成' : '暂停生成',
+    stopDisabled: !aiNamingState.running || aiNamingState.stopRequested,
+    stopHidden: !aiNamingState.running,
+    stopLabel: aiNamingState.stopRequested ? '停止中…' : '停止本次生成'
+  })
+
+  return { hasRequiredConfig, settings }
+}
+
+function renderAiNamingSection() {
+  const { hasRequiredConfig, settings } = renderAiProviderConfiguration()
+  const featureSwitchInFlight = aiNamingState.pendingFeatureSwitch
+  const featureSwitchesLocked = aiNamingState.running || aiNamingState.applying
+
+  renderFeatureSettingsControls(settings, {
+    featureSwitchesLocked,
+    featureSwitchInFlight
+  })
+  renderContentSnapshotSettings()
+
   const progressMax = aiNamingState.runTotalBookmarks || aiNamingState.eligibleBookmarks
   const progressValue = Math.max(
     0,
@@ -4290,23 +4307,6 @@ function renderAiNamingSection() {
   })
 
   renderBookmarkTagDataCard()
-
-  publishAiAnalysisActions({
-    actionDisabled:
-      availabilityState.catalogLoading ||
-      !hasRequiredConfig ||
-      aiNamingState.testingConnection ||
-      aiNamingState.running ||
-      aiNamingState.applying ||
-      aiNamingState.requestingPermission,
-    actionLabel: aiNamingState.lastCompletedAt ? '重新分析并生成建议' : '开始分析并生成建议',
-    pauseDisabled: !aiNamingState.running || aiNamingState.stopRequested,
-    pauseHidden: !aiNamingState.running,
-    pauseLabel: aiNamingState.paused ? '继续生成' : '暂停生成',
-    stopDisabled: !aiNamingState.running || aiNamingState.stopRequested,
-    stopHidden: !aiNamingState.running,
-    stopLabel: aiNamingState.stopRequested ? '停止中…' : '停止本次生成'
-  })
 
   publishAiAnalysisDecisionMetrics({
     eligible: String(aiNamingState.eligibleBookmarks),

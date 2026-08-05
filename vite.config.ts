@@ -12,6 +12,15 @@ const NEWTAB_BOOKMARK_PREBOOT_ROUTE = '/newtab-bookmark-preboot.js'
 const NEWTAB_BOOKMARK_PREBOOT_ENTRY = 'src/newtab/newtab-bookmark-preboot-entry.ts'
 const POPUP_PREBOOT_ROUTE = '/popup-preboot.js'
 const POPUP_PREBOOT_ENTRY = 'src/popup/popup-preboot.ts'
+const NEWTAB_MODULE_PRELOAD_TAG_PATTERN = /^[ \t]*<link\b(?=[^>]*\brel=(["'])modulepreload\1)[^>]*>[^\S\r\n]*(?:\r?\n)?/gim
+
+function removeCrossWorldNewtabModulePreloads(html: string): string {
+  // A chrome://newtab override is loaded through a different extension world.
+  // Chromium rejects Vite's document-level modulepreload entries for reuse and
+  // records one extension error per chunk, so they add work without warming the
+  // module graph. Static imports from the entry module still load every chunk.
+  return html.replace(NEWTAB_MODULE_PRELOAD_TAG_PATTERN, '')
+}
 
 function instantWallpaperBootPlugin(minify: boolean): Plugin {
   return {
@@ -41,7 +50,7 @@ function instantWallpaperBootPlugin(minify: boolean): Plugin {
             `<body>\n    <script src="${NEWTAB_BOOKMARK_PREBOOT_ROUTE}"></script>`
           )
         }
-        return transformedHtml
+        return removeCrossWorldNewtabModulePreloads(transformedHtml)
       }
     },
     configureServer(server) {

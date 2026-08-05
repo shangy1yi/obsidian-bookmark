@@ -9,6 +9,9 @@ import {
   type ModelReasoningCapabilityMap,
   type ReasoningEffortId
 } from '../../shared/ai-reasoning.js'
+import { getOriginPermissionPattern } from '../shared-options/permissions.js'
+
+export type AiNamingSettingsField = 'apiKey' | 'baseUrl' | 'batchSize' | 'timeoutMs'
 
 export interface AiNamingSettings {
   baseUrl: string
@@ -96,6 +99,32 @@ export function normalizeAiNamingSettings(rawSettings: unknown): AiNamingSetting
         : defaults.autoAnalyzeBookmarks,
     systemPrompt: String(source.systemPrompt || defaults.systemPrompt).trim()
   }
+}
+
+export function updateAiNamingSettingsField(
+  rawSettings: unknown,
+  field: AiNamingSettingsField,
+  rawValue: unknown
+): AiNamingSettings {
+  const current = normalizeAiNamingSettings(rawSettings)
+  const value = String(rawValue ?? '')
+
+  if (field !== 'baseUrl') {
+    return normalizeAiNamingSettings({
+      ...current,
+      [field]: value
+    })
+  }
+
+  const providerOriginChanged =
+    getOriginPermissionPattern(current.baseUrl) !== getOriginPermissionPattern(value)
+
+  return normalizeAiNamingSettings({
+    ...current,
+    baseUrl: value,
+    apiKey: providerOriginChanged ? '' : current.apiKey,
+    reasoningCapabilities: {}
+  })
 }
 
 export function normalizeAiNamingCustomModels(rawModels: unknown): string[] {

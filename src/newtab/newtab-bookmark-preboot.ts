@@ -16,6 +16,7 @@ const NEWTAB_BOOKMARK_PREBOOT_HIGH_PRIORITY_FAVICON_LIMIT = 6
 const NEWTAB_BOOKMARK_PREBOOT_VIEWPORT_TOLERANCE_PX = 1
 const NEWTAB_BOOKMARK_PREBOOT_HANDOFF_TOLERANCE_PX = 0.5
 const NEWTAB_BOOKMARK_PREBOOT_HANDOFF_STABLE_FRAMES = 2
+const NEWTAB_BOOKMARK_PREBOOT_SURFACE_HANDOFF_FRAMES = 2
 const NEWTAB_BOOKMARK_PREBOOT_HANDOFF_MAX_WAIT_MS = 1200
 const NEWTAB_BOOKMARK_PREBOOT_TITLE_GUARD_SAMPLE_MS = 100
 const NEWTAB_BOOKMARK_PREBOOT_TITLE_GUARD_MAX_WAIT_MS = 5000
@@ -248,8 +249,10 @@ export function scheduleNewtabBookmarkPrebootHandoff(
   }
 
   let frame = 0
+  let surfaceHandoffFrame = 0
   let timer = 0
   let alignedFrames = 0
+  let tileAlignedFrames = 0
   let finished = false
   let frozenTitleCleanup: (() => void) | null = null
   let guardObserver: MutationObserver | null = null
@@ -267,6 +270,10 @@ export function scheduleNewtabBookmarkPrebootHandoff(
       window.clearTimeout(timer)
       timer = 0
     }
+    if (surfaceHandoffFrame) {
+      window.cancelAnimationFrame(surfaceHandoffFrame)
+      surfaceHandoffFrame = 0
+    }
   }
 
   const clearFrozenTitleTransfer = () => {
@@ -277,6 +284,29 @@ export function scheduleNewtabBookmarkPrebootHandoff(
     frozenTitleCleanup = null
   }
 
+  const removePrebootAfterSurfaceHandoff = (
+    result: Exclude<NewtabBookmarkPrebootHandoffResult, 'missing'>,
+    onRemoved?: () => void
+  ) => {
+    let paintedFrames = 0
+    root.dataset.surfaceHandoff = 'true'
+
+    const commit = () => {
+      surfaceHandoffFrame = 0
+      paintedFrames += 1
+      if (paintedFrames < NEWTAB_BOOKMARK_PREBOOT_SURFACE_HANDOFF_FRAMES) {
+        surfaceHandoffFrame = window.requestAnimationFrame(commit)
+        return
+      }
+      clearNewtabBookmarkPrebootTitleGuard(root)
+      hideNewtabBookmarkPreboot({ clearSnapshot: result !== 'aligned' })
+      onRemoved?.()
+      options.onFinish?.(result)
+    }
+
+    surfaceHandoffFrame = window.requestAnimationFrame(commit)
+  }
+
   const finish = (result: Exclude<NewtabBookmarkPrebootHandoffResult, 'missing'>) => {
     if (finished) {
       return
@@ -284,9 +314,14 @@ export function scheduleNewtabBookmarkPrebootHandoff(
     finished = true
     cancelScheduledSample()
     clearFrozenTitleTransfer()
-    clearNewtabBookmarkPrebootTitleGuard(root)
-    hideNewtabBookmarkPreboot({ clearSnapshot: result !== 'aligned' })
-    options.onFinish?.(result)
+    const hasLiveSurface = Boolean(document.querySelector('.bookmark-tile[data-bookmark-id]'))
+    if (!hasLiveSurface) {
+      clearNewtabBookmarkPrebootTitleGuard(root)
+      hideNewtabBookmarkPreboot({ clearSnapshot: result !== 'aligned' })
+      options.onFinish?.(result)
+      return
+    }
+    removePrebootAfterSurfaceHandoff(result)
   }
 
   const freezeTitleGuard = () => {
@@ -299,31 +334,38 @@ export function scheduleNewtabBookmarkPrebootHandoff(
     finished = true
     cancelScheduledSample()
     frozenTitleCleanup = cleanup
-    clearNewtabBookmarkPrebootTitleGuard(root)
-    hideNewtabBookmarkPreboot({ clearSnapshot: true })
-    options.onFinish?.('timeout')
+    removePrebootAfterSurfaceHandoff('timeout', () => {
+      window.addEventListener('resize', clearFrozenTitleTransfer, { once: true })
+      const liveSections = document.querySelector<HTMLElement>('.bookmark-folder-sections')
+      if (liveSections) {
+        const liveLayoutRoot = liveSections.closest<HTMLElement>('.newtab-primary-slot') ?? liveSections
+        guardObserver = new MutationObserver(clearFrozenTitleTransfer)
+        guardObserver.observe(liveLayoutRoot, {
+          attributeFilter: [
+            'class',
+            'data-bookmark-id',
+            'data-icon-layout-mode',
+            'data-icon-show-titles',
+            'data-icon-vertical-center',
+            'hidden',
+            'style'
+          ],
+          attributes: true,
+          characterData: true,
+          childList: true,
+          subtree: true
+        })
+      }
+    })
+  }
 
-    window.addEventListener('resize', clearFrozenTitleTransfer, { once: true })
-    const liveSections = document.querySelector<HTMLElement>('.bookmark-folder-sections')
-    if (liveSections) {
-      const liveLayoutRoot = liveSections.closest<HTMLElement>('.newtab-primary-slot') ?? liveSections
-      guardObserver = new MutationObserver(clearFrozenTitleTransfer)
-      guardObserver.observe(liveLayoutRoot, {
-        attributeFilter: [
-          'class',
-          'data-bookmark-id',
-          'data-icon-layout-mode',
-          'data-icon-show-titles',
-          'data-icon-vertical-center',
-          'hidden',
-          'style'
-        ],
-        attributes: true,
-        characterData: true,
-        childList: true,
-        subtree: true
-      })
+  const startTitleGuard = (now: number): boolean => {
+    if (!enableNewtabBookmarkPrebootTitleGuard(root)) {
+      return false
     }
+    titleGuardActive = true
+    titleGuardStartedAt = now
+    return true
   }
 
   const scheduleSample = () => {
@@ -353,16 +395,25 @@ export function scheduleNewtabBookmarkPrebootHandoff(
     }
 
     alignedFrames = handoff.state === 'aligned' ? alignedFrames + 1 : 0
+    tileAlignedFrames = handoff.tilesAligned ? tileAlignedFrames + 1 : 0
 
     if (alignedFrames >= NEWTAB_BOOKMARK_PREBOOT_HANDOFF_STABLE_FRAMES) {
       finish('aligned')
       return
     }
+
+    // Card bounds and icon clips are already stable, so the live layer can own
+    // pointer interaction immediately. Keep only the cached titles while font
+    // metrics settle instead of hiding the whole live grid for the timeout.
+    if (
+      !titleGuardActive &&
+      handoff.state === 'pending' &&
+      tileAlignedFrames >= NEWTAB_BOOKMARK_PREBOOT_HANDOFF_STABLE_FRAMES
+    ) {
+      startTitleGuard(now)
+    }
     if (!titleGuardActive && now - startedAt >= NEWTAB_BOOKMARK_PREBOOT_HANDOFF_MAX_WAIT_MS) {
-      if (handoff.tilesAligned && enableNewtabBookmarkPrebootTitleGuard(root)) {
-        titleGuardActive = true
-        titleGuardStartedAt = now
-      } else {
+      if (!handoff.tilesAligned || !startTitleGuard(now)) {
         finish('timeout')
         return
       }
@@ -1261,7 +1312,11 @@ function clampPrebootLength(value: unknown, min: number, max: number, fallback: 
 
 const NEWTAB_BOOKMARK_PREBOOT_CSS = `
 #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID} {
-  --preboot-card-bg: rgba(18, 19, 21, 0.44);
+  /* This script paints before the app stylesheet is available, so mirror the
+     resting bookmark material here instead of letting hydration add the blur. */
+  --preboot-card-bg: rgba(0, 0, 0, 0.6);
+  --preboot-card-border: rgba(255, 255, 255, 0.08);
+  --preboot-card-filter: blur(8px);
   position: fixed;
   inset: 0;
   z-index: 2;
@@ -1284,7 +1339,7 @@ const NEWTAB_BOOKMARK_PREBOOT_CSS = `
   transition: none;
 }
 
-/* The cached cards use translucent glass, so an unsettled live grid would
+/* The cached cards use the final glass material, so an unsettled live grid would
    otherwise remain visible underneath and make its titles appear to jump.
    Visibility preserves layout and geometry measurements for the handoff. */
 #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID} ~ #newtab-react-root .bookmark-folder-sections {
@@ -1297,13 +1352,12 @@ const NEWTAB_BOOKMARK_PREBOOT_CSS = `
   visibility: visible !important;
 }
 
-#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-title-guard="true"] ~ #newtab-react-root .bookmark-title[data-newtab-bookmark-preboot-title-guard="true"] {
-  visibility: hidden !important;
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-surface-handoff="true"] ~ #newtab-react-root .bookmark-folder-sections {
+  visibility: visible !important;
 }
 
-html.instant-wallpaper-startup-preview #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID},
-html[data-instant-wallpaper-signature] #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID} {
-  --preboot-card-bg: rgba(16, 17, 19, 0.56);
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-title-guard="true"] ~ #newtab-react-root .bookmark-title[data-newtab-bookmark-preboot-title-guard="true"] {
+  visibility: hidden !important;
 }
 
 #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID} .newtab-bookmark-preboot-content {
@@ -1339,19 +1393,43 @@ html[data-instant-wallpaper-signature] #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID} {
   gap: 8px;
   padding: 8px 10px;
   overflow: hidden;
-  border: 1px solid rgba(245, 245, 247, 0.1);
+  border: 1px solid var(--preboot-card-border);
   border-radius: 8px;
   background: var(--preboot-card-bg);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.052);
+  -webkit-backdrop-filter: var(--preboot-card-filter);
+  backdrop-filter: var(--preboot-card-filter);
+  transition: none;
 }
 
-#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-title-guard="true"] .newtab-bookmark-preboot-tile {
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-title-guard="true"]:not([data-surface-handoff="true"]) ~ #newtab-react-root .bookmark-tile {
+  border-color: transparent !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-surface-handoff="true"] ~ #newtab-react-root .bookmark-tile {
+  transition: none !important;
+}
+
+/* Keep the cached card as the only glass owner while delayed font metrics are
+   guarded. During removal, retain its compositor layer at a visually neutral
+   blur until the live card has painted for two animation frames. */
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-surface-handoff="true"] .newtab-bookmark-preboot-tile {
   border-color: transparent;
   background: transparent;
   box-shadow: none;
+  -webkit-backdrop-filter: blur(0.01px);
+  backdrop-filter: blur(0.01px);
 }
 
 #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-title-guard="true"] .newtab-bookmark-preboot-tile > :not(.newtab-bookmark-preboot-title) {
+  visibility: hidden;
+}
+
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-surface-handoff="true"]:not([data-title-guard="true"]) .newtab-bookmark-preboot-tile > * {
   visibility: hidden;
 }
 

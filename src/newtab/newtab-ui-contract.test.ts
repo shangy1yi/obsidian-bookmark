@@ -37,11 +37,10 @@ const reducedTransparencyMaskRule = newtabCss.match(
   /@media \(prefers-reduced-transparency: reduce\)[\s\S]*?#newtab-background-mask\s*\{([^}]*)\}/
 )?.[1] || ''
 const startupReducedTransparencyMaskRule = newtabHtml.match(
-  /@media \(prefers-reduced-transparency: reduce\)[\s\S]*?#newtab-startup-background-mask\s*\{([^}]*)\}/
+  /@media \(prefers-reduced-transparency: reduce\)[\s\S]*?#newtab-background-mask\s*\{([^}]*)\}/
 )?.[1] || ''
 const searchSurfaceRule = newtabCss.match(/\.newtab-search\s*\{([^}]*)\}/s)?.[1] || ''
 const bookmarkTileRule = newtabCss.match(/\.bookmark-tile\s*\{([^}]*)\}/s)?.[1] || ''
-const utilityModuleEnterRule = newtabCss.match(/\.newtab-utility-stack > \*\s*\{([^}]*)\}/s)?.[1] || ''
 const reducedTransparencyOpaqueSelectors = [globalsCss, newtabCss]
   .flatMap((source) => [...source.matchAll(/:where\(\s*([^)]*?)\s*\)\s*\{[^}]*background-color:\s*#161616\s*!important;/g)])
   .map((match) => match[1])
@@ -63,13 +62,16 @@ assert.ok(
 )
 
 assert.ok(
-  newtabHtml.includes('html:not([data-instant-wallpaper-preview-only="true"]).instant-wallpaper-ready:not(.instant-wallpaper-remote-ready) body::before') &&
-    newtabCss.includes('html:not([data-instant-wallpaper-preview-only="true"]) .newtab-app.instant-wallpaper-ready:not(.instant-wallpaper-remote-ready)::before') &&
-    newtabCss.includes('.newtab-background-image[data-transitioning="true"]') &&
-    backgroundLayer.includes('data-transitioning="true"') &&
-    !newtabHtml.includes('transition: opacity 280ms cubic-bezier(0.22, 1, 0.36, 1);\n        will-change: opacity;') &&
-    !/\.newtab-background-image\s*\{[^}]*will-change:\s*opacity/s.test(newtabCss),
-  'Wallpaper layers should reserve will-change for an active non-preview-only handoff and release it after the incoming layer commits.'
+  newtabHtml.includes('id="newtab-wallpaper-stage"') &&
+    newtabHtml.includes('var(--newtab-runtime-wallpaper-image, var(--instant-wallpaper-image, none))') &&
+    newtabHtml.includes('transform: translateZ(0)') &&
+    backgroundLayer.includes("RUNTIME_WALLPAPER_IMAGE_PROPERTY = '--newtab-runtime-wallpaper-image'") &&
+    !backgroundLayer.includes('data-transitioning="true"') &&
+    !backgroundLayer.includes('IMAGE_REVEAL_MS') &&
+    !newtabHtml.includes('body::before') &&
+    !newtabCss.includes('.newtab-app::before') &&
+    !/\.newtab-background-image\s*\{[^}]*will-change:/s.test(newtabCss),
+  'Wallpaper rendering must keep one persistent first-frame layer instead of cross-fading and replacing compositor nodes after hydration.'
 )
 
 assert.ok(
@@ -111,18 +113,18 @@ assert.ok(
     instantWallpaperBoot.includes('Targets written before mask snapshots existed should fail dark') &&
     newtabHtml.includes('id="newtab-startup-background-mask-style"') &&
     instantWallpaperBoot.includes("--instant-wallpaper-mask-image") &&
-    newtabHtml.includes('id="newtab-startup-background-mask"') &&
+    newtabHtml.includes('id="newtab-background-mask"') &&
     newtabHtml.includes('background-color: var(--instant-wallpaper-mask-color, transparent)') &&
     newtabHtml.includes('background-image: var(--instant-wallpaper-mask-image, none)') &&
     newtabHtml.includes('backdrop-filter: var(--instant-wallpaper-mask-filter, none)') &&
     controller.includes('let backgroundSettingsHydrated = false') &&
     controller.includes('ready: backgroundSettingsHydrated') &&
     controller.includes('const shouldSyncBackgroundUi = backgroundSettingsHydrated && !backgroundUiAlreadyApplied') &&
-    newtabApp.includes('{backgroundSettings.ready ? (') &&
     newtabApp.includes('if (!backgroundSettings.ready) return') &&
-    newtabApp.includes("getElementById('newtab-startup-background-mask-style')?.remove()") &&
-    newtabApp.includes('removeStartupBackgroundMask()'),
-  'The saved background mask should exist during synchronous wallpaper startup and hand off to React without a bright frame.'
+    newtabApp.includes("getElementById('newtab-background-mask')") &&
+    newtabApp.includes('mask.className = getBackgroundMaskClass(backgroundSettings)') &&
+    !newtabApp.includes('removeStartupBackgroundMask()'),
+  'The saved background mask must remain the same DOM node from synchronous startup through React settings hydration.'
 )
 
 assert.ok(
@@ -135,11 +137,11 @@ assert.ok(
 )
 
 assert.ok(
-  newtabApp.includes("data-mask-initial=\"\"") &&
-    newtabApp.includes("removeAttribute('data-mask-initial')") &&
-    newtabApp.includes('requestAnimationFrame') &&
-    /#newtab-background-mask\[data-mask-initial\][\s\S]*?transition:\s*none/.test(newtabCss),
-  'The React mask must appear at its final state without a fade on first mount, and the startup mask must be removed only after it has painted.'
+  newtabHtml.includes('<div id="newtab-background-mask"') &&
+    !newtabApp.includes('id="newtab-background-mask"') &&
+    !newtabApp.includes("removeAttribute('data-mask-initial')") &&
+    !/newtab-background-mask[^']*transition:/.test(newtabApp),
+  'The background mask must be a persistent non-animated HTML layer, not a startup node replaced by React.'
 )
 
 assert.ok(
@@ -205,7 +207,8 @@ assert.ok(
     paperShaderFilter.includes('useShaderImageSource') &&
     paperShaderFilter.includes("media.kind === 'video'") &&
     paperShaderFilter.includes('originX:') &&
-    newtabApp.indexOf('<NewtabPaperShaderLayer />') < newtabApp.indexOf('id="newtab-background-mask"'),
+    newtabApp.indexOf('<NewtabPaperShaderLayer />') < newtabApp.indexOf('id="newtab-background-mask-host"') &&
+    newtabApp.includes('host.append(mask)'),
   'Paper image shaders should render in the wallpaper filter stack below the readability mask.'
 )
 
@@ -218,7 +221,7 @@ assert.ok(
     wallpaperFilter.includes('getHoverInfluence') &&
     wallpaperFilter.includes('hoverRenderFrame = window.requestAnimationFrame') &&
     wallpaperFilter.includes('asciiGlyphMetricsCache') &&
-    newtabApp.indexOf('<NewtabWallpaperFilterLayer />') < newtabApp.indexOf('id="newtab-background-mask"'),
+    newtabApp.indexOf('<NewtabWallpaperFilterLayer />') < newtabApp.indexOf('id="newtab-background-mask-host"'),
   'Wallpaper filters should use the sampled Canvas renderer below the existing mask layer.'
 )
 
@@ -455,9 +458,9 @@ const autoCenterSlotTransition = newtabCss.match(
   /\.newtab-search-slot\[data-search-auto-vertical-center="true"\]\s*\{([^}]*)\}/
 )?.[1] || ''
 assert.ok(
-  autoCenterSlotTransition.includes('opacity') &&
+  !autoCenterSlotTransition.includes('opacity') &&
     !autoCenterSlotTransition.includes('margin'),
-  'Auto-centered search must not animate its offset: transitioning margin makes measurements read mid-animation values and the slot visibly wander.'
+  'Auto-centered search must reveal at final opacity and must not animate its offset; either transition produces a visible startup flash or wandering measurements.'
 )
 assert.ok(
   controller.includes('nodes.slot === lastMeasuredSearchSlot') &&
@@ -465,11 +468,11 @@ assert.ok(
   'Search layout must re-measure only for a new slot element and only after the vertically centered content block has painted once.'
 )
 
-const cssWallpaperFocusDuration = newtabCss.match(/--newtab-wallpaper-focus-duration:\s*(\d+)ms/)?.[1]
-const bootWallpaperFocusDuration = newtabHtml.match(/transition:\s*opacity\s+(\d+)ms\s+cubic-bezier/)?.[1]
 assert.ok(
-  cssWallpaperFocusDuration && cssWallpaperFocusDuration === bootWallpaperFocusDuration,
-  'The inline boot wallpaper reveal must run at the same speed as the app focus duration to avoid a two-speed color shift.'
+  !newtabCss.includes('--newtab-wallpaper-focus-duration') &&
+    !newtabHtml.includes('transition: opacity 280ms') &&
+    !newtabCss.includes('.newtab-background-image[data-transitioning="true"]'),
+  'The persistent wallpaper source must not run an opacity handoff underneath backdrop-filter surfaces.'
 )
 
 assert.ok(
@@ -508,10 +511,14 @@ assert.ok(
 )
 
 assert.ok(
-  newtabCss.includes('newtab-utility-module-enter') &&
-    utilityModuleEnterRule.includes('animation: newtab-utility-module-enter var(--ui-motion-standard) var(--ui-ease-standard)') &&
-    !/\b(?:both|forwards)\b/.test(utilityModuleEnterRule),
-  'Utility modules should fade in on hydration, then release the animation stacking context so descendant glass can sample the wallpaper.'
+  !newtabHtml.includes('newtab-glass-booting') &&
+    !newtabCss.includes('html.newtab-glass-booting :where(') &&
+    !newtabCss.includes('will-change: backdrop-filter') &&
+    !newtabCss.includes('newtab-utility-module-enter') &&
+    !/\.newtab-search-slot\[data-search-auto-vertical-center="true"\]\s*\{[^}]*transition:\s*opacity/s.test(newtabCss) &&
+    !newtabApp.includes("STARTUP_GLASS_BOOT_CLASS = 'newtab-glass-booting'") &&
+    !newtabApp.includes('STARTUP_GLASS_SURFACE_SELECTOR'),
+  'First-viewport glass must mount at final opacity without adding and later removing per-surface compositor hints.'
 )
 
 assert.ok(
@@ -531,9 +538,11 @@ assert.ok(
 assert.ok(
   viteConfig.includes('NEWTAB_BOOKMARK_PREBOOT_ROUTE') &&
     viteConfig.includes('NEWTAB_BOOKMARK_PREBOOT_ENTRY') &&
+    viteConfig.includes('removeCrossWorldNewtabModulePreloads(transformedHtml)') &&
+    viteConfig.includes('NEWTAB_MODULE_PRELOAD_TAG_PATTERN') &&
     viteConfig.includes('`    <script src="${INSTANT_WALLPAPER_BOOT_ROUTE}"></script>\\n  </head>`') &&
     viteConfig.includes('`<body>\\n    <script src="${NEWTAB_BOOKMARK_PREBOOT_ROUTE}"></script>`'),
-  'Newtab should expose Vite resource hints before synchronous wallpaper restore, then install its stable bookmark snapshot before the React root is parsed.'
+  'Newtab should discard cross-world module preloads, restore the wallpaper synchronously, then install its stable bookmark snapshot before the React root is parsed.'
 )
 
 assert.ok(
@@ -560,9 +569,9 @@ assert.ok(
 
 const backgroundMaskTransition = newtabApp.match(/const BACKGROUND_MASK_BASE_CLASS = '([^']+)'/)?.[1] || ''
 assert.ok(
-  backgroundMaskTransition.includes('transition:opacity_') &&
+  !backgroundMaskTransition.includes('transition:') &&
     !backgroundMaskTransition.includes('backdrop-filter_var'),
-  'The background mask should not animate backdrop-filter during startup.'
+  'The persistent background mask must not animate or rebuild its compositor layer during startup.'
 )
 
 assert.ok(
