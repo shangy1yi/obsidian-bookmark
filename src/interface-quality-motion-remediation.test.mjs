@@ -34,6 +34,7 @@ const popupModals = read('src/popup/components/PopupModalsHost.tsx')
 const popupCss = read('src/popup/popup.css')
 const optionsChrome = read('src/options/components/options-chrome-classes.ts')
 const optionsCss = read('src/options/options.css')
+const optionsApp = read('src/options/OptionsApp.tsx')
 const optionsMain = read('src/options/main.tsx')
 const aiProviderSettings = read('src/options/components/AiProviderSettings.tsx')
 const aiProviderSettingsClasses = read('src/options/components/ai-provider-settings-classes.ts')
@@ -199,6 +200,18 @@ assert.ok(
   !optionsMain.includes('initSquircleEngine') &&
     optionsCss.includes('.options-shell .curator-button:is(:disabled, [data-disabled])'),
   'Options controls must keep native rounded borders and a visible neutral disabled outline.'
+)
+
+assert.ok(
+  optionsApp.includes('id="options-mobile-navigation"') &&
+    optionsApp.includes('ResizeObserver') &&
+    optionsApp.includes("variant=\"mobile\"") &&
+    optionsChrome.includes('options-mobile-nav-trigger !hidden') &&
+    optionsCss.includes('.options-nav-active-indicator[data-ready="true"]') &&
+    optionsCss.includes('transform 260ms var(--ease-smooth-out)') &&
+    !optionsCss.includes('view-transition-name: options-nav-active') &&
+    !switchClasses.includes('motion-reduce:transform-none'),
+  'Options navigation should use a stable moving indicator, a narrow-screen drawer, and truthful reduced-motion switch state.'
 )
 
 assert.ok(

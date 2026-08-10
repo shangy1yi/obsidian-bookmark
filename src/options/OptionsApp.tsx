@@ -8,7 +8,17 @@ import {
   useState,
   type MouseEvent
 } from 'react'
+import { Button } from '../ui/base/Button'
+import { CloseButton } from '../ui/base/CloseButton'
 import { CollapsiblePanel, CollapsibleRoot, CollapsibleTrigger } from '../ui/base/Collapsible'
+import {
+  DialogBackdrop,
+  DialogClose,
+  DialogOverlay,
+  DialogPanel,
+  DialogTitle
+} from '../ui/base/Dialog'
+import { DotMatrixLoader } from '../ui/base/DotMatrixLoader'
 import { Icon } from '../ui/icons/Icon'
 import type { IconName } from '../ui/icons/icon-map'
 import { ThemeProvider } from '../ui/theme/ThemeProvider'
@@ -29,6 +39,7 @@ import {
   navCollapsibleClass,
   navGroupClass,
   navGroupTriggerClass,
+  navActiveIndicatorClass,
   navLinkIconClass,
   navLinkClass,
   navSubitemClass,
@@ -40,6 +51,14 @@ import {
   optionsHeaderClass,
   optionsLayoutClass,
   optionsMainClass,
+  optionsMobileNavBackdropClass,
+  optionsMobileNavCloseClass,
+  optionsMobileNavHeaderClass,
+  optionsMobileNavOverlayClass,
+  optionsMobileNavPanelClass,
+  optionsMobileNavTitleClass,
+  optionsMobileNavTriggerClass,
+  optionsMobileSidebarClass,
   optionsShellClassBase,
   optionsSkipLinkClass,
   optionsSidebarClass,
@@ -167,21 +186,26 @@ function OptionsNavLink({
       className={['group', navLinkClass, className].filter(Boolean).join(' ')}
       href={href}
       aria-current={active ? 'page' : undefined}
+      data-options-section={section}
       onClick={onNavigate}
     >
       <span className={navLinkIconClass} aria-hidden="true">
         <Icon name={icon} size={15} />
       </span>
-      <span className="min-w-0 truncate max-[920px]:whitespace-normal">{label}</span>
+      <span className="relative z-[1] min-w-0 truncate max-[920px]:whitespace-normal">{label}</span>
     </a>
   )
 }
 
 function OptionsHeader({
   activeSectionKey,
+  mobileNavigationOpen,
+  onMobileNavigationOpenChange,
   onNavigate
 }: {
   activeSectionKey: OptionsSectionKey
+  mobileNavigationOpen: boolean
+  onMobileNavigationOpenChange: (open: boolean) => void
   onNavigate: SectionLinkClickHandler
 }) {
   const active = activeSectionKey === 'general'
@@ -204,31 +228,115 @@ function OptionsHeader({
           </strong>
         </span>
       </a>
+      <Button
+        id="options-mobile-nav-trigger"
+        className={optionsMobileNavTriggerClass}
+        type="button"
+        variant="ghost"
+        aria-controls="options-mobile-navigation"
+        aria-expanded={mobileNavigationOpen}
+        aria-label="打开设置导航"
+        title="打开设置导航"
+        onClick={() => onMobileNavigationOpenChange(true)}
+      >
+        <Icon name="Menu" size={20} aria-hidden="true" />
+      </Button>
     </header>
   )
 }
 
 function OptionsSidebar({
   activeSectionKey,
-  onNavigate
+  onNavigate,
+  variant = 'desktop',
+  visible = true
 }: {
   activeSectionKey: OptionsSectionKey
   onNavigate: SectionLinkClickHandler
+  variant?: 'desktop' | 'mobile'
+  visible?: boolean
 }) {
   const [availabilityManuallyOpen, setAvailabilityManuallyOpen] = useState(false)
   const availabilityOpen = availabilitySectionKeys.has(activeSectionKey) || availabilityManuallyOpen
+  const idPrefix = variant === 'mobile' ? 'mobile-' : ''
+  const sidebarRef = useRef<HTMLElement | null>(null)
+  const activeIndicatorRef = useRef<HTMLSpanElement | null>(null)
+
+  useLayoutEffect(() => {
+    const sidebar = sidebarRef.current
+    const indicator = activeIndicatorRef.current
+    if (!sidebar || !indicator || !visible) {
+      if (indicator) {
+        indicator.style.opacity = '0'
+        delete indicator.dataset.ready
+      }
+      return
+    }
+
+    let settleFrame = 0
+    let readyFrame = 0
+    const startedAt = performance.now()
+    const positionIndicator = () => {
+      const activeLink = sidebar.querySelector<HTMLElement>(
+        '.options-nav-link[aria-current="page"]'
+      )
+      if (!activeLink) {
+        indicator.style.opacity = '0'
+        return
+      }
+
+      const sidebarRect = sidebar.getBoundingClientRect()
+      const linkRect = activeLink.getBoundingClientRect()
+      if (!linkRect.width || !linkRect.height) {
+        indicator.style.opacity = '0'
+        return
+      }
+
+      indicator.style.width = `${linkRect.width}px`
+      indicator.style.height = `${linkRect.height}px`
+      indicator.style.transform = `translate3d(${linkRect.left - sidebarRect.left + sidebar.scrollLeft}px, ${linkRect.top - sidebarRect.top + sidebar.scrollTop}px, 0)`
+      indicator.style.opacity = '1'
+      if (!indicator.dataset.ready && !readyFrame) {
+        readyFrame = window.requestAnimationFrame(() => {
+          indicator.dataset.ready = 'true'
+        })
+      }
+    }
+    const trackSettlingLayout = (now: number) => {
+      positionIndicator()
+      if (now - startedAt < 360) {
+        settleFrame = window.requestAnimationFrame(trackSettlingLayout)
+      }
+    }
+
+    settleFrame = window.requestAnimationFrame(trackSettlingLayout)
+    const resizeObserver = new ResizeObserver(positionIndicator)
+    resizeObserver.observe(sidebar)
+    window.addEventListener('resize', positionIndicator)
+    return () => {
+      window.cancelAnimationFrame(settleFrame)
+      window.cancelAnimationFrame(readyFrame)
+      resizeObserver.disconnect()
+      window.removeEventListener('resize', positionIndicator)
+    }
+  }, [activeSectionKey, availabilityOpen, variant, visible])
 
   return (
-    <aside className={optionsSidebarClass} aria-label="设置导航">
+    <aside
+      className={variant === 'mobile' ? optionsMobileSidebarClass : optionsSidebarClass}
+      aria-label={variant === 'mobile' ? '移动端设置导航' : '设置导航'}
+      ref={sidebarRef}
+    >
+      <span className={navActiveIndicatorClass} ref={activeIndicatorRef} aria-hidden="true" />
       {navGroups.map((group, groupIndex) => (
         <div
           className={[navGroupClass, groupIndex > 0 ? 'mt-[18px]' : ''].filter(Boolean).join(' ')}
           key={group.labelId}
         >
-          <p id={group.labelId} className={optionsSidebarLabelClass}>
+          <p id={`${idPrefix}${group.labelId}`} className={optionsSidebarLabelClass}>
             {group.label}
           </p>
-          <nav className={navClass} aria-labelledby={group.labelId}>
+          <nav className={navClass} aria-labelledby={`${idPrefix}${group.labelId}`}>
             {group.links?.map((link) => (
               <OptionsNavLink
                 key={link.section}
@@ -246,7 +354,7 @@ function OptionsSidebar({
                 <CollapsibleTrigger
                   className={navGroupTriggerClass}
                   type="button"
-                  aria-controls={group.collapsible.panelId}
+                  aria-controls={`${idPrefix}${group.collapsible.panelId}`}
                 >
                   <span>{group.collapsible.trigger}</span>
                   <span className="t-acc-chevron text-ds-text-disabled" aria-hidden="true">
@@ -254,7 +362,7 @@ function OptionsSidebar({
                   </span>
                 </CollapsibleTrigger>
                 <CollapsiblePanel
-                  id={group.collapsible.panelId}
+                  id={`${idPrefix}${group.collapsible.panelId}`}
                   className={navSublistClass}
                 >
                   {group.collapsible.links.map((link) => (
@@ -280,6 +388,74 @@ function OptionsSidebar({
         </div>
       ))}
     </aside>
+  )
+}
+
+function OptionsMobileNavigation({
+  activeSectionKey,
+  onNavigate,
+  onOpenChange,
+  open
+}: {
+  activeSectionKey: OptionsSectionKey
+  onNavigate: SectionLinkClickHandler
+  onOpenChange: (open: boolean) => void
+  open: boolean
+}) {
+  const handleNavigate: SectionLinkClickHandler = (event) => {
+    const shouldClose =
+      event.button === 0 &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.shiftKey
+    onNavigate(event)
+    if (shouldClose) {
+      onOpenChange(false)
+    }
+  }
+
+  return (
+    <DialogOverlay
+      id="options-mobile-navigation"
+      className={`${optionsMobileNavOverlayClass} ${open ? 'pointer-events-auto' : 'pointer-events-none'}`}
+      open={open}
+      onOpenChange={onOpenChange}
+      triggerId="options-mobile-nav-trigger"
+      aria-hidden={open ? 'false' : 'true'}
+      inert={!open}
+      tabIndex={-1}
+    >
+      <DialogBackdrop className={optionsMobileNavBackdropClass} />
+      <DialogPanel
+        className={optionsMobileNavPanelClass}
+        motionVariant="drawer"
+        aria-labelledby="options-mobile-navigation-title"
+        finalFocus={() => document.getElementById('options-mobile-nav-trigger')}
+      >
+        <div className={optionsMobileNavHeaderClass}>
+          <DialogTitle id="options-mobile-navigation-title" className={optionsMobileNavTitleClass}>
+            设置导航
+          </DialogTitle>
+          <DialogClose
+            render={
+              <CloseButton
+                className={optionsMobileNavCloseClass}
+                type="button"
+                label="关闭设置导航"
+                variant="ghost"
+              />
+            }
+          />
+        </div>
+        <OptionsSidebar
+          activeSectionKey={activeSectionKey}
+          onNavigate={handleNavigate}
+          variant="mobile"
+          visible={open}
+        />
+      </DialogPanel>
+    </DialogOverlay>
   )
 }
 
@@ -317,6 +493,7 @@ export function OptionsApp() {
   const optionsMainRef = useRef<HTMLElement | null>(null)
   const aiProviderAnchorRef = useRef<HTMLDivElement | null>(null)
   const [aiProviderAttentionRequestId, setAiProviderAttentionRequestId] = useState(0)
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false)
   useEffect(() => {
     if (!('scrollRestoration' in window.history)) {
       return
@@ -331,6 +508,18 @@ export function OptionsApp() {
 
   useEffect(() => {
     return subscribeToOptionsBookmarkEvents()
+  }, [])
+
+  useEffect(() => {
+    const desktopQuery = window.matchMedia('(min-width: 921px)')
+    const closeMobileNavigation = () => {
+      if (desktopQuery.matches) {
+        setMobileNavigationOpen(false)
+      }
+    }
+    closeMobileNavigation()
+    desktopQuery.addEventListener('change', closeMobileNavigation)
+    return () => desktopQuery.removeEventListener('change', closeMobileNavigation)
   }, [])
 
   useLayoutEffect(() => {
@@ -457,7 +646,12 @@ export function OptionsApp() {
       <div className={optionsShellClassBase} ref={optionsShellRef}>
         <a className={optionsSkipLinkClass} href="#options-main">跳到主要内容</a>
         <div className={optionsSidebarDividerClass} aria-hidden="true"></div>
-        <OptionsHeader activeSectionKey={sectionKey} onNavigate={handleSectionNavigationClick} />
+        <OptionsHeader
+          activeSectionKey={sectionKey}
+          mobileNavigationOpen={mobileNavigationOpen}
+          onMobileNavigationOpenChange={setMobileNavigationOpen}
+          onNavigate={handleSectionNavigationClick}
+        />
         <div className={optionsLayoutClass}>
           <OptionsSidebar activeSectionKey={sectionKey} onNavigate={handleSectionNavigationClick} />
           <main id="options-main" className={optionsMainClass} ref={optionsMainRef} tabIndex={-1}>
@@ -471,6 +665,12 @@ export function OptionsApp() {
           </main>
         </div>
       </div>
+      <OptionsMobileNavigation
+        activeSectionKey={sectionKey}
+        onNavigate={handleSectionNavigationClick}
+        onOpenChange={setMobileNavigationOpen}
+        open={mobileNavigationOpen}
+      />
       <DeferredOptionsModals />
     </ThemeProvider>
   )
@@ -509,10 +709,11 @@ function ActiveOptionsPanel({
 function OptionsPanelLoading() {
   return (
     <output
-      className="grid min-h-40 place-items-center text-sm text-ds-text-muted"
+      className="flex min-h-40 items-center justify-center gap-2.5 text-[13px] text-ds-text-muted"
       aria-live="polite"
     >
-      正在载入…
+      <DotMatrixLoader className="size-5" variant="bar" />
+      <span>正在载入…</span>
     </output>
   )
 }

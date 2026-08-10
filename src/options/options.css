@@ -55,6 +55,139 @@ body,
   --ui-focus-ring: var(--ds-focus);
 }
 
+.options-nav-active-indicator[data-ready="true"] {
+  transition:
+    background-color var(--ds-motion-fast) var(--ds-ease-standard),
+    box-shadow var(--ds-motion-fast) var(--ds-ease-standard),
+    opacity var(--ds-motion-fast) var(--ds-ease-standard),
+    transform 260ms var(--ease-smooth-out);
+}
+
+.options-nav-active-indicator::before {
+  position: absolute;
+  top: 50%;
+  left: 4px;
+  width: 2px;
+  height: 16px;
+  border-radius: var(--ds-radius-full);
+  background: var(--ds-text-primary);
+  content: "";
+  opacity: 0.82;
+  transform: translateY(-50%);
+}
+
+.options-brand:focus-visible {
+  border-radius: var(--ds-radius-sm);
+  box-shadow: var(--ds-shadow-focus);
+}
+
+.options-mobile-nav-trigger {
+  border-color: var(--ds-border);
+  background: var(--ds-surface-1);
+  color: var(--ds-text-secondary);
+}
+
+.options-main-scroll,
+.options-shell aside,
+.options-mobile-sidebar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ds-border-hover) transparent;
+}
+
+.options-main-scroll::-webkit-scrollbar,
+.options-shell aside::-webkit-scrollbar,
+.options-mobile-sidebar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.options-main-scroll::-webkit-scrollbar-track,
+.options-shell aside::-webkit-scrollbar-track,
+.options-mobile-sidebar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.options-main-scroll::-webkit-scrollbar-thumb,
+.options-shell aside::-webkit-scrollbar-thumb,
+.options-mobile-sidebar::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: var(--ds-radius-full);
+  background: var(--ds-border-hover);
+  background-clip: padding-box;
+}
+
+.options-mobile-sidebar nav {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.options-interactive-surface {
+  transition:
+    border-color var(--ds-motion-standard) var(--ds-ease-standard),
+    box-shadow var(--ds-motion-standard) var(--ds-ease-standard);
+}
+
+.options-interactive-surface:focus-within {
+  border-color: var(--ds-border-hover);
+  box-shadow: inset 0 0 0 1px var(--ds-border-subtle);
+}
+
+.options-switch-control::after {
+  position: absolute;
+  inset: -4px;
+  border: 1px solid var(--ds-border-hover);
+  border-radius: inherit;
+  content: "";
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.88);
+  transition:
+    opacity var(--ds-motion-fast) var(--ds-ease-standard),
+    transform var(--ds-motion-standard) var(--ds-ease-standard);
+}
+
+.options-switch-control:not([data-disabled]):active::after {
+  opacity: 0.7;
+  transform: scale(1);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .options-brand:hover .options-brand-mark {
+    border-color: var(--ds-border-hover);
+  }
+
+  .options-brand:hover img {
+    filter: grayscale(1) contrast(1.08) brightness(1);
+  }
+
+  .options-mobile-nav-trigger:hover {
+    border-color: var(--ds-border-hover);
+    background: var(--ds-hover);
+    color: var(--ds-text-primary);
+  }
+
+  .options-sidebar:has(.options-nav-link[aria-current="page"]:hover) > .options-nav-active-indicator {
+    background: var(--ds-active);
+  }
+
+  .options-nav-link:hover > span > svg {
+    transform: translateX(1px);
+  }
+
+  .options-shell .curator-button:not(:disabled):not([aria-disabled="true"]):not([data-disabled]):hover {
+    transform: translate3d(0, -1px, 0);
+  }
+
+  .options-shell .curator-button:not(:disabled):not([aria-disabled="true"]):not([data-disabled]):active {
+    transform: scale(var(--ds-press-scale));
+  }
+
+  .options-interactive-surface:has(
+    :where(button, input, textarea, select, [role="switch"]):not(:disabled):not([data-disabled])
+  ):hover {
+    border-color: var(--ds-border);
+  }
+}
+
 .options-shell :where(
   button,
   a[href],
@@ -154,16 +287,34 @@ body,
   .folder-picker-card:active {
     scale: 1 !important;
   }
+
+  .options-nav-link > span > svg,
+  .options-shell .curator-button,
+  .options-switch-control::after {
+    transform: none !important;
+  }
+
+  .options-switch-control::after {
+    transition: opacity 80ms linear !important;
+  }
+
+  .options-nav-active-indicator[data-ready="true"] {
+    transition-property: background-color, box-shadow, opacity !important;
+    transition-duration: 80ms !important;
+    transition-timing-function: linear !important;
+  }
 }
 
 @media (prefers-reduced-transparency: reduce) {
-  .options-modal-backdrop {
+  .options-modal-backdrop,
+  .options-mobile-nav-backdrop {
     background: rgba(0, 0, 0, 0.92) !important;
     -webkit-backdrop-filter: none !important;
     backdrop-filter: none !important;
   }
 
   .options-modal-panel,
+  .options-mobile-nav-panel,
   .options-shell :where(.curator-motion-popover, [role="dialog"], [role="menu"]) {
     background-color: var(--ds-bg-page) !important;
     -webkit-backdrop-filter: none !important;

@@ -36,10 +36,10 @@ export const OPTION_WIDE_PANEL_CLASS =
   `${OPTION_PANEL_WIDE_LAYOUT_CLASS} ${OPTION_PANEL_SURFACE_RESET_CLASS}`
 
 export const OPTION_GROUP_CLASS =
-  'curator-motion-surface mt-7 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 py-2 max-[760px]:mt-5'
+  'options-interactive-surface curator-motion-surface mt-7 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 py-2 max-[760px]:mt-5'
 
 export const OPTION_TOOL_PANEL_CLASS =
-  `curator-motion-surface mt-5 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[18px_20px_20px] shadow-none ${OPTION_REVEAL_ENTER_CLASS} max-[760px]:p-4`
+  `options-interactive-surface curator-motion-surface mt-5 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[18px_20px_20px] shadow-none ${OPTION_REVEAL_ENTER_CLASS} max-[760px]:p-4`
 
 export const OPTION_RUN_HEADER_CLASS = [
   'curator-motion-surface mt-6 grid grid-cols-[minmax(220px,0.82fr)_minmax(260px,1fr)_auto] items-stretch gap-3',
@@ -48,10 +48,10 @@ export const OPTION_RUN_HEADER_CLASS = [
 ].join(' ')
 
 export const OPTION_RUN_CELL_CLASS =
-  'curator-motion-surface min-w-0 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[16px_18px] shadow-none max-[760px]:p-4'
+  'options-interactive-surface curator-motion-surface min-w-0 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[16px_18px] shadow-none max-[760px]:p-4'
 
 export const OPTION_RUN_CELL_COMPACT_CLASS =
-  'curator-motion-surface min-w-0 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[14px_16px] shadow-none'
+  'options-interactive-surface curator-motion-surface min-w-0 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[14px_16px] shadow-none'
 
 export const OPTION_RUN_CELL_TITLE_CLASS =
   'block text-[15px] font-[650] leading-normal tracking-[0] text-ds-text-primary'
@@ -60,7 +60,7 @@ export const OPTION_RUN_CELL_TEXT_CLASS =
   'mt-2 mb-0 text-[13px] leading-[1.55] text-ds-text-secondary'
 
 export const OPTION_RUN_ACTIONS_CLASS =
-  'curator-motion-surface flex min-w-0 flex-wrap items-center justify-end gap-2.5 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[14px_16px] max-[1180px]:justify-start max-[860px]:items-stretch'
+  'options-interactive-surface curator-motion-surface flex min-w-0 flex-wrap items-center justify-end gap-2.5 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[14px_16px] max-[1180px]:justify-start max-[860px]:items-stretch'
 
 export const OPTION_RUN_ACTION_BUTTON_CLASS =
   'max-[860px]:w-full'
@@ -81,7 +81,7 @@ export const OPTION_COPY_TEXT_CLASS =
   'mt-[7px] mb-0 text-[13px] leading-[1.65] text-ds-text-muted'
 
 export const OPTION_EMPTY_STATE_CLASS =
-  'curator-motion-surface t-stagger rounded-ds-sm border border-ds-border-subtle bg-ds-surface-1 p-[18px_20px] text-left shadow-none'
+  'options-interactive-surface curator-motion-surface t-stagger rounded-ds-sm border border-ds-border-subtle bg-ds-surface-1 p-[18px_20px] text-left shadow-none'
 
 export const OPTION_EMPTY_STATE_TITLE_CLASS =
   'm-0 text-sm font-bold leading-[1.4] text-ds-text-primary'

@@ -13,7 +13,7 @@ const SHORTCUT_DETAIL_TONE_CLASSES: Record<string, string> = {
   warning: 'border-ds-warning/35 bg-ds-warning-soft text-ds-warning'
 }
 const SHORTCUT_CARD_CLASS =
-  'mt-7 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[26px_24px_24px] max-[760px]:mt-5 max-[760px]:p-[18px_16px]'
+  'options-interactive-surface mt-7 rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-[26px_24px_24px] max-[760px]:mt-5 max-[760px]:p-[18px_16px]'
 const SHORTCUT_HEAD_CLASS =
   'flex items-start justify-between gap-[18px] max-[760px]:flex-col max-[760px]:items-stretch'
 const SHORTCUT_COPY_CLASS = 'min-w-0'
@@ -84,6 +84,7 @@ export function ShortcutControls() {
           focusableWhenDisabled={state.loading}
           onClick={() => handleShortcutAction('refresh')}
         >
+          <Icon name="RefreshCw" size={14} aria-hidden="true" />
           刷新状态
         </Button>
         <Button
@@ -94,6 +95,7 @@ export function ShortcutControls() {
           aria-label="打开 Chrome 扩展快捷键设置"
           onClick={() => handleShortcutAction('open-settings')}
         >
+          <Icon name="ExternalLink" size={14} aria-hidden="true" />
           打开快捷键设置
         </Button>
       </div>
