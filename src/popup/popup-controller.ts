@@ -1168,6 +1168,12 @@ function setSearchQuery(value, { immediate = false } = {}) {
   if (String(value || '').trim() && state.bookmarkReorderMode) {
     resetBookmarkReorderModeState()
   }
+  if (String(value || '').trim() && state.keyboardPane === 'folders') {
+    clearQueuedKeyboardNavigation()
+    state.keyboardPane = 'bookmarks'
+    state.activeFolderKeyboardIndex = -1
+    state.activeResultIndex = -1
+  }
   state.searchQuery = value
   state.naturalSearchSetupRequired = false
   clearViewNotice()
@@ -1195,10 +1201,21 @@ function applyDebouncedSearchQuery(value: string): void {
   runSearch()
 }
 function syncActiveSearchResultIndex(): void {
-  if (!state.debouncedQuery || !state.searchResults.length) {
+  if (!state.debouncedQuery) {
     state.activeResultIndex = -1
     return
   }
+
+  // Search results always own keyboard selection. Without this reset, a folder
+  // row focused before searching can keep the workspace indicator in the sidebar.
+  state.keyboardPane = 'bookmarks'
+  state.activeFolderKeyboardIndex = -1
+
+  if (!state.searchResults.length) {
+    state.activeResultIndex = -1
+    return
+  }
+
   if (state.activeResultIndex < 0) {
     state.activeResultIndex = 0
     return
@@ -2221,7 +2238,7 @@ function buildBookmarkRowViewModel(bookmark, depth, active = false, index = -1):
 function getSearchResultRows(): PopupContentSearchResultViewModel[] {
   return state.searchResults
     .map((bookmark, index) => {
-      const isActive = index === state.activeResultIndex
+      const isActive = isBookmarkRowKeyboardActive(state.keyboardPane, index, state.activeResultIndex)
       const reasonTokens = summarizeMatchReasonTokens(bookmark.matchReasons)
       const reasonTitle = Array.isArray(bookmark.matchReasons) && bookmark.matchReasons.length
         ? bookmark.matchReasons.join(' · ')
@@ -4382,7 +4399,8 @@ function queueActiveResultDelta(delta: number) {
   const nextIndex = baseIndex < 0
     ? (delta < 0 ? keyboardBookmarks.length - 1 : 0)
     : Math.max(0, Math.min(baseIndex + delta, keyboardBookmarks.length - 1))
-  if (nextIndex === baseIndex) {
+  const shouldActivateBookmarkPane = state.keyboardPane !== 'bookmarks' || state.activeFolderKeyboardIndex >= 0
+  if (nextIndex === baseIndex && !shouldActivateBookmarkPane) {
     return
   }
 
@@ -4507,10 +4525,13 @@ function setActiveResultIndex(nextIndex) {
     return
   }
   const clampedIndex = Math.max(0, Math.min(nextIndex, keyboardBookmarks.length - 1))
-  if (clampedIndex === state.activeResultIndex) {
+  const shouldActivateBookmarkPane = state.keyboardPane !== 'bookmarks' || state.activeFolderKeyboardIndex >= 0
+  if (clampedIndex === state.activeResultIndex && !shouldActivateBookmarkPane) {
     return
   }
   const previousIndex = state.activeResultIndex
+  state.keyboardPane = 'bookmarks'
+  state.activeFolderKeyboardIndex = -1
   state.activeResultIndex = clampedIndex
   updateActiveSearchResult(previousIndex, clampedIndex)
   renderMainContent({ preserveScroll: false })
@@ -4522,7 +4543,8 @@ function activateResultKeyboardIndex(nextIndex: number) {
   }
 
   const clampedIndex = Math.max(0, Math.min(Math.trunc(nextIndex), keyboardBookmarks.length - 1))
-  if (state.keyboardPane === 'bookmarks' && clampedIndex === state.activeResultIndex) {
+  const shouldActivateBookmarkPane = state.keyboardPane !== 'bookmarks' || state.activeFolderKeyboardIndex >= 0
+  if (!shouldActivateBookmarkPane && clampedIndex === state.activeResultIndex) {
     return
   }
 

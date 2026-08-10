@@ -20,6 +20,7 @@ function run(): void {
   testFolderPaneDoesNotKeepBookmarkRowActive()
   testFolderPaneStartsOnSelectedFolder()
   testFolderPaneUsesFullSidebarTreeAfterFolderFilter()
+  testSearchResultsReclaimBookmarkKeyboardSelection()
   testDocumentNavigationDelegatesFocusedControls()
   testMainSearchKeepsCaretHorizontalKeysButAllowsResultNavigation()
   testFolderPickerKeyboardIndexes()
@@ -87,6 +88,43 @@ function testFolderPaneUsesFullSidebarTreeAfterFolderFilter(): void {
   assert(
     getFolderPaneTreeRoot(selectedFolder, bookmarksBar) === bookmarksBar,
     'folder keyboard navigation should keep using the full sidebar tree after selecting a folder'
+  )
+}
+
+function testSearchResultsReclaimBookmarkKeyboardSelection(): void {
+  const source = readFileSync('src/popup/popup-controller.ts', 'utf8')
+  const syncSearchSelection = source.slice(
+    source.indexOf('function syncActiveSearchResultIndex()'),
+    source.indexOf('async function toggleNaturalLanguageSearch')
+  )
+  const searchResultRows = source.slice(
+    source.indexOf('function getSearchResultRows()'),
+    source.indexOf('const MATCH_REASON_TOKEN_PATTERNS')
+  )
+  const setActiveResult = source.slice(
+    source.indexOf('function setActiveResultIndex('),
+    source.indexOf('function activateResultKeyboardIndex(')
+  )
+
+  assert(
+    syncSearchSelection.includes("state.keyboardPane = 'bookmarks'") &&
+      syncSearchSelection.includes('state.activeFolderKeyboardIndex = -1'),
+    'starting a search must clear a stale folder keyboard selection before rendering results'
+  )
+  assert(
+    source.includes("if (String(value || '').trim() && state.keyboardPane === 'folders')") &&
+      source.includes('clearQueuedKeyboardNavigation()') &&
+      source.includes('state.activeResultIndex = -1'),
+    'raw search input must reclaim the bookmark pane before the debounced results arrive'
+  )
+  assert(
+    searchResultRows.includes('isBookmarkRowKeyboardActive(state.keyboardPane, index, state.activeResultIndex)'),
+    'search result highlight state must follow the active keyboard pane'
+  )
+  assert(
+    setActiveResult.includes("state.keyboardPane = 'bookmarks'") &&
+      setActiveResult.includes('state.activeFolderKeyboardIndex = -1'),
+    'keyboard result navigation must reclaim the bookmark pane even when the result index is unchanged'
   )
 }
 
