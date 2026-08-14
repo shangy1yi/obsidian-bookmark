@@ -7,7 +7,7 @@ import { Progress } from '../../ui/base/Progress'
 import { Toolbar } from '../../ui/base/Toolbar'
 import { cx } from '../../ui/base/utils'
 import { Icon } from '../../ui/icons/Icon'
-import { getSmartDisplayProgress, getSmartLoadingOrbState } from '../smart-loading-progress.js'
+import { getSmartDisplayProgress, getSmartLoadingOrbState, SMART_LOADING_STAGE_STARTS } from '../smart-loading-progress.js'
 import type { PopupSmartClassifierViewModel, PopupSmartPageViewModel } from './PopupViewModels'
 
 const SMART_ERROR_BANNER_CLASS =
@@ -562,6 +562,11 @@ function PopupSmartLoading({
               } as CSSProperties}
               label="智能分类进度"
               value={loadingProgress}
+              style={{
+                '--smart-progress-fill': `${loadingProgress}%`,
+                '--smart-stage-a': `${SMART_LOADING_STAGE_STARTS[1]}%`,
+                '--smart-stage-b': `${SMART_LOADING_STAGE_STARTS[2]}%`
+              } as CSSProperties}
               aria-valuetext={`${state.loadingLabel} 第 ${state.loadingStep}/${state.loadingStepCount} 阶段，已完成 ${loadingPercent}%`}
               unstyled
             />

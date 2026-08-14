@@ -142,11 +142,14 @@ import { writeClipboardText } from '../shared/clipboard.js'
 import { runIdle } from '../shared/idle.js'
 import {
   SMART_LOADING_PROGRESS_COMPLETE_MS,
+  SMART_LOADING_PROGRESS_FINISH_MS,
+  SMART_LOADING_PROGRESS_SETTLE_HOLD_MS,
   SMART_LOADING_PROGRESS_TICK_MS,
   SMART_LOADING_STEP_COUNT,
-  getNextSmartProgress,
   getSmartCheckpointProgress,
   getSmartDisplayProgress,
+  getSmartEasedProgress,
+  getSmartFinishProgress,
   getSmartProgressTarget,
   normalizeSmartLoadingStep
 } from './smart-loading-progress.js'
@@ -173,6 +176,10 @@ let aiSettingsModulePromise: Promise<typeof import('../options/sections/ai-setti
 let smartClassifierModulePromise: Promise<typeof import('./smart-classifier.js')> | null = null
 let recycleBinModulePromise: Promise<typeof import('../shared/recycle-bin.js')> | null = null
 let smartProgressTimer: number | null = null
+// 缓动的锚点：最近一次"真实进度"的数值与发生时刻，节拍器据此按经过时间推算显示值。
+let smartProgressBase = 0
+let smartProgressBaseAtMs = 0
+let smartProgressFinishFrame: number | null = null
 let popupRefreshRunId = 0
 let currentTabHydrationPromise: Promise<void> | null = null
 let popupBookmarkCatalog: BookmarkCatalogSnapshot | null = null
@@ -3663,11 +3670,8 @@ async function classifyCurrentPage({ requestMissingPermissions = false } = {}) {
     state.smartExtraction = smartClassifier.buildSmartExtractionSnapshot(pageContext)
     state.smartRecommendations = recommendations
     state.smartSelectedRecommendationId = recommendations[0]?.id || ''
-    state.smartProgressPercent = 100
-    stopSmartProgressTicker()
-    renderSmartClassifier()
     if (state.smartRunId !== runId) return
-    await waitForSmartProgressCompletion()
+    await runSmartProgressFinish(runId)
     if (!isSmartLoadingRunActive(runId)) return
     state.smartStatus = 'results'
     renderSmartClassifier()
@@ -3697,6 +3701,7 @@ function advanceSmartProgressStage(runId: number, nextStep: number): boolean {
     state.smartProgressPercent,
     getSmartCheckpointProgress(step, 0)
   )
+  anchorSmartProgress(state.smartProgressPercent)
   renderSmartClassifier()
   return true
 }
@@ -3713,6 +3718,7 @@ function updateSmartProgressCheckpoint(runId: number, rawStep: number, checkpoin
     return
   }
   state.smartProgressPercent = nextProgress
+  anchorSmartProgress(nextProgress)
   renderSmartClassifier()
 }
 function isSmartLoadingRunActive(runId: number): boolean {
@@ -4645,7 +4651,8 @@ function getSmartLoadingLabel() {
 }
 function startSmartProgressTicker(runId: number) {
   stopSmartProgressTicker()
-  if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+  anchorSmartProgress(state.smartProgressPercent)
+  if (prefersReducedMotionForSmartProgress()) {
     return
   }
 
@@ -4655,7 +4662,11 @@ function startSmartProgressTicker(runId: number) {
       return
     }
 
-    const nextProgress = getNextSmartProgress(state.smartProgressPercent, state.smartStep)
+    const nextProgress = getSmartEasedProgress(
+      state.smartStep,
+      smartProgressBase,
+      performance.now() - smartProgressBaseAtMs
+    )
     if (nextProgress > state.smartProgressPercent) {
       state.smartProgressPercent = nextProgress
       renderSmartClassifier()
@@ -4666,15 +4677,67 @@ function startSmartProgressTicker(runId: number) {
 
   smartProgressTimer = window.setTimeout(tick, SMART_LOADING_PROGRESS_TICK_MS)
 }
+function prefersReducedMotionForSmartProgress(): boolean {
+  return Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)
+}
+// 每次拿到真实进度就重新落锚，缓动从新数值重新起步（又快又平滑）而不是接着旧曲线的尾巴爬。
+function anchorSmartProgress(progress: number): void {
+  smartProgressBase = progress
+  smartProgressBaseAtMs = performance.now()
+}
 function stopSmartProgressTicker() {
+  cancelSmartProgressFinish()
   if (smartProgressTimer === null) {
     return
   }
   window.clearTimeout(smartProgressTimer)
   smartProgressTimer = null
 }
-function waitForSmartProgressCompletion() {
+function cancelSmartProgressFinish() {
+  if (smartProgressFinishFrame === null) {
+    return
+  }
+  window.cancelAnimationFrame(smartProgressFinishFrame)
+  smartProgressFinishFrame = null
+}
+// 收尾：从当前值 ease-out 补到 100%，再让完成态停留一拍，替代原来的瞬间跳满。
+function runSmartProgressFinish(runId: number): Promise<void> {
+  stopSmartProgressTicker()
+
+  const from = getSmartDisplayProgress(state.smartProgressPercent, state.smartStep)
+  if (prefersReducedMotionForSmartProgress() || from >= 100) {
+    state.smartProgressPercent = 100
+    renderSmartClassifier()
+    return waitForSmartProgressCompletion()
+  }
+
   return new Promise((resolve) => {
+    const startedAtMs = performance.now()
+    const step = () => {
+      if (!isSmartLoadingRunActive(runId)) {
+        smartProgressFinishFrame = null
+        resolve()
+        return
+      }
+
+      const ratio = Math.min(1, (performance.now() - startedAtMs) / SMART_LOADING_PROGRESS_FINISH_MS)
+      state.smartProgressPercent = getSmartFinishProgress(from, ratio)
+      renderSmartClassifier()
+
+      if (ratio >= 1) {
+        smartProgressFinishFrame = null
+        window.setTimeout(resolve, SMART_LOADING_PROGRESS_SETTLE_HOLD_MS)
+        return
+      }
+
+      smartProgressFinishFrame = window.requestAnimationFrame(step)
+    }
+
+    smartProgressFinishFrame = window.requestAnimationFrame(step)
+  })
+}
+function waitForSmartProgressCompletion() {
+  return new Promise<void>((resolve) => {
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         window.setTimeout(resolve, SMART_LOADING_PROGRESS_COMPLETE_MS)

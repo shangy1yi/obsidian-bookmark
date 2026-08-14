@@ -28,12 +28,38 @@ assert(!progressClassSource.includes('--ds-accent'), 'smart progress should not 
 assert(!progressClassSource.includes('--ds-focus'), 'smart progress should not use the blue focus token')
 assert(componentSource.includes('<span className="tabular-nums">{loadingPercent}%</span>'), 'smart progress should show its latest percentage without animating replacement text')
 assert(
-  /prefers-reduced-motion[\s\S]*?\.smart-progress-bar::after[\s\S]*?animation:\s*none\s*!important/.test(popupCssSource),
+  /prefers-reduced-motion[\s\S]*?\.smart-progress-track::after[\s\S]*?animation:\s*none\s*!important/.test(popupCssSource),
   'reduced motion should stop the progress sheen'
 )
-assert(popupCssSource.includes('left: 33.333333%'), 'first smart progress divider should mark one third')
-assert(popupCssSource.includes('left: 66.666667%'), 'second smart progress divider should mark two thirds')
+assert(
+  /@keyframes smart-progress-sheen/.test(popupCssSource),
+  'the filled track should carry a sheen so a slow AI stage never looks frozen'
+)
+assert(
+  /\.smart-progress-track::after[\s\S]*?clip-path:\s*inset\(0 calc\(100% - var\(--smart-progress-fill/.test(popupCssSource),
+  'the sheen must be clipped to the completed portion so it never overstates progress'
+)
+assert(
+  popupCssSource.includes('var(--smart-stage-a'),
+  'first smart progress divider should follow the stage weights'
+)
+assert(
+  popupCssSource.includes('var(--smart-stage-b'),
+  'second smart progress divider should follow the stage weights'
+)
+assert(
+  componentSource.includes("'--smart-stage-a': `${SMART_LOADING_STAGE_STARTS[1]}%`"),
+  'stage dividers must be driven by the stage table instead of hardcoded thirds'
+)
 assert(controllerSource.includes('startSmartProgressTicker(runId)'), 'smart progress should keep creeping while loading')
+assert(
+  controllerSource.includes('await runSmartProgressFinish(runId)'),
+  'the last stage should ease into 100% instead of snapping there'
+)
+assert(
+  !/state\.smartProgressPercent = 100\s*\n\s*stopSmartProgressTicker/.test(controllerSource),
+  'results must not teleport the bar to 100% before the finish ramp runs'
+)
 
 const contextIndex = controllerSource.indexOf('await smartClassifier.buildCurrentPageContext')
 const aiStageIndex = controllerSource.indexOf('advanceSmartProgressStage(runId, 2)')
