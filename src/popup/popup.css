@@ -91,7 +91,8 @@ body::after {
   content: none;
 }
 
-/* 阶段刻度由阶段权重推导（--smart-stage-*），不再手写 1/3、2/3，改权重时不会漂移。 */
+/* 阶段刻度由阶段权重推导（--smart-stage-*），不再手写 1/3、2/3，改权重时不会漂移。
+   这是 AI 三阶段管线特有的，不进共享的流光进度条样式。 */
 .smart-progress-track::before {
   position: absolute;
   top: 1px;
@@ -107,45 +108,6 @@ body::after {
   background-size: 1px 100%, 1px 100%;
   content: "";
   pointer-events: none;
-}
-
-/*
- * 流光只铺在已完成的那一截上（clip-path 跟着 --smart-progress-fill 走）。
- * 数字负责说清整体进度，流光负责证明"还在跑"——AI 那一段哪怕数字挪得慢，条子也不是死的。
- * clip-path 与填充条用同一条 320ms 线性过渡，两条前沿边不会错开。
- */
-.smart-progress-track::after {
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  animation: smart-progress-sheen 1750ms cubic-bezier(0.42, 0, 0.28, 1) infinite;
-  background-image: linear-gradient(
-    90deg,
-    rgba(255, 255, 255, 0) 0%,
-    rgba(255, 255, 255, 0.5) 50%,
-    rgba(255, 255, 255, 0) 100%
-  );
-  background-repeat: no-repeat;
-  background-size: 38% 100%;
-  clip-path: inset(0 calc(100% - var(--smart-progress-fill, 0%)) 0 0);
-  content: "";
-  pointer-events: none;
-  transition: clip-path 320ms linear;
-  will-change: background-position;
-}
-
-@keyframes smart-progress-sheen {
-  from {
-    background-position-x: -60%;
-  }
-
-  to {
-    background-position-x: 160%;
-  }
-}
-
-.smart-progress-bar::after {
-  content: none;
 }
 
 :where(
@@ -543,20 +505,6 @@ button:focus-visible {
   }
 
   .popup-main-pane[data-reorder-mode="true"] .popup-main-row[data-reorder-source="true"] {
-    opacity: 0;
-  }
-
-  #popup-root .smart-progress-bar {
-    transform: scaleX(var(--smart-progress-scale)) !important;
-  }
-
-  #popup-root .smart-progress-bar::after,
-  #popup-root .smart-progress-track::after {
-    animation: none !important;
-    transition: none !important;
-  }
-
-  #popup-root .smart-progress-track::after {
     opacity: 0;
   }
 }

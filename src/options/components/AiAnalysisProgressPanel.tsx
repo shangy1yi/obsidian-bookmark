@@ -2,14 +2,18 @@ import { useMemo, type ReactNode } from 'react'
 import { AiThinkingOrb } from '../../ui/ai/AiThinkingOrb'
 import { AiTaskStatus } from '../../ui/ai/AiTaskStatus'
 import {
+  SHEEN_PROGRESS_BAR_CLASS,
+  SHEEN_PROGRESS_TRACK_CLASS,
+  getSheenProgressBarStyle,
+  getSheenProgressTrackStyle
+} from '../../ui/base/sheen-progress'
+import {
   useAiAnalysisDuration,
   useAiAnalysisProgress
 } from './ai-analysis-status-store.js'
 import { OPTION_VALUE_CLASS } from './option-layout-classes.js'
 
-const OPTIONS_PROGRESS_TRACK_CLASS =
-  'mt-[14px] h-2 rounded-full bg-ds-surface-2 ring-1 ring-inset ring-ds-border-subtle'
-const OPTIONS_PROGRESS_BAR_CLASS = 'rounded-full bg-ds-accent-hover'
+const OPTIONS_PROGRESS_TRACK_CLASS = `mt-[14px] ${SHEEN_PROGRESS_TRACK_CLASS}`
 const AI_ANALYSIS_DECISION_PANEL_CLASS =
   'mt-[18px] border-ds-border-subtle bg-ds-surface-1'
 const AI_ANALYSIS_PROGRESS_COPY_CLASS =
@@ -20,6 +24,10 @@ const AI_ANALYSIS_BUSY_LABEL_CLASS =
 export function AiAnalysisProgressPanel({ children }: { children: ReactNode }) {
   const state = useAiAnalysisProgress()
   const { durationLabel } = useAiAnalysisDuration()
+  // 这里的进度是真值（已处理 / 总数），不套 popup 那套面向未知耗时的缓动。
+  const progressPercent = state.progressMax > 0
+    ? (state.progressValue / state.progressMax) * 100
+    : 0
   const title = useMemo(() => (
     <strong>
       {state.busy ? (
@@ -52,7 +60,10 @@ export function AiAnalysisProgressPanel({ children }: { children: ReactNode }) {
       progressDivisions={state.progressMax}
       progressValueText={state.progressLabel}
       progressClassName={OPTIONS_PROGRESS_TRACK_CLASS}
-      progressIndicatorClassName={OPTIONS_PROGRESS_BAR_CLASS}
+      progressStyle={getSheenProgressTrackStyle(progressPercent)}
+      progressIndicatorClassName={SHEEN_PROGRESS_BAR_CLASS}
+      progressIndicatorStyle={getSheenProgressBarStyle(progressPercent)}
+      progressUnstyled
       statusNode={statusNode}
       aria-label="书签智能分析决策概览"
     >

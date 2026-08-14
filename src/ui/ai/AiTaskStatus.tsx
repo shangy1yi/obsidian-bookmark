@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 import { Badge } from '../base/Badge'
 import { Progress } from '../base/Progress'
 import { Spinner } from '../base/Spinner'
@@ -10,7 +10,10 @@ export interface AiTaskStatusProps {
   descriptionClassName?: string
   label?: ReactNode
   progressIndicatorClassName?: string
+  progressIndicatorStyle?: CSSProperties
   progressClassName?: string
+  progressStyle?: CSSProperties
+  progressUnstyled?: boolean
   status: 'idle' | 'running' | 'success' | 'warning' | 'error'
   statusNode?: ReactNode
   title: ReactNode
@@ -43,7 +46,10 @@ export function AiTaskStatus({
   progressAriaLabel,
   progressDivisions,
   progressIndicatorClassName,
+  progressIndicatorStyle,
   progressClassName,
+  progressStyle,
+  progressUnstyled = false,
   progressMax,
   progressValueText,
   status,
@@ -74,7 +80,10 @@ export function AiTaskStatus({
           divisions={progressDivisions}
           label={progressAriaLabel}
           className={progressClassName}
+          style={progressStyle}
           indicatorClassName={progressIndicatorClassName}
+          indicatorStyle={progressIndicatorStyle}
+          unstyled={progressUnstyled}
           aria-valuetext={progressValueText}
         />
       ) : null}

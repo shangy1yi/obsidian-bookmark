@@ -692,6 +692,50 @@ body {
   .t-shimmer::before { animation: none !important; }
 }
 
+/*
+ * 流光进度条。宽度说清真实进度，流光证明任务还在跑——两者分工，互不冒充。
+ * 流光被 clip-path 裁在已完成的那一截里（--sheen-progress-fill 由组件写入），
+ * 并与填充条共用同一条 320ms 线性过渡，两条前沿边不会错开。
+ */
+.sheen-progress-track::after {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  animation: sheen-progress-sweep 1750ms cubic-bezier(0.42, 0, 0.28, 1) infinite;
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.5) 50%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 38% 100%;
+  clip-path: inset(0 calc(100% - var(--sheen-progress-fill, 0%)) 0 0);
+  content: "";
+  pointer-events: none;
+  transition: clip-path 320ms linear;
+  will-change: background-position;
+}
+
+@keyframes sheen-progress-sweep {
+  from { background-position-x: -60%; }
+  to   { background-position-x: 160%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheen-progress-bar,
+  .sheen-progress-track::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .sheen-progress-bar {
+    transform: scaleX(var(--sheen-progress-scale)) !important;
+  }
+
+  .sheen-progress-track::after { opacity: 0; }
+}
+
 .t-stagger-line {
   display: block;
   opacity: 0;

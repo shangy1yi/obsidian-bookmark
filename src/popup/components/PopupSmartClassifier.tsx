@@ -4,6 +4,12 @@ import { Button } from '../../ui/base/Button'
 import { DotMatrixLoader } from '../../ui/base/DotMatrixLoader'
 import { Input } from '../../ui/base/Input'
 import { Progress } from '../../ui/base/Progress'
+import {
+  SHEEN_PROGRESS_BAR_CLASS,
+  SHEEN_PROGRESS_TRACK_CLASS,
+  getSheenProgressBarStyle,
+  getSheenProgressTrackStyle
+} from '../../ui/base/sheen-progress'
 import { Toolbar } from '../../ui/base/Toolbar'
 import { cx } from '../../ui/base/utils'
 import { Icon } from '../../ui/icons/Icon'
@@ -143,14 +149,8 @@ const loadingContentClass = 'min-w-0'
 const loadingCopyClass =
   'mb-2.5 mt-0 flex items-center justify-between gap-3 text-[13px] font-[650] text-ds-text-primary'
 const loadingStepClass = 'text-[11px] font-medium text-ds-text-secondary'
-const progressTrackClass =
-  'smart-progress-track relative h-[6px] overflow-hidden rounded-full bg-ds-text-primary/[0.08] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.03)]'
-const progressBarClass = [
-  'smart-progress-bar relative block h-full overflow-hidden rounded-[inherit]',
-  'origin-left bg-[rgba(237,237,237,0.86)]',
-  'shadow-[inset_0_1px_0_rgba(255,255,255,0.34)]',
-  'transition-transform duration-[320ms] ease-linear will-change-transform motion-reduce:transition-none'
-].join(' ')
+const progressTrackClass = cx('smart-progress-track', SHEEN_PROGRESS_TRACK_CLASS)
+const progressBarClass = SHEEN_PROGRESS_BAR_CLASS
 
 const resultCardClass = cx(panelCardClass, 'flex h-full min-h-0 flex-col overflow-hidden px-[18px] py-4')
 const titleRowClass = 'mb-3.5 grid grid-cols-[minmax(0,1fr)] gap-2'
@@ -554,16 +554,11 @@ function PopupSmartLoading({
               className={progressTrackClass}
               indicatorClassName={progressBarClass}
               indicatorProps={{ 'data-smart-progress-target': loadingProgress } as Record<string, string | number>}
-              indicatorStyle={{
-                width: '100%',
-                transform: `scaleX(${loadingProgress / 100})`,
-                transformOrigin: 'left center',
-                '--smart-progress-scale': loadingProgress / 100
-              } as CSSProperties}
+              indicatorStyle={getSheenProgressBarStyle(loadingProgress)}
               label="智能分类进度"
               value={loadingProgress}
               style={{
-                '--smart-progress-fill': `${loadingProgress}%`,
+                ...getSheenProgressTrackStyle(loadingProgress),
                 '--smart-stage-a': `${SMART_LOADING_STAGE_STARTS[1]}%`,
                 '--smart-stage-b': `${SMART_LOADING_STAGE_STARTS[2]}%`
               } as CSSProperties}

@@ -1,6 +1,13 @@
 import type { ReactNode } from 'react'
 import { StatusBusyLoadingLabel } from './LoadingLabel.js'
 import { useMotionEntrance } from '../../ui/motion/useMotionEntrance'
+import {
+  SHEEN_PROGRESS_BAR_CLASS,
+  SHEEN_PROGRESS_TRACK_CLASS,
+  getSheenProgressBarStyle,
+  getSheenProgressTrackStyle,
+  normalizeSheenProgressPercent
+} from '../../ui/base/sheen-progress'
 import { useAvailabilityProgress } from './availability-overview-store.js'
 import { OPTION_VALUE_CLASS } from './option-layout-classes.js'
 
@@ -15,10 +22,8 @@ const AVAILABILITY_DECISION_SUBTITLE_CLASS =
   'mt-[5px] mb-0 text-[13px] leading-[1.5] text-ds-text-secondary'
 const AVAILABILITY_LABEL_CLASS =
   'block text-xs font-medium leading-4 text-ds-text-secondary'
-const AVAILABILITY_PROGRESS_TRACK_CLASS =
-  'mt-[14px] h-[7px] overflow-hidden rounded-none border border-ds-border-subtle bg-black'
-const AVAILABILITY_PROGRESS_BAR_CLASS =
-  'block h-full origin-left rounded-none bg-ds-accent-hover transition-transform duration-ds-fast ease-ds-standard motion-reduce:transition-none'
+const AVAILABILITY_PROGRESS_TRACK_CLASS = `mt-[14px] ${SHEEN_PROGRESS_TRACK_CLASS}`
+const AVAILABILITY_PROGRESS_BAR_CLASS = SHEEN_PROGRESS_BAR_CLASS
 const AVAILABILITY_PROGRESS_ROW_CLASS =
   'mt-3 grid grid-cols-[minmax(128px,0.32fr)_minmax(0,1fr)] items-center gap-[14px] border-t border-t-[rgba(255,255,255,0.07)] pt-[11px] max-[760px]:grid-cols-1 max-[760px]:gap-2'
 const AVAILABILITY_PROGRESS_META_TITLE_CLASS =
@@ -68,16 +73,17 @@ export function AvailabilityDecisionPanel({ children }: { children: ReactNode })
             <div>
               <div
                 className={AVAILABILITY_PROGRESS_TRACK_CLASS}
+                style={getSheenProgressTrackStyle(state.progressValue)}
                 aria-label="可用性检测进度"
                 aria-valuemax={100}
                 aria-valuemin={0}
-                aria-valuenow={Math.max(0, Math.min(state.progressValue, 100))}
+                aria-valuenow={normalizeSheenProgressPercent(state.progressValue)}
                 role="progressbar"
               >
                 <span
                   aria-hidden="true"
                   className={AVAILABILITY_PROGRESS_BAR_CLASS}
-                  style={{ transform: `scaleX(${Math.max(0, Math.min(state.progressValue, 100)) / 100})` }}
+                  style={getSheenProgressBarStyle(state.progressValue)}
                 />
               </div>
               <p
