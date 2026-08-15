@@ -2,7 +2,15 @@
   color-scheme: dark;
 
   --reveal-translate-y: var(--distance-micro);
-  --reveal-ease: var(--ease-smooth-out);
+
+  /* Both popup skeletons — the two-pane workspace and the current-page card —
+     dissolve on this pair. The inherited --ease-smooth-out is a strong ease-out:
+     it dumps ~80% of the opacity change into the first 50ms, so the swap reads
+     as a cut with a smear instead of a fade. An even curve over 240ms is what
+     makes it read as one dissolve. Overrides the app-wide 180ms in tokens.css,
+     which still serves the compact motion elsewhere. */
+  --reveal-dur: 240ms;
+  --reveal-ease: var(--ease-in-out);
 }
 
 * {
@@ -36,13 +44,29 @@
   transform: translate3d(0, 0, 0);
 }
 
-/* Keep the dense two-pane workspace geometrically fixed during cold start.
-   Compact cards may still use the subtle translate reveal above. */
+/* Neither popup skeleton translates. A placeholder mark stands exactly where
+   its text lands, so the premise is "this bar becomes that line" — offset the
+   incoming layer and the two ghost past each other mid-dissolve instead. The
+   workspace also has to stay geometrically fixed during cold start. */
 .t-skel.popup-workspace-reveal .t-skel-content,
 .t-skel.popup-workspace-reveal.is-revealed .t-skel-content {
   transform: none;
 }
 
+.t-skel.popup-page-reveal .t-skel-content,
+.t-skel.popup-page-reveal.is-revealed .t-skel-content {
+  transform: none;
+}
+
+.t-skel.popup-page-reveal .t-skel-content {
+  transition:
+    opacity var(--reveal-dur) var(--reveal-ease);
+}
+
+/* Opacity only — the dense workspace must not translate. Both layers keep the
+   same duration and curve as the shared rules above, so their opacities sum to
+   a constant through the swap; offsetting either side, or giving one a stronger
+   curve, is what makes a crossfade dip or ghost. */
 .t-skel.popup-workspace-reveal .t-skel-content {
   transition:
     opacity var(--reveal-dur) var(--reveal-ease);
@@ -78,6 +102,12 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .popup-workspace-reveal .popup-skeleton-pulse {
     animation: none;
+  }
+
+  /* popup.css :root wins over the reduced-motion block in tokens.css,
+     so the popup has to zero its own override here. */
+  :root {
+    --reveal-dur: 1ms;
   }
 }
 

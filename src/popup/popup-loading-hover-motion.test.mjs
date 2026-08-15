@@ -551,7 +551,12 @@ try {
   assert.match(revealStyles.skeletonBarAnimationName, /t-skel-pulse/, 'Placeholder marks must retain restrained loading feedback')
   assert.equal(revealStyles.contentFilter, 'none', 'Loaded text must remain crisp before and after reveal')
   assert.equal(revealStyles.skeletonFilter, 'none', 'Large skeleton surfaces must avoid blur rasterization')
-  assert.ok(result.contentTransitionMs >= 150 && result.contentTransitionMs <= 200, 'Popup reveal must be perceptible without lingering')
+  assert.ok(result.contentTransitionMs >= 200 && result.contentTransitionMs <= 300, 'Popup reveal must be perceptible without lingering')
+  assert.equal(
+    result.skeletonTransitionMs,
+    result.contentTransitionMs,
+    'Both reveal layers must share one duration so the dissolve cannot dip or ghost mid-swap'
+  )
   assert.equal(liveReveal.sawCrossFade, true, 'The popup skeleton and content must visibly cross-fade')
   assert.equal(liveReveal.sawTranslateReveal, false, 'Dense popup content must not move while replacing its skeleton')
   assert.ok(

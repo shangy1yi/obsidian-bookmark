@@ -116,7 +116,8 @@ function run(): void {
     motionTokens.includes('--reveal-dur: 180ms') &&
       motionTokens.includes('--reveal-blur: 0px') &&
       popupCss.includes('--reveal-translate-y: var(--distance-micro)') &&
-      popupCss.includes('--reveal-ease: var(--ease-smooth-out)'),
+      popupCss.includes('--reveal-dur: 240ms') &&
+      popupCss.includes('--reveal-ease: var(--ease-in-out)'),
     'popup skeleton reveal must remain crisp, compositor-only, and token driven'
   )
   assert(/\.t-skel\.popup-t-skel \.t-skel-content\s*\{[^}]*filter:\s*none;[^}]*transform:\s*translate3d/s.test(popupCss), 'popup loaded text must never enter through a large-area blur filter')
