@@ -1239,8 +1239,11 @@ async function processAutoAnalyzeQueue(): Promise<void> {
   try {
     await processNextAutoAnalyzeQueueEntry()
   } finally {
-    autoAnalyzeQueueProcessing = false
     autoAnalyzeTreeContext = null
+    await settleAutoAnalyzeQueueStatus().catch((error) => {
+      console.warn('[Curator] 自动分析队列状态收敛失败', error)
+    })
+    autoAnalyzeQueueProcessing = false
   }
 }
 
@@ -1362,7 +1365,6 @@ async function runAutoAnalysisForBookmark(
     !snapshotSettings?.localOnlyNoAiUpload
 
   if (!shouldSnapshot && !shouldUploadToAi) {
-    await clearAutoAnalyzeStatusForBookmark(bookmarkId)
     return
   }
 
@@ -1418,7 +1420,6 @@ async function runAutoAnalysisForBookmark(
   }
 
   if (!shouldUploadToAi) {
-    await clearAutoAnalyzeStatusForBookmark(bookmarkId)
     return
   }
 
@@ -1427,7 +1428,6 @@ async function runAutoAnalysisForBookmark(
     localOnlyNoAiUpload: Boolean(snapshotSettings?.localOnlyNoAiUpload)
   })
   if (!requestSettings) {
-    await clearAutoAnalyzeStatusForBookmark(bookmarkId)
     return
   }
 
@@ -2217,8 +2217,8 @@ async function markAutoAnalyzeQueueEntryFailed(
   return disposition
 }
 
-async function removeAutoAnalyzeQueueEntry(bookmarkId: string): Promise<void> {
-  await updateAutoAnalyzeQueue((entries) => {
+async function removeAutoAnalyzeQueueEntry(bookmarkId: string): Promise<AutoAnalyzeQueueEntry[]> {
+  return updateAutoAnalyzeQueue((entries) => {
     return entries.filter((entry) => entry.bookmarkId !== bookmarkId)
   })
 }
@@ -3040,6 +3040,38 @@ async function clearAutoAnalyzeStatusForBookmark(bookmarkId: string): Promise<vo
   await removeLocalStorage(STORAGE_KEYS.autoAnalyzeStatus)
   await clearActionBadge().catch(() => {})
   clearAutoAnalyzeStatusAlarm()
+}
+
+async function settleAutoAnalyzeQueueStatus(): Promise<void> {
+  const [queue, currentStatus] = await Promise.all([
+    loadAutoAnalyzeQueue(),
+    loadAutoAnalyzeStatus()
+  ])
+  const pendingQueue = pruneAutoAnalyzeQueue(queue, Date.now())
+
+  if (currentStatus && ['completed', 'failed'].includes(currentStatus.status)) {
+    return
+  }
+
+  const nextEntry = pendingQueue[0]
+  if (nextEntry) {
+    if (currentStatus?.status === 'queued' && currentStatus.bookmarkId === nextEntry.bookmarkId) {
+      return
+    }
+    await persistAutoAnalyzeStatus({
+      status: 'queued',
+      bookmarkId: nextEntry.bookmarkId,
+      url: nextEntry.url,
+      title: nextEntry.title || '新增书签',
+      createdAt: nextEntry.createdAt,
+      detail: '队列中还有待处理书签，正在继续处理。'
+    })
+    return
+  }
+
+  if (currentStatus) {
+    await clearAutoAnalyzeStatusForBookmark(currentStatus.bookmarkId)
+  }
 }
 
 async function loadAutoAnalyzeStatus(): Promise<AutoAnalyzeStatusSnapshot | null> {

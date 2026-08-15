@@ -53,6 +53,15 @@ assert.match(
   /return willRetry[\s\S]*nextRunAt:[\s\S]*: \[\]/,
   'terminal failures must be removed instead of being scheduled again'
 )
+const queueRemoval = readFunction(
+  'removeAutoAnalyzeQueueEntry',
+  'updateAutoAnalyzeQueue'
+)
+assert.match(
+  queueRemoval,
+  /Promise<AutoAnalyzeQueueEntry\[]>[\s\S]*return updateAutoAnalyzeQueue/,
+  'queue removal must return the remaining entries for a stable status handoff'
+)
 
 const queueProcessor = readFunction(
   'processNextAutoAnalyzeQueueEntry',
@@ -86,6 +95,11 @@ assert.match(
   queueLoop,
   /if \(autoAnalyzeQueueProcessing\) \{[\s\S]*scheduleAutoAnalyzeQueueAlarm\(AUTO_ANALYZE_QUEUE_WATCHDOG_MS\)[\s\S]*return/,
   'a watchdog firing during a live run must rearm itself'
+)
+assert.match(
+  queueLoop,
+  /finally \{[\s\S]*await settleAutoAnalyzeQueueStatus\(\)[\s\S]*autoAnalyzeQueueProcessing = false/,
+  'queue status must settle once after the processing loop instead of disappearing between entries'
 )
 assert.match(
   source,
@@ -159,6 +173,11 @@ assert.match(
 const runAnalysis = readFunction(
   'runAutoAnalysisForBookmark',
   'scheduleAutoAnalyzeQueueProcessing'
+)
+assert.doesNotMatch(
+  runAnalysis,
+  /clearAutoAnalyzeStatusForBookmark/,
+  'an individual queue entry must not clear the shared queue status'
 )
 const latestRead = runAnalysis.indexOf('let latestBookmark = await getBookmarkById(bookmarkId)')
 const conflictCheck = runAnalysis.indexOf('getAutoBookmarkMutationConflict(bookmark, latestBookmark)')
