@@ -376,11 +376,16 @@ assert.ok(
     newtabMain.includes('prefetchNewtabStartupData()') &&
     !newtabMain.includes("from './newtab-controller'") &&
     newtabMain.includes('createRoot(root).render') &&
-    newtabMain.indexOf('createRoot(root).render') < newtabMain.indexOf("import('./newtab-controller')") &&
+    // The controller chunk is requested ahead of the React mount so its download
+    // and off-thread parse overlap with it, but it is only *started* from a task
+    // queued after render(), so the cached shell still paints first.
+    newtabMain.indexOf("const newTabControllerModule = import('./newtab-controller')") <
+      newtabMain.indexOf('createRoot(root).render') &&
     newtabMain.indexOf('markNewTabStartupBaseline()') < newtabMain.indexOf('createRoot(root).render') &&
     newtabMain.includes("performance.mark('newtab.domContentLoaded')") &&
-    newtabMain.includes('window.requestAnimationFrame') &&
-    newtabMain.includes('window.setTimeout(loadController, 0)') &&
+    newtabMain.indexOf('createRoot(root).render') <
+      newtabMain.indexOf('scheduleNewTabControllerStart()') &&
+    newtabMain.includes('window.setTimeout(startNewTabController, 0)') &&
     !newtabApp.includes('useNewtabController') &&
     newtabApp.includes("void import('./newtab-controller')") &&
     newtabApp.indexOf('startNewTabController()') < newtabApp.indexOf('dispatchNewtabSettingsDrawerToggleRequest()') &&

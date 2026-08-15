@@ -394,6 +394,13 @@ export function scheduleNewtabBookmarkPrebootHandoff(
       return
     }
 
+    // Pointer input can move to the live grid as soon as its tile geometry
+    // matches the snapshot, without waiting for the painted handoff: a click
+    // then resolves to exactly the bookmark drawn under the cursor. This is
+    // re-evaluated every sample, so a grid that shifts again gives the input
+    // layer straight back.
+    setNewtabBookmarkPrebootPointerHandoff(root, handoff.tilesAligned)
+
     alignedFrames = handoff.state === 'aligned' ? alignedFrames + 1 : 0
     tileAlignedFrames = handoff.tilesAligned ? tileAlignedFrames + 1 : 0
 
@@ -593,6 +600,24 @@ function clearNewtabBookmarkPrebootTitleGuard(root: HTMLElement): void {
     '.bookmark-title[data-newtab-bookmark-preboot-title-guard="true"]'
   )) {
     delete title.dataset.newtabBookmarkPrebootTitleGuard
+  }
+}
+
+/**
+ * 快照与实况瓦片几何对齐后，实况层立刻接管命中测试（仍不绘制）。
+ * 交接前实况网格是 visibility: hidden，命中测试也一并被禁用，用户会看到
+ * 一屏可读的书签却点不动；这里把「能点」与「能看见」解耦，撤下快照的
+ * 时机、动画与像素完全不变。
+ */
+function setNewtabBookmarkPrebootPointerHandoff(root: HTMLElement, enabled: boolean): void {
+  if (enabled) {
+    if (root.dataset.pointerHandoff !== 'true') {
+      root.dataset.pointerHandoff = 'true'
+    }
+    return
+  }
+  if (root.dataset.pointerHandoff) {
+    delete root.dataset.pointerHandoff
   }
 }
 
@@ -1352,8 +1377,27 @@ const NEWTAB_BOOKMARK_PREBOOT_CSS = `
   visibility: visible !important;
 }
 
+/* Tile geometry already matches the snapshot, so the live grid can own pointer
+   input while the cached layer keeps owning the pixels. Transparent rather than
+   hidden: visibility would keep hit-testing off and leave a readable but dead
+   grid on screen. Nothing paints here, so the handoff frame is unchanged. */
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-pointer-handoff="true"]:not([data-title-guard="true"]):not([data-surface-handoff="true"]) ~ #newtab-react-root .bookmark-folder-sections {
+  visibility: visible !important;
+  opacity: 0 !important;
+  transition: none !important;
+}
+
+/* A fully transparent grid must not also pay for 72 backdrop blurs it cannot
+   show; the snapshot tiles carry the glass until the painted handoff. */
+#${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-pointer-handoff="true"]:not([data-title-guard="true"]):not([data-surface-handoff="true"]) ~ #newtab-react-root .bookmark-tile {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  transition: none !important;
+}
+
 #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-surface-handoff="true"] ~ #newtab-react-root .bookmark-folder-sections {
   visibility: visible !important;
+  transition: none !important;
 }
 
 #${NEWTAB_BOOKMARK_PREBOOT_ROOT_ID}[data-title-guard="true"] ~ #newtab-react-root .bookmark-title[data-newtab-bookmark-preboot-title-guard="true"] {
