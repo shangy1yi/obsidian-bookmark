@@ -176,6 +176,7 @@ let aiSettingsModulePromise: Promise<typeof import('../options/sections/ai-setti
 let smartClassifierModulePromise: Promise<typeof import('./smart-classifier.js')> | null = null
 let recycleBinModulePromise: Promise<typeof import('../shared/recycle-bin.js')> | null = null
 let smartProgressTimer: number | null = null
+let smartClassificationAbortController: AbortController | null = null
 // 缓动的锚点：最近一次"真实进度"的数值与发生时刻，节拍器据此按经过时间推算显示值。
 let smartProgressBase = 0
 let smartProgressBaseAtMs = 0
@@ -205,6 +206,10 @@ interface PopupRefreshDeferredData {
 function abortNaturalSearchRequest() {
   state.naturalSearchAbortController?.abort()
   state.naturalSearchAbortController = null
+}
+function abortSmartClassificationRequest() {
+  smartClassificationAbortController?.abort()
+  smartClassificationAbortController = null
 }
 function loadNaturalSearchModule(): Promise<typeof import('./natural-search.js')> {
   naturalSearchModulePromise ||= import('./natural-search.js')
@@ -1057,6 +1062,7 @@ function cleanupPopupController() {
   unregisterPopupBrowserEventActions = null
   popupControllerStarted = false
   abortNaturalSearchRequest()
+  abortSmartClassificationRequest()
   stopSmartProgressTicker()
   clearQueuedKeyboardNavigation()
   clearTimeout(state.searchTimer)
@@ -1458,7 +1464,7 @@ async function runNaturalSearch(query, normalizedQuery, runId) {
   } catch (error) {
     if (
       state.searchRunId !== runId ||
-      isAbortError(error) ||
+      controller.signal.aborted ||
       (error instanceof Error && error.message === 'search-cancelled')
     ) {
       return
@@ -1537,8 +1543,7 @@ async function resolveNaturalSearchPlan(
   } catch (error) {
     if (
       state.searchRunId !== options.runId ||
-      options.signal?.aborted ||
-      isAbortError(error)
+      options.signal?.aborted
     ) {
       throw error
     }
@@ -1584,8 +1589,7 @@ async function resolveNaturalSearchPlan(
   } catch (error) {
     if (
       state.searchRunId !== options.runId ||
-      options.signal?.aborted ||
-      isAbortError(error)
+      options.signal?.aborted
     ) {
       throw error
     }
@@ -3569,6 +3573,7 @@ function isSmartOverlayActive(): boolean {
     ['loading', 'results', 'error', 'permission'].includes(state.smartStatus)
 }
 function resetSmartClassification() {
+  abortSmartClassificationRequest()
   state.smartRunId += 1
   stopSmartProgressTicker()
   state.smartStatus = 'idle'
@@ -3600,6 +3605,9 @@ async function classifyCurrentPage({ requestMissingPermissions = false } = {}) {
     showToast({ type: 'error', message: '当前页面无法进行智能分类。' })
     return
   }
+  abortSmartClassificationRequest()
+  const controller = new AbortController()
+  smartClassificationAbortController = controller
   const runId = state.smartRunId + 1
   state.smartRunId = runId
   state.smartStatus = 'loading'
@@ -3640,6 +3648,7 @@ async function classifyCurrentPage({ requestMissingPermissions = false } = {}) {
       currentUrl,
       currentTitle: getCurrentPageTitle(),
       settings,
+      signal: controller.signal,
       onProgress: (checkpoint) => updateSmartProgressCheckpoint(runId, 1, checkpoint)
     })
     const contextRunStillCurrent = state.smartRunId === runId
@@ -3651,6 +3660,7 @@ async function classifyCurrentPage({ requestMissingPermissions = false } = {}) {
       currentUrl,
       currentTitle: getCurrentPageTitle(),
       allFolders: state.allFolders,
+      signal: controller.signal,
       onProgress: (checkpoint) => updateSmartProgressCheckpoint(runId, 2, checkpoint)
     })
     const classificationRunStillCurrent = state.smartRunId === runId
@@ -3676,7 +3686,7 @@ async function classifyCurrentPage({ requestMissingPermissions = false } = {}) {
     state.smartStatus = 'results'
     renderSmartClassifier()
   } catch (error) {
-    if (state.smartRunId !== runId) return
+    if (state.smartRunId !== runId || controller.signal.aborted) return
     stopSmartProgressTicker()
     if (isSmartPermissionRequiredError(error)) {
       state.smartStatus = 'permission'
@@ -3688,6 +3698,10 @@ async function classifyCurrentPage({ requestMissingPermissions = false } = {}) {
     state.smartStatus = 'error'
     state.smartError = normalizeSmartError(error)
     renderSmartClassifier()
+  } finally {
+    if (smartClassificationAbortController === controller) {
+      smartClassificationAbortController = null
+    }
   }
 }
 function advanceSmartProgressStage(runId: number, nextStep: number): boolean {
@@ -4387,13 +4401,6 @@ function isSmartPermissionRequiredError(error) {
 }
 function formatPermissionOrigin(origin) {
   return String(origin || '').replace(/\/\*$/, '')
-}
-function isAbortError(error) {
-  return Boolean(
-    error &&
-    typeof error === 'object' &&
-    (error.name === 'AbortError' || error.kind === 'abort')
-  )
 }
 function queueActiveResultDelta(delta: number) {
   const keyboardBookmarks = getKeyboardNavigationBookmarks()

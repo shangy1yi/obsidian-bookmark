@@ -147,17 +147,6 @@ export function normalizeNaturalSearchAiError(error: unknown): string {
   return `AI 解析不可用：${truncateNaturalSearchText(message, 72)}`
 }
 
-export function isNaturalSearchAbortError(error: unknown): boolean {
-  return Boolean(
-    error &&
-    typeof error === 'object' &&
-    (
-      (error as { name?: unknown }).name === 'AbortError' ||
-      (error as { kind?: unknown }).kind === 'abort'
-    )
-  )
-}
-
 function buildNaturalSearchPrompt({
   query,
   localPlan

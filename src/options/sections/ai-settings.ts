@@ -1,7 +1,9 @@
 import { normalizeText } from '../../shared/text.js'
 import {
   AI_NAMING_FETCHED_MODELS_LIMIT,
-  AI_NAMING_MAX_BATCH_SIZE
+  AI_NAMING_LEGACY_DEFAULT_TIMEOUT_MS,
+  AI_NAMING_MAX_BATCH_SIZE,
+  AI_NAMING_MAX_TIMEOUT_MS
 } from '../shared-options/constants.js'
 import { createDefaultAiNamingSettings } from '../shared-options/state.js'
 import {
@@ -65,6 +67,7 @@ export function normalizeAiNamingSettings(rawSettings: unknown): AiNamingSetting
     : {}
   const apiStyle = String(source.apiStyle || defaults.apiStyle).trim()
   const timeoutMs = Number(source.timeoutMs)
+  const hasLegacyDefaultTimeout = timeoutMs === AI_NAMING_LEGACY_DEFAULT_TIMEOUT_MS
   const batchSize = Number(source.batchSize)
   const reasoningEffort = String(source.reasoningEffort ?? defaults.reasoningEffort ?? 'default').trim().toLowerCase()
 
@@ -76,8 +79,8 @@ export function normalizeAiNamingSettings(rawSettings: unknown): AiNamingSetting
     fetchedModels: normalizeAiNamingFetchedModels(source.fetchedModels),
     reasoningCapabilities: normalizeModelReasoningCapabilityMap(source.reasoningCapabilities),
     apiStyle: apiStyle === 'chat_completions' ? 'chat_completions' : 'responses',
-    timeoutMs: Number.isFinite(timeoutMs)
-      ? Math.max(5000, Math.min(timeoutMs, 120000))
+    timeoutMs: Number.isFinite(timeoutMs) && !hasLegacyDefaultTimeout
+      ? Math.max(5000, Math.min(timeoutMs, AI_NAMING_MAX_TIMEOUT_MS))
       : defaults.timeoutMs,
     batchSize: Number.isFinite(batchSize)
       ? Math.max(1, Math.min(Math.round(batchSize), AI_NAMING_MAX_BATCH_SIZE))

@@ -3,8 +3,38 @@ import {
   normalizeAiNamingSettings,
   updateAiNamingSettingsField
 } from './ai-settings.js'
+import {
+  AI_NAMING_CONTENT_FETCH_TIMEOUT_MS,
+  AI_NAMING_DEFAULT_TIMEOUT_MS
+} from '../shared-options/constants.js'
 
 function run(): void {
+  assert.equal(
+    AI_NAMING_DEFAULT_TIMEOUT_MS,
+    120000,
+    'AI requests should have enough time for slower reasoning models and compatibility retries'
+  )
+  assert.equal(
+    AI_NAMING_CONTENT_FETCH_TIMEOUT_MS,
+    30000,
+    'page extraction should keep an independent bounded timeout'
+  )
+  assert.equal(
+    normalizeAiNamingSettings(undefined).timeoutMs,
+    120000,
+    'fresh settings should use the two-minute AI request budget'
+  )
+  assert.equal(
+    normalizeAiNamingSettings({ timeoutMs: 30000 }).timeoutMs,
+    120000,
+    'the previous persisted default must migrate instead of keeping users on 30 seconds'
+  )
+  assert.equal(
+    normalizeAiNamingSettings({ timeoutMs: 45000 }).timeoutMs,
+    45000,
+    'non-legacy explicit timeout choices must be preserved'
+  )
+
   const current = normalizeAiNamingSettings({
     apiKey: 'sk-current',
     baseUrl: 'https://api.openai.com/v1',

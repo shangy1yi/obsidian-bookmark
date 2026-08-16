@@ -320,6 +320,10 @@ const fetchText = readFunction(
   'fetchAutoTextWithTimeout',
   'readAutoResponseTextWithLimit'
 )
+const pageContextBuilder = readFunction(
+  'buildAutoPageContext',
+  'buildAutoPageContentFromHtml'
+)
 const readText = readFunction(
   'readAutoResponseTextWithLimit',
   'isAutoAbortError'
@@ -338,6 +342,16 @@ assert.doesNotMatch(
   runAnalysis,
   /fetchWithAutoTimeout/,
   'auto-analysis must not use the old headers-only timeout helper'
+)
+assert.match(
+  pageContextBuilder,
+  /Math\.min\(settings\.timeoutMs, AI_NAMING_CONTENT_FETCH_TIMEOUT_MS\)/,
+  'auto-analysis page extraction must keep its shorter content-fetch timeout'
+)
+assert.match(
+  source,
+  /requestSmartClassification[\s\S]*requestStructuredAiOutput[\s\S]*timeoutMs: settings\.timeoutMs|requestAutoClassification[\s\S]*requestStructuredAiOutput[\s\S]*timeoutMs: settings\.timeoutMs/,
+  'auto-analysis model requests must retain the full configured AI timeout'
 )
 
 console.log('Service worker auto-analysis boundary contract tests passed.')

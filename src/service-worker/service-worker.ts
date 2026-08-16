@@ -59,6 +59,7 @@ import {
   type AiNamingSettings
 } from '../options/sections/ai-settings.js'
 import {
+  AI_NAMING_CONTENT_FETCH_TIMEOUT_MS,
   AI_NAMING_DEFAULT_TIMEOUT_MS,
   AI_NAMING_JINA_READER_ORIGIN
 } from '../options/shared-options/constants.js'
@@ -2402,7 +2403,7 @@ async function buildAutoPageContext(
   bookmark: BookmarkRecord,
   settings: AiNamingSettings
 ): Promise<PageContentContext> {
-  const timeoutMs = settings.timeoutMs
+  const timeoutMs = Math.min(settings.timeoutMs, AI_NAMING_CONTENT_FETCH_TIMEOUT_MS)
   let context: PageContentContext
   const originPattern = getDirectPageFetchOriginPattern(bookmark.url)
   const canFetchDirectly = originPattern ? await containsHostPermission(originPattern) : false

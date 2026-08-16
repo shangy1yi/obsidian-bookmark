@@ -60,6 +60,10 @@ const responseReader = getSection(
   'async function fetchTextWithRequestTimeout(',
   'function throwIfAborted('
 )
+const preparedItem = getSection(
+  'async function buildAiNamingPreparedItem(',
+  'async function saveContentSnapshotsForAiPreparedItems('
+)
 const mutationGuard = getSection(
   'async function requireCurrentAiNamingBookmark(',
   'function validateAiNamingSettings('
@@ -216,6 +220,16 @@ assert.match(
   responseReader,
   /content-length[\s\S]*?getReader\(\)[\s\S]*?bytesRead > normalizedMaxBytes/,
   'auxiliary AI and page responses must enforce declared and streamed body limits'
+)
+assert.match(
+  preparedItem,
+  /Math\.min\([\s\S]*AI_NAMING_CONTENT_FETCH_TIMEOUT_MS[\s\S]*getAiMetadataForBookmark\(bookmark, contentTimeoutMs/,
+  'page preparation must keep a bounded content-fetch timeout independent from the model budget'
+)
+assert.match(
+  batchRequest,
+  /timeoutMs: settings\.timeoutMs/,
+  'structured model generation must retain the full configured AI request budget'
 )
 assert.match(
   mutationGuard,

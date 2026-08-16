@@ -84,10 +84,10 @@ function run(): void {
     popupPlanRequestIndex
   )
   assert(
-    popupPlanRequestIndex >= 0 &&
+      popupPlanRequestIndex >= 0 &&
       popupPlanPostRequestGuardIndex > popupPlanRequestIndex &&
       popupPlanPostRequestGuardIndex < popupPlanCacheWriteIndex &&
-      popupNaturalSearchPlanResolver.lastIndexOf('isAbortError(error)', popupPlanErrorWriteIndex) > popupPlanRequestIndex,
+      popupNaturalSearchPlanResolver.lastIndexOf('options.signal?.aborted', popupPlanErrorWriteIndex) > popupPlanRequestIndex,
     'stale popup AI plans must be rejected before cache or error state can be committed'
   )
   assert(
@@ -98,9 +98,10 @@ function run(): void {
     'popup results from a superseded reasoning-settings request must not be cached or rendered'
   )
   assert(
-    /function isAbortError\(error\)[\s\S]*?error\.name === 'AbortError'[\s\S]*?error\.kind === 'abort'/.test(popupController) &&
-      /function isNaturalSearchAbortError\(error: unknown\)[\s\S]*?\.name === 'AbortError'[\s\S]*?\.kind === 'abort'/.test(naturalSearchAi),
-    'natural-search cancellation must recognize both DOM AbortError and AiRuntimeError(kind=abort)'
+    popupNaturalSearchRunner.includes('controller.signal.aborted') &&
+      !popupController.includes('function isAbortError(error)') &&
+      !naturalSearchAi.includes('function isNaturalSearchAbortError(error: unknown)'),
+    'natural-search cancellation must use its own signal so runtime timeouts remain visible'
   )
   assert(pinyinSearch.includes('Math.max(8, options.batchSize ?? 250)'), 'cooperative pinyin enrichment must honor popup-sized batches below 50 items')
   assert(!popupContent.includes('[will-change:opacity]'), 'initial content layers must not keep permanent compositor hints')

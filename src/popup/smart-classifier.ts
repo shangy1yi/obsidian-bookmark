@@ -9,8 +9,9 @@ import {
 } from '../shared/ai-runtime.js'
 import { normalizeBookmarkTags } from '../shared/bookmark-tags.js'
 import { extractDomain, normalizeText } from '../shared/text.js'
+import { AI_NAMING_CONTENT_FETCH_TIMEOUT_MS } from '../options/shared-options/constants.js'
 
-export const POPUP_SMART_DEFAULT_TIMEOUT_MS = 30000
+export const POPUP_SMART_DEFAULT_TIMEOUT_MS = AI_NAMING_CONTENT_FETCH_TIMEOUT_MS
 export const POPUP_JINA_READER_ORIGIN = 'https://r.jina.ai/*'
 
 export interface PopupSmartFolderLike {
@@ -150,19 +151,24 @@ export async function buildCurrentPageContext({
   currentUrl,
   currentTitle,
   settings,
-  onProgress
+  onProgress,
+  signal
 }: {
   currentUrl: string
   currentTitle: string
   settings: PopupSmartSettings
   onProgress?: (checkpoint: number) => void
+  signal?: AbortSignal | null
 }) {
+  throwIfSmartAborted(signal)
   const contentExtraction = await loadContentExtractionModule()
+  throwIfSmartAborted(signal)
   reportSmartProgress(onProgress, 0.08)
-  const timeoutMs = settings.timeoutMs
+  const timeoutMs = Math.min(settings.timeoutMs, POPUP_SMART_DEFAULT_TIMEOUT_MS)
   let context = null
   const originPattern = contentExtraction.getDirectPageFetchOriginPattern(currentUrl)
   const canFetchDirectly = originPattern ? Boolean(await hasOptionalOriginPermission(originPattern)) : false
+  throwIfSmartAborted(signal)
   const directFetchDecision = contentExtraction.decideDirectPageFetch(currentUrl, canFetchDirectly)
   reportSmartProgress(onProgress, 0.18)
 
@@ -177,19 +183,22 @@ export async function buildCurrentPageContext({
   } else {
     try {
       reportSmartProgress(onProgress, 0.24)
-      const response = await fetchWithSmartTimeout(currentUrl, {
+      const { response, text: html } = await fetchSmartTextWithTimeout(currentUrl, {
         method: 'GET',
         cache: 'no-store',
         credentials: 'omit',
         redirect: 'follow',
-        referrerPolicy: 'no-referrer'
+        referrerPolicy: 'no-referrer',
+        signal
       }, timeoutMs)
       reportSmartProgress(onProgress, 0.4)
+      if (!response.ok) {
+        throw new Error(`网页返回 HTTP ${response.status}。`)
+      }
       const finalUrl = String(response.url || currentUrl || '')
       const contentType = String(response.headers.get('content-type') || '').toLowerCase()
 
       if (contentType.includes('text/html')) {
-        const html = await response.text()
         reportSmartProgress(onProgress, 0.54)
         context = contentExtraction.extractPageContentFromHtml(html, {
           url: finalUrl,
@@ -205,6 +214,7 @@ export async function buildCurrentPageContext({
         reportSmartProgress(onProgress, 0.64)
       }
     } catch (error) {
+      throwIfSmartAborted(signal)
       context = contentExtraction.appendPageContentWarnings(
         contentExtraction.buildFallbackPageContentFromUrl(currentUrl, {
           currentTitle,
@@ -217,7 +227,9 @@ export async function buildCurrentPageContext({
   }
 
   if (settings.allowRemoteParsing) {
+    throwIfSmartAborted(signal)
     const canUseRemoteParser = await hasOptionalOriginPermission(POPUP_JINA_READER_ORIGIN)
+    throwIfSmartAborted(signal)
     reportSmartProgress(onProgress, 0.72)
     if (!canUseRemoteParser) {
       const normalizedContext = contentExtraction.normalizePageContentContext({
@@ -238,13 +250,15 @@ export async function buildCurrentPageContext({
         timeoutMs,
         fallbackContext: context,
         currentTitle,
-        contentExtraction
+        contentExtraction,
+        signal
       })
       reportSmartProgress(onProgress, 0.94)
       const combinedContext = contentExtraction.combinePageContentContexts(context, remoteContext)
       reportSmartProgress(onProgress, 1)
       return combinedContext
     } catch (error) {
+      throwIfSmartAborted(signal)
       const normalizedContext = contentExtraction.normalizePageContentContext({
         ...context,
         warnings: [
@@ -266,20 +280,23 @@ async function fetchRemoteCurrentPageContext({
   timeoutMs,
   fallbackContext,
   currentTitle,
-  contentExtraction
+  contentExtraction,
+  signal
 }: {
   url: string
   timeoutMs: number
   fallbackContext: { finalUrl?: string; title?: string } | null
   currentTitle: string
   contentExtraction: typeof import('../options/sections/content-extraction.js')
+  signal?: AbortSignal | null
 }) {
+  throwIfSmartAborted(signal)
   const readerUrl = contentExtraction.buildJinaReaderUrl(url)
   if (!readerUrl) {
     throw new Error('远程解析 URL 无效。')
   }
 
-  const response = await fetchWithSmartTimeout(readerUrl, {
+  const { response, text } = await fetchSmartTextWithTimeout(readerUrl, {
     method: 'GET',
     cache: 'no-store',
     credentials: 'omit',
@@ -287,14 +304,14 @@ async function fetchRemoteCurrentPageContext({
     referrerPolicy: 'no-referrer',
     headers: {
       Accept: 'text/plain, text/markdown;q=0.9, */*;q=0.1'
-    }
+    },
+    signal
   }, timeoutMs)
 
   if (!response.ok) {
     throw new Error(`Jina Reader 返回 HTTP ${response.status}。`)
   }
 
-  const text = await response.text()
   return contentExtraction.buildRemotePageContentFromText(text, {
     url: fallbackContext?.finalUrl || url,
     currentTitle: fallbackContext?.title || currentTitle
@@ -307,7 +324,8 @@ export async function requestSmartClassification({
   currentUrl,
   currentTitle,
   allFolders,
-  onProgress
+  onProgress,
+  signal
 }: {
   settings: PopupSmartSettings
   pageContext: unknown
@@ -315,8 +333,11 @@ export async function requestSmartClassification({
   currentTitle: string
   allFolders: PopupSmartFolderLike[]
   onProgress?: (checkpoint: number) => void
+  signal?: AbortSignal | null
 }): Promise<PopupSmartAiResult> {
+  throwIfSmartAborted(signal)
   const contentExtraction = await loadContentExtractionModule()
+  throwIfSmartAborted(signal)
   const folderCandidates = buildAiFolderCandidates(allFolders)
   const prompt = buildSmartAiPrompt({
     pageContext,
@@ -331,6 +352,7 @@ export async function requestSmartClassification({
     schemaName: 'popup_smart_classification',
     systemPrompt: prompt.systemPrompt,
     userPrompt: prompt.userPrompt,
+    signal,
     timeoutMs: settings.timeoutMs,
     validate: (payload) => validateSmartFolderIds(payload, folderCandidates)
   })
@@ -527,11 +549,11 @@ async function hasOptionalOriginPermission(origin: string): Promise<boolean> {
   }
 }
 
-function fetchWithSmartTimeout(
+async function fetchSmartTextWithTimeout(
   url: string,
   options: RequestInit & { signal?: AbortSignal | null } = {},
   timeoutMs = POPUP_SMART_DEFAULT_TIMEOUT_MS
-): Promise<Response> {
+): Promise<{ response: Response; text: string }> {
   const controller = new AbortController()
   const externalSignal = options.signal
   const abortCurrentFetch = () => {
@@ -548,13 +570,26 @@ function fetchWithSmartTimeout(
     controller.abort()
   }, Math.max(1000, Number(timeoutMs) || POPUP_SMART_DEFAULT_TIMEOUT_MS))
 
-  return fetch(url, {
-    ...options,
-    signal: controller.signal
-  }).finally(() => {
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    })
+    if (!response.ok) {
+      return { response, text: '' }
+    }
+    const text = await response.text()
+    return { response, text }
+  } finally {
     clearTimeout(timeoutId)
     externalSignal?.removeEventListener('abort', abortCurrentFetch)
-  })
+  }
+}
+
+function throwIfSmartAborted(signal?: AbortSignal | null): void {
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted.', 'AbortError')
+  }
 }
 
 function getOriginPermissionPattern(url: string): string {

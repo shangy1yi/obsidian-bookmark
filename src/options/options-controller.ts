@@ -147,6 +147,7 @@ import {
 import {
   NAVIGATION_TIMEOUT_MS,
   NAVIGATION_RETRY_TIMEOUT_MS,
+  AI_NAMING_CONTENT_FETCH_TIMEOUT_MS,
   AI_NAMING_DEFAULT_MODEL,
   AI_NAMING_DEFAULT_TIMEOUT_MS,
   AI_NAMING_MAX_TEXT_LENGTH,
@@ -7576,7 +7577,11 @@ async function buildAiNamingPreparedItem(
   } = {}
 ) {
   throwIfAborted(options.signal)
-  const metadata = await getAiMetadataForBookmark(bookmark, timeoutMs, options)
+  const contentTimeoutMs = Math.min(
+    Math.max(1000, Number(timeoutMs) || AI_NAMING_CONTENT_FETCH_TIMEOUT_MS),
+    AI_NAMING_CONTENT_FETCH_TIMEOUT_MS
+  )
+  const metadata = await getAiMetadataForBookmark(bookmark, contentTimeoutMs, options)
   throwIfAborted(options.signal)
   const pageContext = buildPageContextForAi(metadata)
   const folderCandidates = buildAiFolderCandidates(bookmark, options.folders)
