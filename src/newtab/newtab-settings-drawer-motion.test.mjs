@@ -16,6 +16,7 @@ const optionsBordersOnly = process.argv.includes('--options-borders-only')
 const optionsRefreshOnly = process.argv.includes('--options-refresh-only')
 const optionsScopePickerOnly = process.argv.includes('--options-scope-picker-only')
 const optionsReasoningOnly = process.argv.includes('--options-reasoning-only')
+const optionsShellOnly = process.argv.includes('--options-shell-only')
 const overlayMotionOnly = process.argv.includes('--overlay-motion-only')
 const popupReorderOnly = process.argv.includes('--popup-reorder-only')
 const collapsibleMotionOnly = process.argv.includes('--collapsible-motion-only')
@@ -1226,7 +1227,130 @@ async function verifyPopupBookmarkReorder(page, seeded, context) {
   )
 }
 
+async function verifyOptionsChrome(page, extensionId) {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto(`chrome-extension://${extensionId}/src/options/options.html#general`, { waitUntil: 'domcontentloaded' })
+  await page.locator('#general').waitFor({ state: 'visible' })
+  await page.waitForFunction(() => document.querySelector('.options-sidebar:not(.options-mobile-sidebar) > .options-nav-active-indicator')?.dataset.ready === 'true')
+
+  assert.equal(
+    await page.locator('#options-mobile-nav-trigger').isVisible(),
+    false,
+    'Desktop Options should keep the mobile navigation trigger out of layout'
+  )
+
+  const desktopIndicatorGeometry = await page.locator('aside[aria-label="设置导航"]').evaluate((sidebar) => {
+    const active = sidebar.querySelector('[aria-current="page"][data-options-section]')?.getBoundingClientRect()
+    const indicator = sidebar.querySelector(':scope > .options-nav-active-indicator')?.getBoundingClientRect()
+    return active && indicator
+      ? {
+          active: { x: active.x, y: active.y, width: active.width, height: active.height },
+          indicator: { x: indicator.x, y: indicator.y, width: indicator.width, height: indicator.height }
+        }
+      : null
+  })
+  assert.ok(desktopIndicatorGeometry, 'Desktop Options navigation should expose an active indicator')
+  for (const key of ['x', 'y', 'width', 'height']) {
+    assert.ok(
+      Math.abs(desktopIndicatorGeometry.active[key] - desktopIndicatorGeometry.indicator[key]) <= 1,
+      `Desktop active indicator should match its navigation item: ${JSON.stringify(desktopIndicatorGeometry)}`
+    )
+  }
+  await captureVisual(page, 'options-shell-desktop')
+
+  await page.locator('aside[aria-label="设置导航"] a[data-options-section="backup"]').click()
+  await page.locator('#backup-title').waitFor({ state: 'visible' })
+  await page.waitForFunction(() => {
+    const sidebar = document.querySelector('aside[aria-label="设置导航"]')
+    const active = sidebar?.querySelector('[aria-current="page"]')?.getBoundingClientRect()
+    const indicator = sidebar?.querySelector(':scope > .options-nav-active-indicator')?.getBoundingClientRect()
+    return active && indicator && Math.abs(active.y - indicator.y) <= 1
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`chrome-extension://${extensionId}/src/options/options.html#general`, { waitUntil: 'domcontentloaded' })
+  await page.locator('#general').waitFor({ state: 'visible' })
+  const mobileTrigger = page.locator('#options-mobile-nav-trigger')
+  await mobileTrigger.waitFor({ state: 'visible' })
+  assert.equal(
+    await page.locator('aside[aria-label="设置导航"]').isVisible(),
+    false,
+    'Narrow Options should replace the long inline navigation with a drawer trigger'
+  )
+  const mobileOverflow = await page.evaluate(() => ({
+    documentWidth: document.documentElement.scrollWidth,
+    viewportWidth: innerWidth
+  }))
+  assert.ok(
+    mobileOverflow.documentWidth <= mobileOverflow.viewportWidth,
+    `Narrow Options should not overflow horizontally: ${JSON.stringify(mobileOverflow)}`
+  )
+  await captureVisual(page, 'options-shell-mobile')
+
+  await mobileTrigger.click()
+  const mobileNavigation = page.locator('#options-mobile-navigation')
+  await page.waitForFunction(() => document.getElementById('options-mobile-navigation')?.getAttribute('aria-hidden') === 'false')
+  const [mobilePanelBox, mobileCloseBox] = await Promise.all([
+    page.locator('.options-mobile-nav-panel').boundingBox(),
+    page.getByRole('button', { name: '关闭设置导航' }).boundingBox()
+  ])
+  assert.ok(mobilePanelBox && mobileCloseBox, 'Mobile Options drawer and close control should be measurable')
+  assert.ok(
+    mobilePanelBox.width <= 340 && mobilePanelBox.width <= 390,
+    `Mobile Options drawer should stay within the viewport: ${JSON.stringify(mobilePanelBox)}`
+  )
+  assert.ok(
+    mobileCloseBox.width >= 40 && mobileCloseBox.height >= 40,
+    `Mobile Options close control should preserve a 40px target: ${JSON.stringify(mobileCloseBox)}`
+  )
+  await page.waitForFunction(() => document.querySelector('.options-mobile-sidebar > .options-nav-active-indicator')?.dataset.ready === 'true')
+  await captureVisual(page, 'options-mobile-navigation')
+
+  await page.locator('aside[aria-label="移动端设置导航"] a[data-options-section="recycle"]').click()
+  await page.locator('#recycle-title').waitFor({ state: 'visible' })
+  await page.waitForFunction(() => document.getElementById('options-mobile-navigation')?.getAttribute('aria-hidden') === 'true')
+  assert.equal(await mobileNavigation.getAttribute('aria-hidden'), 'true', 'Choosing a mobile destination should close the drawer')
+
+  await mobileTrigger.click()
+  await page.waitForFunction(() => document.getElementById('options-mobile-navigation')?.getAttribute('aria-hidden') === 'false')
+  await page.keyboard.press('Escape')
+  await page.waitForFunction(() => document.getElementById('options-mobile-navigation')?.getAttribute('aria-hidden') === 'true')
+  await waitForFrames(page, 12)
+  assert.equal(
+    await mobileTrigger.evaluate((element) => document.activeElement === element),
+    true,
+    'Closing the mobile Options drawer should return focus to its trigger'
+  )
+
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.goto(`chrome-extension://${extensionId}/src/options/options.html#general`, { waitUntil: 'domcontentloaded' })
+  const checkedSwitch = page.getByRole('switch', { name: '自动移动到推荐文件夹' })
+  await checkedSwitch.waitFor({ state: 'visible' })
+  const reducedSwitchGeometry = await checkedSwitch.evaluate((control) => {
+    const thumb = control.querySelector(':scope > span')?.getBoundingClientRect()
+    const root = control.getBoundingClientRect()
+    const indicator = document.querySelector('.options-sidebar:not(.options-mobile-sidebar) > .options-nav-active-indicator')
+    return {
+      checked: control.getAttribute('data-checked') !== null,
+      controlCenter: root.left + root.width / 2,
+      thumbCenter: thumb ? thumb.left + thumb.width / 2 : 0,
+      indicatorTransition: indicator ? getComputedStyle(indicator).transitionProperty : ''
+    }
+  })
+  assert.ok(
+    reducedSwitchGeometry.checked && reducedSwitchGeometry.thumbCenter > reducedSwitchGeometry.controlCenter,
+    `Reduced motion must preserve the checked switch position: ${JSON.stringify(reducedSwitchGeometry)}`
+  )
+  assert.ok(
+    !reducedSwitchGeometry.indicatorTransition.split(',').map((value) => value.trim()).includes('transform'),
+    `Reduced motion should move navigation selection immediately: ${JSON.stringify(reducedSwitchGeometry)}`
+  )
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
+}
+
 async function verifyOptions(page, extensionId) {
+  await verifyOptionsChrome(page, extensionId)
   await page.setViewportSize({ width: 1280, height: 800 })
   await page.goto(`chrome-extension://${extensionId}/src/options/options.html`, { waitUntil: 'domcontentloaded' })
   await page.locator('#general').waitFor({ state: 'attached' })
@@ -2448,6 +2572,9 @@ try {
   } else if (optionsReasoningOnly) {
     await verifyOptions(page, extensionId)
     console.log('Options reasoning selector test passed.')
+  } else if (optionsShellOnly) {
+    await verifyOptionsChrome(page, extensionId)
+    console.log('Options shell interaction tests passed.')
   } else if (overlayMotionOnly) {
     await verifySharedOverlayMotion(page, extensionId)
     console.log('Shared overlay motion tests passed.')

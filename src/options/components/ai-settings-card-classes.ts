@@ -5,10 +5,10 @@ import {
 } from '../../ui/switch-classes'
 
 export const AI_SETTINGS_CARD_CLASS =
-  'mt-5 overflow-hidden rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-0 text-ds-text-primary shadow-none'
+  'options-interactive-surface mt-5 overflow-hidden rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-0 text-ds-text-primary shadow-none'
 
 export const AI_SETTINGS_NARROW_CARD_CLASS =
-  'mt-5 overflow-hidden rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-0 text-ds-text-primary shadow-none'
+  'options-interactive-surface mt-5 overflow-hidden rounded-ds-md border border-ds-border-subtle bg-ds-surface-1 p-0 text-ds-text-primary shadow-none'
 
 export const AI_SETTINGS_HEADER_CLASS =
   'mb-0 flex min-w-0 items-start justify-between gap-3 border-b border-ds-border-subtle p-[14px_16px] max-[760px]:flex-col'
@@ -33,7 +33,7 @@ export const AI_SETTINGS_STATUS_TONE_CLASS = {
 } as const
 
 export const AI_SETTINGS_ROW_CLASS =
-  'grid min-h-[54px] grid-cols-[minmax(0,1fr)_auto] items-center gap-[18px] px-4 py-3 max-[760px]:grid-cols-1 max-[760px]:items-start'
+  'grid min-h-[54px] grid-cols-[minmax(0,1fr)_auto] items-center gap-[18px] px-4 py-3 max-[420px]:gap-3 max-[420px]:px-3.5'
 
 export const AI_SETTINGS_COPY_CLASS = 'min-w-0'
 

@@ -1,21 +1,24 @@
 import {
   SMART_LOADING_PROGRESS_TARGETS,
-  SMART_LOADING_PROGRESS_TICK_MS,
   SMART_LOADING_STAGE_STARTS,
-  getNextSmartProgress,
   getSmartCheckpointProgress,
   getSmartDisplayProgress,
+  getSmartEasedProgress,
+  getSmartFinishProgress,
   getSmartLoadingOrbState,
   getSmartProgressTarget,
+  getSmartStageCeiling,
   normalizeSmartLoadingStep
 } from './smart-loading-progress.js'
 
 function run(): void {
   testDisplayProgressHonorsStageStart()
-  testProgressTargetsSplitTheTrackIntoEqualThirds()
+  testStagesAreWeightedByRealDuration()
   testCheckpointsMapWithinTheActiveStage()
-  testLoadingProgressKeepsCreepingWithinTheStage()
+  testAiStageMovesVisiblyInItsFirstSeconds()
+  testEasingNeverLeavesTheActiveStage()
   testAiStageKeepsMovingForTheMaximumRequestTimeout()
+  testFinishRampClosesTheLastGap()
   testLoadingStagesUseDistinctAiVisuals()
 }
 
@@ -32,13 +35,18 @@ function testDisplayProgressHonorsStageStart(): void {
   )
 }
 
-function testProgressTargetsSplitTheTrackIntoEqualThirds(): void {
-  assertClose(SMART_LOADING_STAGE_STARTS[1], 100 / 3, 'step 2 start')
-  assertClose(SMART_LOADING_STAGE_STARTS[2], 200 / 3, 'step 3 start')
-  assertClose(getSmartProgressTarget(1), SMART_LOADING_PROGRESS_TARGETS[0], 'step 1 target')
-  assertClose(getSmartProgressTarget(2), SMART_LOADING_PROGRESS_TARGETS[1], 'step 2 target')
-  assertClose(getSmartProgressTarget(3), SMART_LOADING_PROGRESS_TARGETS[2], 'step 3 target')
+function testStagesAreWeightedByRealDuration(): void {
+  const spans = SMART_LOADING_PROGRESS_TARGETS.map(
+    (target, index) => target - SMART_LOADING_STAGE_STARTS[index]
+  )
+  assert(
+    spans[1] > spans[0] + spans[2],
+    'the AI request is the slowest stage and must own more than half the track'
+  )
+  assert(spans[0] > spans[2], 'fetching a page takes longer than matching folders locally')
+  assertClose(SMART_LOADING_PROGRESS_TARGETS[2], 100, 'the last stage must end the track')
   assert(normalizeSmartLoadingStep(99) === 3, 'step should clamp to the last stage')
+  assertClose(getSmartProgressTarget(2), SMART_LOADING_PROGRESS_TARGETS[1], 'step 2 target')
 }
 
 function testCheckpointsMapWithinTheActiveStage(): void {
@@ -48,26 +56,51 @@ function testCheckpointsMapWithinTheActiveStage(): void {
     'step 2 should begin at its real stage boundary'
   )
   assertClose(getSmartCheckpointProgress(2, 1), SMART_LOADING_PROGRESS_TARGETS[1], 'step 2 target')
-  assertClose(getSmartCheckpointProgress(2, 0.5), 50, 'step 2 midpoint')
+  assertClose(
+    getSmartCheckpointProgress(2, 0.5),
+    (SMART_LOADING_STAGE_STARTS[1] + SMART_LOADING_PROGRESS_TARGETS[1]) / 2,
+    'step 2 midpoint'
+  )
 }
 
-function testLoadingProgressKeepsCreepingWithinTheStage(): void {
-  const currentProgress = 40
-  const nextProgress = getNextSmartProgress(currentProgress, 2)
-  assert(nextProgress > currentProgress, 'loading progress should keep moving between checkpoints')
-  assert(nextProgress < SMART_LOADING_PROGRESS_TARGETS[1], 'loading progress must stay inside the active stage')
+// 回归护栏：AI 阶段以前只靠固定步长爬行，前 5 秒几乎不动，观感就是"卡住了"。
+function testAiStageMovesVisiblyInItsFirstSeconds(): void {
+  const base = SMART_LOADING_STAGE_STARTS[1]
+  const afterOneSecond = getSmartEasedProgress(2, base, 1000)
+  const afterFiveSeconds = getSmartEasedProgress(2, base, 5000)
+  assert(afterOneSecond - base >= 4, 'the AI stage must gain real ground in its first second')
+  assert(afterFiveSeconds - base >= 20, 'the AI stage must be well underway after five seconds')
+  assert(afterFiveSeconds > afterOneSecond, 'eased progress must be monotonic in elapsed time')
+}
+
+function testEasingNeverLeavesTheActiveStage(): void {
+  for (let step = 1; step <= 3; step += 1) {
+    const ceiling = getSmartStageCeiling(step)
+    const target = getSmartProgressTarget(step)
+    assert(ceiling < target, `step ${step} must keep headroom for the real completion`)
+    assert(
+      getSmartEasedProgress(step, SMART_LOADING_STAGE_STARTS[step - 1], 600000) <= ceiling + 0.001,
+      `step ${step} easing must stay under its ceiling`
+    )
+  }
 }
 
 function testAiStageKeepsMovingForTheMaximumRequestTimeout(): void {
-  let progress = getSmartCheckpointProgress(2, 0.36)
-  const ticksAcrossTwoMinutes = Math.floor(120000 / SMART_LOADING_PROGRESS_TICK_MS)
-  for (let tick = 0; tick < ticksAcrossTwoMinutes; tick += 1) {
-    progress = getNextSmartProgress(progress, 2)
-  }
+  const base = getSmartCheckpointProgress(2, 0.36)
+  const atTwoMinutes = getSmartEasedProgress(2, base, 120000)
+  const justAfter = getSmartEasedProgress(2, base, 121000)
+  assert(justAfter > atTwoMinutes, 'AI progress should still be moving after a two-minute request')
+  assert(justAfter < SMART_LOADING_PROGRESS_TARGETS[1], 'AI progress should not cross into the next stage')
+}
 
-  const nextProgress = getNextSmartProgress(progress, 2)
-  assert(nextProgress > progress, 'AI progress should still be moving after a two-minute request')
-  assert(nextProgress < SMART_LOADING_PROGRESS_TARGETS[1], 'AI progress should not cross into the next stage')
+// 回归护栏：结果就绪时以前直接把百分比写成 100，肉眼看到的是一次瞬移。
+function testFinishRampClosesTheLastGap(): void {
+  const from = 84
+  assertClose(getSmartFinishProgress(from, 0), from, 'the finish ramp starts where the bar already is')
+  assertClose(getSmartFinishProgress(from, 1), 100, 'the finish ramp must reach exactly 100')
+  const midway = getSmartFinishProgress(from, 0.5)
+  assert(midway > from && midway < 100, 'the finish ramp must pass through the gap instead of jumping it')
+  assert(midway > (from + 100) / 2, 'the finish ramp should ease out, front-loading the remaining gap')
 }
 
 function testLoadingStagesUseDistinctAiVisuals(): void {
