@@ -161,12 +161,16 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: 'dist',
       emptyOutDir: true,
+      modulePreload: false,
       sourcemap: debugSourcemap,
       rollupOptions: {
         output: {
           manualChunks(id) {
-            if (id.includes('pinyin-pro')) {
-              return 'vendor-pinyin'
+            if (id.includes('/src/shared/search/pinyin.ts')) {
+              return 'shared-pinyin'
+            }
+            if (id.includes('/src/shared/text.ts')) {
+              return 'shared-text'
             }
             if (id.includes('/src/newtab/content-state.ts')) {
               return 'newtab-content-state'

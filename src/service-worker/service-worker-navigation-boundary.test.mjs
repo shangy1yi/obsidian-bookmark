@@ -214,12 +214,8 @@ assert.ok(
   'the per-tab origin firewall requires declarativeNetRequest permission'
 )
 assert.ok(
-  JSON.parse(manifestSource).permissions.includes('dns'),
-  'pre-connect public-address validation requires the Chrome DNS permission'
-)
-assert.ok(
-  Number(JSON.parse(manifestSource).minimum_chrome_version) >= 149,
-  'the DNS-backed network boundary requires the validated Chrome runtime baseline'
+  !JSON.parse(manifestSource).permissions.includes('dns'),
+  'stable Chrome extensions must omit the dev-channel-only dns permission'
 )
 
 console.log('Service worker navigation boundary contract tests passed.')

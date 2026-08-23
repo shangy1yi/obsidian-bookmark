@@ -107,6 +107,119 @@ body {
   }
 }
 
+/* Switch 拨动的双段过冲。
+   位移只走 translate 属性，不碰 transform——根元素的按压 scale 用的是
+   transform，两者分开才不会互相覆盖。thumb 静态位置由 [data-checked]
+   决定，首帧因此不会播放归位动画；只有 .is-init（首次真正切换后由
+   Switch.tsx 挂上）才允许 keyframes 接管。 */
+.t-toggle-thumb {
+  translate: 0 0;
+  will-change: translate;
+}
+
+.t-toggle[data-checked] .t-toggle-thumb {
+  translate: var(--toggle-travel) 0;
+}
+
+.t-toggle.is-init[data-checked] .t-toggle-thumb {
+  animation: t-toggle-on var(--toggle-dur) var(--toggle-ease) both;
+}
+
+.t-toggle.is-init:not([data-checked]) .t-toggle-thumb {
+  animation: t-toggle-off var(--toggle-dur) var(--toggle-ease) both;
+}
+
+@keyframes t-toggle-on {
+  0%   { translate: 0 0; }
+  55%  { translate: calc(var(--toggle-travel) + var(--toggle-ov1)) 0; }
+  80%  { translate: calc(var(--toggle-travel) - var(--toggle-ov2)) 0; }
+  100% { translate: var(--toggle-travel) 0; }
+}
+
+@keyframes t-toggle-off {
+  0%   { translate: var(--toggle-travel) 0; }
+  55%  { translate: calc(0px - var(--toggle-ov1)) 0; }
+  80%  { translate: var(--toggle-ov2) 0; }
+  100% { translate: 0 0; }
+}
+
+/* 行内状态徽标的出现。这里刻意不是 transitions.dev 的 notification-badge：
+   Badge 是随文排的状态标签，不是挂在触发器上的未读点，没有斜向滑入的锚点
+   可言。它需要的只是「换了一个值」被看见，所以走 scale + fade + 去模糊。 */
+.t-badge-pop {
+  animation: t-badge-pop var(--badge-pop-dur) var(--badge-pop-ease) both;
+}
+
+@keyframes t-badge-pop {
+  from {
+    opacity: 0;
+    transform: scale(var(--badge-pop-scale));
+    filter: blur(var(--badge-pop-blur));
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+    filter: blur(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .t-toggle-thumb {
+    animation: none !important;
+  }
+
+  .t-badge-pop {
+    animation: curator-value-fade var(--duration-micro) linear both;
+  }
+}
+
+/* 列表项退出。用 grid-template-rows 1fr→0fr 收高度，和 .t-acc-panel 同一套
+   路子：它不需要预先知道行有多高，任意内容都能塌。
+   padding 必须落在 inner 上——落在 0fr 的轨道上会留下一条收不掉的高度。 */
+.t-list-exit {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition:
+    grid-template-rows var(--list-exit-dur) var(--list-exit-ease),
+    opacity var(--list-exit-dur) var(--list-exit-ease);
+}
+
+.t-list-exit-inner {
+  min-height: 0;
+  overflow: hidden;
+  padding-bottom: var(--list-exit-gap);
+}
+
+.t-list-exit:last-child > .t-list-exit-inner {
+  padding-bottom: 0;
+}
+
+.t-list-exit[data-exiting="true"] {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.t-list-exit[data-exiting="true"] > .t-list-exit-inner {
+  padding-bottom: 0;
+  transition: padding-bottom var(--list-exit-dur) var(--list-exit-ease);
+}
+
+/* 内容自己再往退出方向让一点，纯高度塌陷读起来像被裁掉而不是离开。 */
+.t-list-exit[data-exiting="true"] > .t-list-exit-inner > * {
+  transform: translate3d(0, calc(0px - var(--list-exit-shift)), 0);
+  transition: transform var(--list-exit-dur) var(--list-exit-ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .t-list-exit,
+  .t-list-exit > .t-list-exit-inner,
+  .t-list-exit > .t-list-exit-inner > * {
+    transition: none !important;
+    transform: none !important;
+  }
+}
+
 @keyframes curator-value-fade {
   from { opacity: 0.72; }
   to { opacity: 1; }

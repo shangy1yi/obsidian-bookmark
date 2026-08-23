@@ -29,6 +29,13 @@ const VISUALLY_HIDDEN_INPUT_STYLE: InputStyle = {
   width: 1
 }
 
+const SWITCH_ROOT_CLASS = 't-toggle relative inline-block h-6 w-11 rounded-full border border-ds-border bg-ds-hover outline-none transition-[background-color,border-color,transform] duration-ds-fast ease-ds-standard data-[checked]:border-ds-border-hover data-[checked]:bg-ds-accent focus-visible:border-ds-focus focus-visible:shadow-ds-focus active:scale-[var(--ds-press-scale)] data-[disabled]:opacity-50 motion-reduce:transition-none motion-reduce:active:scale-100'
+
+/* 位移交给 .t-toggle-thumb 的 translate，这里只留颜色过渡：
+   Tailwind 的 data-[checked]:translate-x-5 会写 transform，和 keyframes
+   的 translate 叠加就会走出双倍行程。 */
+const SWITCH_THUMB_CLASS = 't-toggle-thumb absolute left-0.5 top-0.5 size-5 rounded-full bg-ds-accent-subtle transition-[background-color] duration-ds-fast ease-ds-standard data-[checked]:bg-ds-page motion-reduce:transition-none'
+
 export type SwitchControlProps = Omit<BaseSwitchRootProps, 'className' | 'children' | 'inputRef'> & {
   className?: string
   inputRef?: Ref<HTMLInputElement>
@@ -66,6 +73,20 @@ export function SwitchControl({
 
   const checked = checkedProp ?? checkedState
   const disabled = disabledProp ?? disabledState
+
+  // thumb 的双段过冲只在「值真的变了」之后才允许播放。首帧挂载时
+  // previousChecked 与当前值一致，keyframes 不上场，所以一屏开关不会在
+  // 页面载入时集体弹一次。受控父组件从外部改值也算一次切换。
+  const previousCheckedRef = useRef(Boolean(checkedProp ?? defaultChecked))
+  const [thumbAnimated, setThumbAnimated] = useState(false)
+
+  useLayoutEffect(() => {
+    if (previousCheckedRef.current === Boolean(checked)) {
+      return
+    }
+    previousCheckedRef.current = Boolean(checked)
+    setThumbAnimated(true)
+  }, [checked])
 
   checkedRef.current = Boolean(checked)
   disabledRef.current = Boolean(disabled)
@@ -194,7 +215,8 @@ export function SwitchControl({
         aria-checked={Boolean(checked)}
         aria-disabled={disabled ? true : undefined}
         className={unstyled ? className : cx(
-          'relative inline-block h-6 w-11 rounded-full border border-ds-border bg-ds-hover outline-none transition-[background-color,border-color,transform] duration-ds-fast ease-ds-standard data-[checked]:border-ds-border-hover data-[checked]:bg-ds-accent focus-visible:border-ds-focus focus-visible:shadow-ds-focus active:scale-[var(--ds-press-scale)] data-[disabled]:opacity-50 motion-reduce:transition-none motion-reduce:active:scale-100',
+          SWITCH_ROOT_CLASS,
+          thumbAnimated && 'is-init',
           className
         )}
         data-checked={checked ? '' : undefined}
@@ -221,7 +243,7 @@ export function SwitchControl({
       >
         <span
           className={unstyled ? thumbClassName : cx(
-            'absolute left-0.5 top-0.5 size-5 rounded-full bg-ds-accent-subtle transition-[transform,background-color] duration-ds-fast ease-ds-standard data-[checked]:translate-x-5 data-[checked]:bg-ds-page motion-reduce:transition-none',
+            SWITCH_THUMB_CLASS,
             thumbClassName
           )}
           data-checked={checked ? '' : undefined}
@@ -247,7 +269,8 @@ export function SwitchControl({
     <BaseSwitch.Root
       checked={checked}
       className={unstyled ? className : cx(
-        'relative inline-block h-6 w-11 rounded-full border border-ds-border bg-ds-hover outline-none transition-[background-color,border-color,transform] duration-ds-fast ease-ds-standard data-[checked]:border-ds-border-hover data-[checked]:bg-ds-accent focus-visible:border-ds-focus focus-visible:shadow-ds-focus active:scale-[var(--ds-press-scale)] data-[disabled]:opacity-50 motion-reduce:transition-none motion-reduce:active:scale-100',
+        SWITCH_ROOT_CLASS,
+        thumbAnimated && 'is-init',
         className
       )}
       disabled={disabled}
@@ -258,7 +281,7 @@ export function SwitchControl({
     >
       <BaseSwitch.Thumb
         className={unstyled ? thumbClassName : cx(
-          'absolute left-0.5 top-0.5 size-5 rounded-full bg-ds-accent-subtle transition-[transform,background-color] duration-ds-fast ease-ds-standard data-[checked]:translate-x-5 data-[checked]:bg-ds-page motion-reduce:transition-none',
+          SWITCH_THUMB_CLASS,
           thumbClassName
         )}
       />

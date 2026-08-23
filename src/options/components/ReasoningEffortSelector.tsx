@@ -8,7 +8,7 @@ import {
   useRef,
   useState
 } from 'react'
-import { prefersReducedMotion } from '../../shared/motion'
+import { getMotionDurationMs, getMotionEasing, prefersReducedMotion } from '../../shared/motion'
 import { Popover } from '../../ui/base/Popover'
 import { cx } from '../../ui/base/utils'
 import { OPTIONS_REDUCED_MOTION_SURFACE_CLASS } from './options-motion-classes.js'
@@ -67,7 +67,7 @@ const TRIGGER_CLASS = cx(
 
 const VIEW_TRACK_CLASS = cx(
   'reasoning-selector-view-track grid min-w-0',
-  'transition-[grid-template-rows,opacity,transform] duration-[260ms] ease-[var(--ease-smooth-out)]'
+  'transition-[grid-template-rows,opacity,transform] duration-[var(--acc-collapse)] ease-[var(--ease-smooth-out)]'
 )
 
 const MENU_ROW_CLASS =
@@ -75,7 +75,7 @@ const MENU_ROW_CLASS =
 
 const HEADER_LAYER_CLASS = cx(
   'absolute inset-0 flex items-center opacity-0 translate-y-[3px] pointer-events-none',
-  'transition-[opacity,transform] duration-[200ms] ease-[var(--ease-smooth-out)]',
+  'transition-[opacity,transform] duration-[var(--text-swap-dur)] ease-[var(--ease-smooth-out)]',
   'data-[active=true]:translate-y-0 data-[active=true]:opacity-100 data-[active=true]:pointer-events-auto'
 )
 
@@ -352,7 +352,12 @@ export function ReasoningEffortSelector({
         { opacity: 0, transform: 'translateY(3px)' },
         { opacity: 1, transform: 'translateY(0)' }
       ],
-      { duration: 130, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' }
+      {
+        // 和 newtab-controller 的拖拽落位一样从 token 读，字面量只当 fallback：
+        // 档位标签是原地换值，走 text swap 的时长。
+        duration: getMotionDurationMs('--text-swap-dur', 130),
+        easing: getMotionEasing('--ease-smooth-out', 'cubic-bezier(0.22, 1, 0.36, 1)')
+      }
     )
   }, [safePreviewIndex])
 

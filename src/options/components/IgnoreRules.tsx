@@ -1,5 +1,6 @@
 import { displayUrl } from '../../shared/text.js'
 import { Button } from '../../ui/base/Button'
+import { useListExit } from '../../ui/motion/useListExit'
 import { handleIgnoreRuleAction } from '../options-controller'
 import { useIgnoreRulesState } from './ignore-rules-store.js'
 import { OPTION_REVEAL_ENTER_CLASS } from './option-layout-classes.js'
@@ -40,7 +41,7 @@ const IGNORE_RULE_SUBTITLE_CLASS =
   'mt-2 text-[13px] leading-[1.7] text-ds-text-secondary'
 const IGNORE_RULE_CLEAR_BUTTON_CLASS =
   'justify-center whitespace-nowrap max-[760px]:w-full'
-const IGNORE_RULE_LIST_CLASS = 'mt-4 flex flex-col gap-3'
+const IGNORE_RULE_LIST_CLASS = 'mt-4 flex flex-col [--list-exit-gap:0.75rem]'
 const IGNORE_RULE_EMPTY_CLASS =
   'rounded-ds-sm border border-ds-border-subtle bg-ds-surface-1 px-4 py-[18px] text-[13px] leading-[1.7] text-ds-text-secondary'
 const IGNORE_RULE_CARD_CLASS =
@@ -161,18 +162,24 @@ function IgnoreRuleList({
   kind: IgnoreRuleKind
   rules: IgnoreRuleViewModel[]
 }) {
-  if (!rules.length) {
+  const sortedRules = rules
+    .slice()
+    .sort((left, right) => (Number(right.createdAt) || 0) - (Number(left.createdAt) || 0))
+  const entries = useListExit(sortedRules, (rule) => `${kind}:${getIgnoreRuleId(rule, kind)}`)
+
+  if (!rules.length && !entries.length) {
     return <div className={IGNORE_RULE_EMPTY_CLASS}>当前没有这类忽略规则。</div>
   }
 
   return (
     <>
-      {rules
-        .slice()
-        .sort((left, right) => (Number(right.createdAt) || 0) - (Number(left.createdAt) || 0))
-        .map((rule) => (
-          <IgnoreRuleCard kind={kind} key={`${kind}:${getIgnoreRuleId(rule, kind)}`} rule={rule} />
-        ))}
+      {entries.map((entry) => (
+        <div className="t-list-exit" data-exiting={entry.exiting ? 'true' : 'false'} key={entry.key}>
+          <div className="t-list-exit-inner">
+            <IgnoreRuleCard kind={kind} rule={entry.item} />
+          </div>
+        </div>
+      ))}
     </>
   )
 }

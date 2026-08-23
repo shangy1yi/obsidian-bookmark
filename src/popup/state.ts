@@ -1,6 +1,7 @@
 import type { FolderRecord } from '../shared/types.js'
 import { createMemoryCache, type MemoryCache } from '../shared/cache.js'
 import type { BookmarkTagIndex } from '../shared/bookmark-tags.js'
+import type { PopupContentViewModel } from './components/PopupViewModels.js'
 import type { NaturalSearchPlan } from './natural-search.js'
 import type { PopupSearchIndexSnapshotState } from './search-index.js'
 import type { PopupSearchBookmark, PopupSearchResult } from './search.js'
@@ -104,7 +105,7 @@ export interface PopupState {
   searchHighlightQuery: string
   filteredBookmarksCacheKey: string
   filteredBookmarksCache: PopupSearchBookmark[]
-  contentRenderKey: string
+  contentRenderedViewModel: PopupContentViewModel | null
   hasPresentedContent: boolean
   searchChipsRenderSignature: string
   moveTargetBookmarkId: string | null
@@ -212,7 +213,7 @@ export const state: PopupState = {
   searchHighlightQuery: '',
   filteredBookmarksCacheKey: '',
   filteredBookmarksCache: [],
-  contentRenderKey: '',
+  contentRenderedViewModel: null,
   hasPresentedContent: false,
   searchChipsRenderSignature: '',
   moveTargetBookmarkId: null,

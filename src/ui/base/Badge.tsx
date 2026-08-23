@@ -22,12 +22,18 @@ type BadgeVariantProps = VariantProps<typeof badgeVariants>
 
 export type BadgeTone = NonNullable<BadgeVariantProps['tone']>
 
-export type BadgeProps = HTMLAttributes<HTMLSpanElement> & BadgeVariantProps
+export type BadgeProps = HTMLAttributes<HTMLSpanElement> & BadgeVariantProps & {
+  /**
+   * 让徽标在出现时演一次 scale + fade。徽标内容变化时元素会被 React 复用，
+   * 动画不会自己重播——需要重播就在调用处给出随内容变化的 key。
+   */
+  animate?: boolean
+}
 
-export function Badge({ className, tone = 'neutral', ...props }: BadgeProps) {
+export function Badge({ animate = false, className, tone = 'neutral', ...props }: BadgeProps) {
   return (
     <span
-      className={badgeVariants({ tone, className })}
+      className={badgeVariants({ tone, className: [animate ? 't-badge-pop' : '', className].filter(Boolean).join(' ') || undefined })}
       {...props}
     />
   )

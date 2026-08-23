@@ -33,7 +33,7 @@ export function AiClassificationResult({
           <Icon name="Sparkles" size={16} aria-hidden="true" />
           {typeof title === 'string' ? <strong className="text-sm">{title}</strong> : title}
         </div>
-        {confidence ? <Badge>{confidence}</Badge> : null}
+        {confidence ? <Badge key={String(confidence)} animate>{confidence}</Badge> : null}
       </div>
       {actions}
       {meta}

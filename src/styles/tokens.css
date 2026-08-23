@@ -116,13 +116,37 @@
   --tt-bg: var(--ds-surface-2);
   --tt-fg: var(--ds-text-primary);
 
-  --acc-expand: 320ms;
-  --acc-collapse: 260ms;
+  /* accordion 开合共用一条时长：它读起来是一次可逆的高度位移，不是一对
+     开/关。拆成 320/260 会让同一个面板来回时变速。280ms 取自原先两值之间，
+     保住项目既有的节奏，只把对称补回来。 */
+  --acc-expand: 280ms;
+  --acc-collapse: 280ms;
   --acc-chevron: 300ms;
   --acc-ease: var(--ease-smooth-out);
 
   --resize-dur: 380ms;
   --resize-ease: var(--ease-smooth-out);
+
+  /* 列表项退出：高度塌陷 + 淡出。行距收在 .t-list-exit-inner 的
+     padding 里而不是容器的 gap 上，gap 不会随行收拢，否则删完会留一条空档。 */
+  --list-exit-dur: var(--duration-fast);
+  --list-exit-ease: var(--ease-smooth-out);
+  --list-exit-shift: var(--distance-base);
+  --list-exit-gap: 0px;
+
+  /* Switch 拨动：thumb 走双段过冲（越过终点 → 荡回 → 落定），
+     轨道颜色走自己的时钟，不跟 thumb 抢节奏。 */
+  --toggle-dur: var(--duration-medium);
+  --toggle-travel: 20px;
+  --toggle-ov1: 1px;
+  --toggle-ov2: 0px;
+  --toggle-ease: var(--ease-bounce);
+
+  /* 行内状态徽标出现：scale + fade + 去模糊，只在挂载/换值时演一次。 */
+  --badge-pop-dur: var(--duration-fast);
+  --badge-pop-scale: var(--scale-large);
+  --badge-pop-blur: var(--blur-small);
+  --badge-pop-ease: var(--ease-bounce);
 
   --digit-dur: 130ms;
   --digit-distance: var(--distance-base);
@@ -244,6 +268,14 @@
     --acc-collapse: 1ms;
     --acc-chevron: 1ms;
     --resize-dur: 1ms;
+    --list-exit-dur: 1ms;
+    --list-exit-shift: 0px;
+    --toggle-dur: 1ms;
+    --toggle-ov1: 0px;
+    --toggle-ov2: 0px;
+    --badge-pop-dur: 1ms;
+    --badge-pop-scale: 1;
+    --badge-pop-blur: 0px;
     --digit-dur: 80ms;
     --dropdown-open-dur: 80ms;
     --dropdown-close-dur: 80ms;

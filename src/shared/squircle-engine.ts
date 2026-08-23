@@ -31,6 +31,7 @@ const tracked = new Map<HTMLElement, TrackedEntry>()
 
 let pendingScan: Set<HTMLElement> | null = null
 let scanScheduled = false
+let sweepRequested = false
 
 function parseRadiusPx(raw: string): number | null {
   // 计算样式可能返回 "8px"、"8px 12px"（椭圆角）或百分比；只处理单值 px。
@@ -74,6 +75,66 @@ function cornerOptions(radii: [number, number, number, number]) {
   }
 }
 
+const clipPathCache = new Map<string, string>()
+const CLIP_PATH_CACHE_LIMIT = 512
+
+/**
+ * 同一个列表里的行尺寸和圆角完全一致，虚拟滚动回收时会反复要同一条路径。
+ * 路径只由 (宽, 高, 四角半径) 决定，缓存起来就不必每次重算。
+ */
+function generateClipPathCached(
+  width: number,
+  height: number,
+  radii: [number, number, number, number]
+): string {
+  const key = `${width}|${height}|${radii[0]},${radii[1]},${radii[2]},${radii[3]}`
+  const cached = clipPathCache.get(key)
+  if (cached !== undefined) return cached
+  const clipPath = generateClipPath(width, height, cornerOptions(radii))
+  // 尺寸种类是有限的；真到了上限说明页面在连续缩放，整表丢弃即可。
+  if (clipPathCache.size >= CLIP_PATH_CACHE_LIMIT) clipPathCache.clear()
+  clipPathCache.set(key, clipPath)
+  return clipPath
+}
+
+const pendingClip = new Set<HTMLElement>()
+let clipScheduled = false
+
+/**
+ * resize 驱动的重新裁剪走批处理：逐元素「读样式→读布局→写 clip-path」会让
+ * 每次写入都作废后一个元素的布局信息，虚拟列表滚动时这条交错读写是布局
+ * 抖动的主要来源。这里与 applySquircleClipBeforePaint 采用同一策略——
+ * 先全量测量，再全量写入。
+ */
+function scheduleClip(el: HTMLElement): void {
+  pendingClip.add(el)
+  if (clipScheduled) return
+  clipScheduled = true
+  requestAnimationFrame(flushPendingClip)
+}
+
+function flushPendingClip(): void {
+  clipScheduled = false
+  if (!pendingClip.size) return
+  const batch = [...pendingClip]
+  pendingClip.clear()
+
+  const measured: Array<[HTMLElement, string | null]> = []
+  for (const el of batch) {
+    if (!el.isConnected) continue
+    measured.push([el, measureSquircleClipPath(el)])
+  }
+
+  for (const [el, clipPath] of measured) {
+    if (clipPath === null) {
+      clearClip(el)
+      continue
+    }
+    el.style.clipPath = clipPath
+    if (el.dataset.sq !== 'on') el.dataset.sq = 'on'
+  }
+}
+
 function applyClip(el: HTMLElement): void {
   if (!el.isConnected) return
   const clipPath = measureSquircleClipPath(el)
@@ -97,7 +158,7 @@ function measureSquircleClipPath(el: HTMLElement): string | null {
   if (width < 2 || height < 2) return null
   // 胶囊 / 圆形：圆弧已占满短边，squircle 退化为圆，交给原生渲染。
   if (maxRadius * 2 >= Math.min(width, height) - 0.5) return null
-  return generateClipPath(width, height, cornerOptions(radii))
+  return generateClipPathCached(width, height, radii)
 }
 
 let eagerBatch: HTMLElement[] | null = null
@@ -160,7 +221,7 @@ function consider(el: HTMLElement): void {
   if (declaresStatefulOuterShadow(className)) return
   if (hasOuterBoxShadow(style)) return
   if (declaresFocusRingShadow(className)) el.dataset.sqFocus = 'ring'
-  const unobserve = observeResize(el, () => applyClip(el))
+  const unobserve = observeResize(el, () => scheduleClip(el))
   tracked.set(el, { unobserve })
 }
 
@@ -222,8 +283,13 @@ function flushPendingScan(): void {
       scanSubtree(el)
     }
   }
-  for (const el of tracked.keys()) {
-    if (!el.isConnected) untrack(el)
+  // 只有真的发生过移除才需要清扫。滚动时几乎每帧都有新增，
+  // 无条件全量遍历 tracked 会把这份代价摊到每一帧上。
+  if (sweepRequested) {
+    sweepRequested = false
+    for (const el of tracked.keys()) {
+      if (!el.isConnected) untrack(el)
+    }
   }
 }
 
@@ -249,7 +315,10 @@ function handleMutations(mutations: MutationRecord[]): void {
       }
       continue
     }
-    if (mutation.removedNodes.length > 0) sawRemoval = true
+    if (mutation.removedNodes.length > 0) {
+      sawRemoval = true
+      sweepRequested = true
+    }
     for (const node of mutation.addedNodes) {
       if (node instanceof HTMLElement) scheduleScan(node)
     }

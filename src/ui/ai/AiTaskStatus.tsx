@@ -64,7 +64,7 @@ export function AiTaskStatus({
           {status === 'running' ? <Spinner /> : null}
           {typeof title === 'string' ? <strong className="text-sm">{title}</strong> : title}
         </div>
-        {statusNode || <Badge tone={toneByStatus[status]}>{status}</Badge>}
+        {statusNode || <Badge key={status} animate tone={toneByStatus[status]}>{status}</Badge>}
       </div>
       {description ? (
         typeof description === 'string' ? (

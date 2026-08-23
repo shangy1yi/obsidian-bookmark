@@ -118,32 +118,74 @@ function buildFolderChain(
   return chain
 }
 
+type FolderLike = Pick<FolderRecord, 'id' | 'title' | 'path'>
+
+/**
+ * 归一化路径 → 该路径下的文件夹（按插入顺序，同名路径保留全部）。
+ *
+ * folderMap 由 bookmark-tree 一次性构建后整体替换，构建完不再原地增删，
+ * 所以按 Map 实例缓存是安全的：重建书签树会得到新的 Map，索引自然失效。
+ */
+const folderPathIndexCache = new WeakMap<
+  Map<string, FolderLike>,
+  Map<string, FolderLike[]>
+>()
+
+function getFolderPathIndex(
+  folderMap: Map<string, FolderLike>
+): Map<string, FolderLike[]> {
+  const cached = folderPathIndexCache.get(folderMap)
+  if (cached) {
+    return cached
+  }
+
+  const byPath = new Map<string, FolderLike[]>()
+  for (const candidate of folderMap.values()) {
+    const candidatePath = normalizePathString(candidate.path || candidate.title)
+    if (!candidatePath) {
+      continue
+    }
+    const bucket = byPath.get(candidatePath)
+    if (bucket) {
+      bucket.push(candidate)
+    } else {
+      byPath.set(candidatePath, [candidate])
+    }
+  }
+
+  folderPathIndexCache.set(folderMap, byPath)
+  return byPath
+}
+
 function findParentFolder(
-  folder: Pick<FolderRecord, 'id' | 'title' | 'path'>,
-  folderMap: Map<string, Pick<FolderRecord, 'id' | 'title' | 'path'>>
-): Pick<FolderRecord, 'id' | 'title' | 'path'> | null {
+  folder: FolderLike,
+  folderMap: Map<string, FolderLike>
+): FolderLike | null {
   const childPath = normalizePathString(folder.path || folder.title)
   if (!childPath) {
     return null
   }
 
-  let parent: Pick<FolderRecord, 'id' | 'title' | 'path'> | null = null
-  for (const candidate of folderMap.values()) {
-    if (String(candidate.id || '') === String(folder.id || '')) {
+  // 父级的路径必然是子路径在 ' / ' 边界上的某个前缀，所以只需要沿着自己的
+  // 路径由长到短试一遍，第一个命中的就是最近的父级。原先要为此扫描整个
+  // folderMap 并对每个候选跑正则，规模一大就是平方级开销。
+  const byPath = getFolderPathIndex(folderMap)
+  const segments = childPath.split(' / ')
+  const folderId = String(folder.id || '')
+
+  for (let end = segments.length - 1; end >= 1; end -= 1) {
+    const bucket = byPath.get(segments.slice(0, end).join(' / '))
+    if (!bucket) {
       continue
     }
-
-    const candidatePath = normalizePathString(candidate.path || candidate.title)
-    if (!candidatePath || candidatePath.length >= childPath.length) {
-      continue
-    }
-
-    if (childPath.startsWith(`${candidatePath} / `) && (!parent || candidatePath.length > normalizePathString(parent.path || parent.title).length)) {
-      parent = candidate
+    // 同名路径下排除自身，保持与逐条扫描时「取第一个非自身」一致。
+    const candidate = bucket.find((entry) => String(entry.id || '') !== folderId)
+    if (candidate) {
+      return candidate
     }
   }
 
-  return parent
+  return null
 }
 
 function normalizePathString(value: unknown): string {

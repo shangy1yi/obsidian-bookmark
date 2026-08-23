@@ -1074,7 +1074,7 @@ function cleanupPopupController() {
   }
   state.toastTimers.clear()
   state.toasts = []
-  state.contentRenderKey = ''
+  state.contentRenderedViewModel = null
   state.filteredBookmarksCacheKey = ''
   state.filteredBookmarksCache = []
   resetPopupSessionStateForNextOpen()
@@ -2012,16 +2012,75 @@ function getPopupEmptyStateViewModel({
     title
   }
 }
+/**
+ * 视图模型的结构等值比较。
+ *
+ * 这里原本是 `JSON.stringify(nextViewModel)` 再比字符串：为了判断「要不要重
+ * 渲染」，先把整棵视图模型序列化一遍，代价比它想省下的渲染还大，而且每次
+ * 都要分配一个大字符串。改成短路比较后语义不变（视图模型是可 JSON 序列化
+ * 的纯数据），但遇到第一处差异就返回，且不产生中间字符串。
+ */
+function isSameContentViewModel(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) {
+    return true
+  }
+  if (typeof left !== typeof right || left === null || right === null) {
+    return false
+  }
+  if (typeof left !== 'object') {
+    return false
+  }
+
+  const leftIsArray = Array.isArray(left)
+  if (leftIsArray !== Array.isArray(right)) {
+    return false
+  }
+
+  if (leftIsArray) {
+    const leftArray = left as unknown[]
+    const rightArray = right as unknown[]
+    if (leftArray.length !== rightArray.length) {
+      return false
+    }
+    for (let index = 0; index < leftArray.length; index += 1) {
+      if (!isSameContentViewModel(leftArray[index], rightArray[index])) {
+        return false
+      }
+    }
+    return true
+  }
+
+  const leftKeys = Object.keys(left as object)
+  const rightKeys = Object.keys(right as object)
+  if (leftKeys.length !== rightKeys.length) {
+    return false
+  }
+  for (const key of leftKeys) {
+    if (!Object.prototype.hasOwnProperty.call(right, key)) {
+      return false
+    }
+    if (!isSameContentViewModel(
+      (left as Record<string, unknown>)[key],
+      (right as Record<string, unknown>)[key]
+    )) {
+      return false
+    }
+  }
+  return true
+}
+
 function replaceContentViewModel(nextViewModel: PopupContentViewModel, { preserveScroll = false } = {}) {
   if (!nextViewModel.loading && ((nextViewModel.rows?.length ?? 0) || (nextViewModel.mainRows?.length ?? 0) || (nextViewModel.sidebarRows?.length ?? 0))) {
     state.hasPresentedContent = true
   }
-  const nextRenderKey = JSON.stringify(nextViewModel)
-  if (state.contentRenderKey === nextRenderKey) {
+  if (
+    state.contentRenderedViewModel &&
+    isSameContentViewModel(state.contentRenderedViewModel, nextViewModel)
+  ) {
     return
   }
 
-  state.contentRenderKey = nextRenderKey
+  state.contentRenderedViewModel = nextViewModel
   dispatchPopupContentChange(nextViewModel, { preserveScroll })
 }
 
