@@ -249,16 +249,21 @@ function startPopupController(): () => void {
   render()
   perfMark('popup.firstRender')
   perfMeasure('popup.shellReady', 'popup.domContentLoaded', 'popup.firstRender')
+  // 偏好加载与书签加载并行。
+  // hydratePopupPreferences 最终只得出两个布尔值（语义搜索开关及其 AI 是否已配置），
+  // 书签列表不读它们。但它里的 AI 配置检查要动态 import natural-search-ai
+  // 及其依赖的 ai-settings，整条 chunk 的拉取与求值一旦串在前面，
+  // 首屏数据就要白等一百多毫秒。
   void hydratePopupPreferences().finally(() => {
     render()
-    refreshData({ initial: true, preserveSearch: true }).finally(() => {
-      perfMark('popup.interactive')
-      perfMeasure('popup.totalInteractive', 'popup.domContentLoaded', 'popup.interactive')
-      void consumePopupCommandIntent().then((handled) => {
-        if (!handled && !isSmartOverlayActive()) {
-          focusSearchInput()
-        }
-      })
+  })
+  void refreshData({ initial: true, preserveSearch: true }).finally(() => {
+    perfMark('popup.interactive')
+    perfMeasure('popup.totalInteractive', 'popup.domContentLoaded', 'popup.interactive')
+    void consumePopupCommandIntent().then((handled) => {
+      if (!handled && !isSmartOverlayActive()) {
+        focusSearchInput()
+      }
     })
   })
   void hydrateAutoAnalyzeStatus()
